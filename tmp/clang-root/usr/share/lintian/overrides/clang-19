@@ -1,0 +1,4 @@
+# Does not link otherwise
+clang-19: embedded-library usr/lib/llvm-19/bin/clang: libjsoncpp
+# expected
+clang-19: executable-not-elf-or-script *usr/lib/llvm-19/share/clang/bash-autocomplete.sh*

@@ -51,3 +51,24 @@ Work Log:
 
 Stage Summary:
 - Test suite fully green; graph verifier clean; dumper honest. Remaining known gaps are documented SCAFFOLD/VACUOUS passes in docs/pass_status.md (matrix updated with SCCP activation note). No task was delegated to subagents this session.
+
+---
+Task ID: 3
+Agent: main (Super Z)
+Task: Benchmark JULES vs GCC and LLVM/Clang (user: "continue. and benchmark vs GCC and LLVM and CLANG").
+
+Work Log:
+- Environment: gcc 14.2.0 present; no clang -> installed LLVM/Clang 19.1.7 user-locally via apt-get download + dpkg -x (clang-19, libclang-cpp19, libclang-common-19-dev) into tmp/clang-root. No root needed.
+- Wrote 6 kernel pairs (JULES + identical C) in jules/bench/kernels: fib, tak, primes, mandel, flops, inthash; sizes calibrated so gcc -O3 runs ~0.06-0.26 s CPU (tak args (33,22,12) chosen for 157.9M calls; fib(39); primes<2M; mandel 750x750x280; 80M iters for flops/inthash).
+- BUG 7 (correctness, found by kernels on first contact): nested while loops executed once. Root cause chain: PhiSimplification's single-pred Region elimination repinned users with in[0]==id but never rewrote Region->Region predecessor edges referencing the killed node (outer-loop backedge Region). SCCP's unreachable-pred trim then legitimately removed the dead backedge -> loop decapitated; downstream passes folded the graph to garbage. Fixed: splice eliminated region out of successor pred lists in place (any input slot), preserving phi alignment. Regression: t13_nested_loops.
+- BUG 8 (correctness, silent miscompile): reg*const lowered as add $imm (ArithRImm emitter lacked a Mul case; t09 passed only because inlining+SCCP constant-folded its 2*17). Fixed: emit imul 3-operand immediate form; added imm32-encodability guard in emit_int_bin with register materialization fallback for wider constants. Regression: t14_mulconst.
+- Suite now 20/20 green; --verify clean on all programs; all three modes correct.
+- Harness (scripts/jules_bench.py): 9 configs (julesc aot/jit-baseline/jit-optimizing, gcc/clang -O0/-O2/-O3), output verification vs gcc -O2 reference, warmup + adaptive reps pinned to one core. Discovered container cgroup CPU-quota throttling quantizes wall time into ~50 ms steps (identical medians across 7 runs) -> switched primary metric to per-process CPU time via getrusage(RUSAGE_CHILDREN) deltas; wall kept as secondary CSV column.
+- Final numbers (CPU-time medians, 7 reps): julesc-aot geomean 4.53x vs gcc-O3, 4.22x vs clang-O3, 2.03x vs gcc-O0, 4.28x vs gcc-O2. Per kernel vs gcc-O3: fib 4.90x (1.04x vs gcc-O0), tak 3.47x, primes 1.86x, mandel 10.53x, flops 4.43x, inthash 5.89x. The three JULES modes are within ~1% of each other on every kernel. Compile-time geomean: julesc 22 ms vs gcc-O3 48 ms vs clang-O3 71 ms (2.2x/3.2x faster). All 54 config x kernel outputs byte-identical (incl. f64 kernels).
+- Gap analysis from asm: every SoN node round-trips a stack slot; conditions lower via setcc/movzx/test/jcc (6 instr vs gcc's cmp+jge); no callee-saved register promotion (pass 85 is the lever); no SIMD; memory-backed loop-carried f64 locals hurt mandel most.
+- Report: charts (scripts/jules_bench_charts.py), ReportLab body + Template-01 HTML cover (cascade palette seed 19), merged to download/JULES_Compiler_Benchmark_Report.pdf (9 pages, pdf_qa WARN-only: 4 cosmetic table-centering notes from the symmetric stat-box row). Cover HTML also delivered per HTML+PDF dual-delivery rule. Repo: bench/README.md + results committed (4 commits total this task).
+
+Stage Summary:
+- Two real miscompiles found+fixed with regressions (t13, t14); suite 20/20.
+- Benchmarks reproducible end-to-end: ./build.sh + python3 scripts/jules_bench.py.
+- JULES honest position: ~4.5x off -O3 codegen, ~2x off -O0, 2-3x faster compilation; roadmap = register allocation (p85), fused compare-and-branch, f64 loop-local promotion, then vectorization.

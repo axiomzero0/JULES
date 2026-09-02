@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+  <style>
+    @page { size: 794px 1123px; margin: 0; }
+    :root {
+      --c-bg: #f3f3f2;
+      --c-accent: #94771d;
+      --c-text: #242320;
+      --c-muted: #85827a;
+      --c-mid: #504a37;
+      --c-surface: #e9e8e6;
+    }
+    html, body {
+      margin: 0; padding: 0;
+      width: 794px; height: 1123px;
+      background: var(--c-bg);
+      color: var(--c-text);
+      font-family: 'Inter', 'Liberation Sans', sans-serif;
+    }
+    @media screen {
+      html { height: auto; display: flex; justify-content: center; min-height: 100vh; background: var(--c-bg); }
+      body { transform-origin: top center; scale: min(1, calc(100vw / 794), calc(100vh / 1123)); margin: 0 auto; box-shadow: 0 0 60px rgba(0,0,0,0.12); }
+    }
+    .cover { width: 794px; height: 1123px; position: relative; border: none; outline: none; box-shadow: none; }
+    /* Layer 1 — background grid (clipped) */
+    .layer-bg {
+      position: absolute; inset: 0; overflow: hidden; z-index: 1;
+      background-image:
+        repeating-linear-gradient(to right, rgba(80,74,55,0.045) 0, rgba(80,74,55,0.045) 1px, transparent 1px, transparent 50px),
+        repeating-linear-gradient(to bottom, rgba(80,74,55,0.045) 0, rgba(80,74,55,0.045) 1px, transparent 1px, transparent 50px);
+    }
+    /* Layer 2 — structure: ultra-thick left anchor line */
+    .layer-struct { position: absolute; inset: 0; z-index: 2; }
+    .anchor-line {
+      position: absolute;
+      left: 95px; top: 112px; bottom: 112px;
+      width: 8px;
+      background: var(--c-mid);
+    }
+    /* Layer 3 — content */
+    .layer-content { position: absolute; inset: 0; z-index: 3; }
+    .kicker {
+      position: absolute; left: 150px; top: 168px;
+      font-size: 16pt; font-weight: 400;
+      letter-spacing: 4px; text-transform: uppercase;
+      color: var(--c-accent); opacity: 0.75;
+      max-width: 560px;
+    }
+    .hero {
+      position: absolute; left: 150px; top: 300px;
+      font-size: 62pt; font-weight: 900;
+      line-height: 1.15; color: var(--c-text);
+      max-width: 560px;
+    }
+    .subhero {
+      position: absolute; left: 150px; top: 420px;
+      font-size: 24pt; font-weight: 300;
+      line-height: 1.4; color: var(--c-mid);
+      max-width: 560px;
+    }
+    .summary {
+      position: absolute; left: 150px; top: 561px;
+      font-size: 16pt; font-weight: 400;
+      line-height: 1.6; color: var(--c-text); opacity: 0.85;
+      max-width: 476px;
+    }
+    .meta {
+      position: absolute; left: 150px; top: 842px;
+      font-size: 18pt; font-weight: 400;
+      line-height: 1.55; color: var(--c-text);
+      max-width: 560px;
+    }
+    .meta .muted { color: var(--c-muted); font-size: 15pt; }
+    .footer {
+      position: absolute; left: 150px; top: 1010px;
+      font-size: 16px; font-weight: 400;
+      letter-spacing: 3px; text-transform: uppercase;
+      color: var(--c-muted); opacity: 0.8;
+      max-width: 560px;
+    }
+  </style>
+</head>
+<body>
+  <div class="cover">
+    <div class="layer-bg"></div>
+    <div class="layer-struct">
+      <div class="anchor-line"></div>
+    </div>
+    <div class="layer-content">
+      <div class="kicker">Compiler Benchmark Report</div>
+      <div class="hero">JULES</div>
+      <div class="subhero">vs GCC 14.2 and<br/>LLVM / Clang 19.1.7</div>
+      <div class="summary">
+        Six checksummed scalar kernels — recursion, integer division,
+        floating-point multiply-add chains, and nested-loop control flow —
+        compiled in nine configurations and measured on CPU time. All 54
+        outputs byte-identical; the suite caught and fixed two real
+        miscompiles on first contact.
+      </div>
+      <div class="meta">
+        julesc — 89-pass Sea-of-Nodes pipeline<br/>
+        gcc 14.2.0 &nbsp;·&nbsp; clang 19.1.7 (LLVM)<br/>
+        <span class="muted">x86-64 · 2 cores · September 2, 2026</span>
+      </div>
+      <div class="footer">JULES-BENCH-001 · Reproducible via bench/ + scripts</div>
+    </div>
+  </div>
+</body>
+</html>
