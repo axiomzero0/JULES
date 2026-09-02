@@ -321,11 +321,24 @@ struct Emitter {
                 store_result(n, size);
                 return;
             }
-            Inst& i = emit(IOp::ArithRImm);
-            i.bin = op;
-            i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
-            i.b.k = Operand::K::Imm; i.b.imm = c.iv;
-            i.size = size;
+            // Immediate-operand forms (add/sub/imul/and/or/xor $imm, reg)
+            // only encode a sign-extended imm32; wider constants must be
+            // materialized into a register (movq $imm picks movabs as needed).
+            i64 sv = static_cast<i64>(c.iv);
+            i32 low = static_cast<i32>(static_cast<u32>(c.iv));
+            bool fits32 = (sv >= -2147483648LL && sv <= 2147483647LL) ||
+                          (static_cast<u64>(static_cast<i64>(low)) == c.iv);
+            if (fits32) {
+                Inst& i = emit(IOp::ArithRImm);
+                i.bin = op;
+                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+                i.b.k = Operand::K::Imm; i.b.imm = c.iv;
+                i.size = size;
+            } else {
+                imm_reg(IOp::MovRImm, R::Rcx, static_cast<i64>(c.iv));
+                Inst& i = reg2(IOp::ArithRR, R::Rax, R::Rcx, size);
+                i.bin = op;
+            }
         } else {
             load_value(nd.in[2], R::Rcx, size);
             Inst& i = reg2(IOp::ArithRR, R::Rax, R::Rcx, size);
@@ -894,6 +907,15 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             break;
         }
         case IOp::ArithRImm: {
+            if (i.bin == BinOp::Mul) {
+                // imul has no add-style two-operand immediate form; use the
+                // explicit three-operand encoding (dst = dst * imm). The
+                // add/sub default here previously swallowed Mul and emitted
+                // `add $imm` — a silent miscompile for reg*const.
+                os << "\timul" << ssz(i.size) << " $" << i.b.imm << ", "
+                   << rs(i.a.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n";
+                break;
+            }
             const char* mn = "add";
             switch (i.bin) {
                 case BinOp::Add: mn = "add"; break;

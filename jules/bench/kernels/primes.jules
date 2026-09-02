@@ -1,0 +1,26 @@
+// bench: primes — trial division, integer div/mod + short-circuit loops
+fn count_primes(limit: i64) -> i64 {
+    var count: i64 = 0;
+    var n: i64 = 3;
+    while n < limit {
+        var is_p: i64 = 1;
+        var d: i64 = 3;
+        while d * d <= n {
+            if n % d == 0 {
+                is_p = 0;
+                break;
+            }
+            d = d + 2;
+        }
+        if is_p == 1 {
+            count = count + 1;
+        }
+        n = n + 2;
+    }
+    return count;
+}
+
+fn main() -> i64 {
+    print(count_primes(2000000 as i64));
+    return 0 as i64;
+}

@@ -1,0 +1,20 @@
+// multiply-by-constant lowering + u64 wrap-around arithmetic
+// (regression: reg*const fell through to the `add $imm` encoding path)
+fn main() -> i64 {
+    var h: u64 = 0;
+    var i: u64 = 0;
+    while i < (16 as u64) {
+        h = h * (31 as u64) + (i ^ (i << (3 as u64)) ^ (i >> (5 as u64)));
+        i = i + (1 as u64);
+    }
+    print(h);
+    var s: i64 = 7;
+    var j: i64 = 0;
+    while j < 10 {
+        s = s * 13 + j;
+        j = j + 1;
+    }
+    print(s);
+    print(s * 1000003);
+    return 0 as i64;
+}

@@ -1,0 +1,11 @@
+// bench: inthash — u64 ALU chain (mul/xor/shift), defined wrap-around
+fn main() -> i64 {
+    var h: u64 = 0;
+    var i: u64 = 0;
+    while i < (80000000 as u64) {
+        h = h * (31 as u64) + (i ^ (i << (3 as u64)) ^ (i >> (5 as u64)));
+        i = i + (1 as u64);
+    }
+    print(h);
+    return 0 as i64;
+}

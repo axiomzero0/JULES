@@ -1,0 +1,30 @@
+// bench: mandel — scalar nested loops, f64 mul-add chains + compares
+fn mandel(w: i64, h: i64, max_iter: i64) -> i64 {
+    var total: i64 = 0;
+    var py: i64 = 0;
+    while py < h {
+        let y0: f64 = ((py as f64) / (h as f64)) * 2.4 - 1.2;
+        var px: i64 = 0;
+        while px < w {
+            let x0: f64 = ((px as f64) / (w as f64)) * 3.0 - 2.1;
+            var x: f64 = 0.0;
+            var y: f64 = 0.0;
+            var iter: i64 = 0;
+            while iter < max_iter && x * x + y * y <= 4.0 {
+                let xt: f64 = x * x - y * y + x0;
+                y = 2.0 * x * y + y0;
+                x = xt;
+                iter = iter + 1;
+            }
+            total = total + iter;
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    print(mandel(750 as i64, 750 as i64, 280 as i64));
+    return 0 as i64;
+}

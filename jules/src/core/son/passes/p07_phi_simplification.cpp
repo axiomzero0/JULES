@@ -81,6 +81,16 @@ private:
                     // phi at degenerate region -> its single input
                     g_.replace_all_uses(u, un.in[1]);
                     g_.kill(u);
+                } else if (un.op == Op::Region) {
+                    // u references id as a PREDECESSOR (any input slot,
+                    // including in[0]): splice the degenerate merge out of
+                    // u's edge list in place. Missing this left the killed
+                    // region in successor pred lists — loop backedges died,
+                    // and SCCP's unreachable-pred trim then decapitated the
+                    // loop. In-place splicing preserves phi input alignment
+                    // at u (the value for that edge is unchanged).
+                    for (u8 j = 0; j < un.n_in; ++j)
+                        if (un.in[j] == id) g_.set_input(u, j, pred);
                 } else if (un.in[0] == id) {
                     g_.set_input(u, 0, pred);
                 }
