@@ -9,7 +9,8 @@ namespace jules {
 
 namespace {
 
-std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id) {
+std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id,
+                         const std::vector<SymbolId>* fn_syms) {
     const Node& n = g.node(id);
     std::ostringstream os;
     switch (n.op) {
@@ -22,10 +23,15 @@ std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id) {
             break;
         case Op::Call: {
             os << " fn=";
+            // aux is a FnId = index into the module function list. Resolve
+            // through fn_syms (FnId -> SymbolId) when provided: symbol table
+            // index 0 is reserved for "" and is NOT a function, so treating
+            // aux as a raw symbol index mislabels every call by one.
             if (n.aux == kFnPrint) os << "print";
             else if (n.aux == kFnFree) os << "free";
-            else if (n.aux != kNoFn && syms.size() > n.aux) os << syms.name(n.aux);
-            else os << "fn" << n.aux;
+            else if (fn_syms && n.aux < fn_syms->size() && (*fn_syms)[n.aux] != kNoSymbol)
+                os << syms.name((*fn_syms)[n.aux]);
+            else if (n.aux != kNoFn) os << "fn" << n.aux;
             break;
         }
         case Op::Bin:
@@ -51,13 +57,14 @@ std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id) {
 
 } // namespace
 
-std::string dump_graph_text(const Graph& g, SymbolTable& syms) {
+std::string dump_graph_text(const Graph& g, SymbolTable& syms,
+                            const std::vector<SymbolId>* fn_syms) {
     std::ostringstream os;
     os << "graph " << g.live_count() << " live / " << g.size() << " nodes\n";
     for (NodeId id = 0; id < g.size(); ++id) {
         const Node& n = g.node(id);
         if (n.op == Op::Dead) continue;
-        os << "n" << id << ": " << op_name(n.op) << node_detail(g, syms, id) << " in=[";
+        os << "n" << id << ": " << op_name(n.op) << node_detail(g, syms, id, fn_syms) << " in=[";
         for (u8 i = 0; i < n.n_in; ++i) {
             if (i) os << ", ";
             os << "n" << n.in[i];
@@ -67,7 +74,8 @@ std::string dump_graph_text(const Graph& g, SymbolTable& syms) {
     return os.str();
 }
 
-std::string dump_graph_dot(const Graph& g, SymbolTable& syms, const char* fn_name) {
+std::string dump_graph_dot(const Graph& g, SymbolTable& syms, const char* fn_name,
+                           const std::vector<SymbolId>* fn_syms) {
     std::ostringstream os;
     os << "digraph \"" << fn_name << "\" {\n";
     os << "  rankdir=BT;\n  node [shape=record, fontname=\"Helvetica\"];\n";
@@ -75,7 +83,7 @@ std::string dump_graph_dot(const Graph& g, SymbolTable& syms, const char* fn_nam
         const Node& n = g.node(id);
         if (n.op == Op::Dead) continue;
         os << "  n" << id << " [label=\"{" << op_name(n.op) << "|#" << id
-           << node_detail(g, syms, id) << "}\"];\n";
+           << node_detail(g, syms, id, fn_syms) << "}\"];\n";
     }
     for (NodeId id = 0; id < g.size(); ++id) {
         const Node& n = g.node(id);

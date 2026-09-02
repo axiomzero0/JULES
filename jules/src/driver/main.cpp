@@ -146,17 +146,25 @@ int run(int argc, char** argv) {
     }
 
     if (opts.emit_ir) {
+        std::vector<SymbolId> fn_syms;
+        fn_syms.reserve(mod.fns.size());
+        for (const FunctionGraph& fg : mod.fns) fn_syms.push_back(fg.name);
         for (const FunctionGraph& fg : mod.fns) {
             std::fprintf(stdout, "; ---- final IR: %s ----\n", syms.name(fg.name).data());
-            std::fputs(dump_graph_text(fg.g, syms).c_str(), stdout);
+            std::fputs(dump_graph_text(fg.g, syms, &fn_syms).c_str(), stdout);
         }
     }
     if (emit_dot) {
+        std::vector<SymbolId> fn_syms;
+        fn_syms.reserve(mod.fns.size());
+        for (const FunctionGraph& fg : mod.fns) fn_syms.push_back(fg.name);
         for (const FunctionGraph& fg : mod.fns) {
             std::string fn = std::string(syms.name(fg.name)) + ".dot";
             std::FILE* df = std::fopen(fn.c_str(), "w");
             if (df) {
-                std::fputs(dump_graph_dot(fg.g, syms, syms.name(fg.name).data()).c_str(), df);
+                std::fputs(
+                    dump_graph_dot(fg.g, syms, syms.name(fg.name).data(), &fn_syms).c_str(),
+                    df);
                 std::fclose(df);
             }
         }

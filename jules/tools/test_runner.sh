@@ -42,13 +42,15 @@ run_test() {
     return 0
 }
 
-# pass-activity assertion: `changes` column of --stats must be > 0
+# pass-activity assertion: sum of the `changes` column across ALL per-function
+# stat tables must be > 0 (stats are emitted one table per function; taking the
+# last table's value only would miss work done in earlier functions).
 assert_pass_active() {
     local name=$1
     local pass_name=$2
     local stats
     stats=$(timeout 30 $JULESC --stats "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
-            awk -v p="$pass_name" '$2 == p {v=$4} END {print v}')
+            awk -v p="$pass_name" '$2 == p {v += $4} END {print v + 0}')
     if [ -z "$stats" ] || [ "$stats" = "0" ]; then
         echo "FAIL $name (pass '$pass_name' reported no changes)"
         fail=$((fail + 1))

@@ -87,7 +87,13 @@ private:
     // ---- variables (memory-backed) -------------------------------------------
     NodeId declare_var(const std::string& name, TypeId ty) {
         NodeId size = make_int_const(ty_store_bytes(ty), ty_i64(), cur_ctrl_);
-        NodeId alloc = g_.make(Op::Alloc, ty_ptr(ty), {cur_ctrl_, cur_mem_, size});
+        // The slot is a pointer to one element of `ty`. The MVP type lattice
+        // has no pointer-to-pointer, so a slot for a pointer-typed local
+        // degrades to *i64: the address width is identical and the Load
+        // result type carries the real pointee information.
+        TypeId slot_ty = ty_ptr(ty);
+        if (slot_ty == ty_none()) slot_ty = ty_ptr(ty_i64());
+        NodeId alloc = g_.make(Op::Alloc, slot_ty, {cur_ctrl_, cur_mem_, size});
         cur_mem_ = alloc;
         if (vars_.contains(name)) vars_.erase(name);
         vars_.insert(name, alloc);
@@ -432,7 +438,9 @@ private:
         if (e.name == "alloc") {
             TypeId pointee = e.args[0]->cast_target;
             NodeId size = make_int_const(ty_store_bytes(pointee), ty_i64(), cur_ctrl_);
-            cur_mem_ = g_.make(Op::Alloc, ty_ptr(pointee), {cur_ctrl_, cur_mem_, size});
+            TypeId res_ty = ty_ptr(pointee);
+            if (res_ty == ty_none()) res_ty = ty_ptr(ty_i64()); // no ptr-to-ptr in MVP lattice
+            cur_mem_ = g_.make(Op::Alloc, res_ty, {cur_ctrl_, cur_mem_, size});
             return cur_mem_;
         }
         FnId target = kNoFn;
@@ -451,7 +459,6 @@ private:
 
         NodeId ins[kMaxInputs];
         ins[0] = cur_ctrl_;
-        ins[1] = cur_mem_;
         u8 n = 2;
         for (const ExprP& a : e.args) {
             if (n >= kMaxInputs) {
@@ -461,6 +468,12 @@ private:
             }
             ins[n++] = emit_expr(*a);
         }
+        // Memory input is captured AFTER argument evaluation: nested calls in
+        // the argument list advance cur_mem_, and this Call must observe their
+        // effects (eval order = argument effects, then the call itself).
+        // Capturing before the loop orphaned the argument calls from the
+        // memory chain and broke effect ordering in the linearizer.
+        ins[1] = cur_mem_;
         cur_mem_ = g_.make_arr(Op::Call, e.ty, ins, n, 0, target);
         return cur_mem_;
     }

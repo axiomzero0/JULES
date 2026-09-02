@@ -27,8 +27,47 @@ public:
     explicit Sccp(Graph& g) : g_(g) {}
 
     bool run() {
+        // Seed every Const node's lattice value up front: constants are
+        // block-independent facts. The graph builder/inliner pins Const nodes
+        // to the block where they were materialized — including blocks that
+        // are not (yet) executable. Without pre-seeding, a pure op in a live
+        // block whose Const operand sits in a not-yet-exec block stalls at
+        // TOP forever: the branch never resolves, neither projection is
+        // marked executable, and the optimistic phi lattice values (entry
+        // inputs only) get frozen and rewritten as constants — decapitating
+        // loops. Pre-seeding matches classic Click-style SCCP where constants
+        // are known globally.
+        for (NodeId id = 0; id < g_.size(); ++id) {
+            if (g_.node(id).op == Op::Const) {
+                LatVal v;
+                v.kind = Lat::Const;
+                const_of(g_, id, v.v);
+                set(id, v);
+            }
+        }
         mark_exec(g_.start());
         drain();
+        // Safety net: an If whose condition is STILL TOP at fixpoint could not
+        // be resolved (stalled operand chain, not a proof). Treat it as
+        // BOTTOM — both projections executable — so downstream regions never
+        // lose all predecessors to an evaluation artifact. Ifs with Const
+        // conditions keep their single taken projection (dead-branch
+        // elimination); BOTTOM conditions already marked both during drain.
+        for (NodeId id = 0; id < g_.size(); ++id) {
+            Node& n = g_.node(id);
+            if (n.op != Op::If) continue;
+            if (get(n.in[1]).kind != Lat::Top) continue;
+            NodeId tproj = kNoNode, fproj = kNoNode;
+            for (NodeId u : g_.uses_of(id)) {
+                Op uo = g_.node(u).op;
+                if (uo == Op::IfTrue) tproj = u;
+                if (uo == Op::IfFalse) fproj = u;
+            }
+            if (tproj != kNoNode && fproj != kNoNode) {
+                mark_exec(tproj);
+                mark_exec(fproj);
+            }
+        }
         return rewrite();
     }
 
@@ -274,7 +313,8 @@ private:
             if (keep == n.n_in) continue; // nothing dead
             g_.touch(); // pred trim is a real change
             if (keep == 0) {
-                // unreachable merge: kill region + phis; pinned nodes die in DCE
+                // unreachable merge: kill region + phis; the pinned subgraph
+                // dies in the phase-5 cascade below
                 const SmallVec<NodeId, 4> users = g_.uses_of(id);
                 for (NodeId u : users) {
                     if (g_.node(u).op == Op::Phi) {
@@ -283,6 +323,7 @@ private:
                     }
                 }
                 g_.kill(id);
+                dead_ctrl_.insert(id, true);
                 changed = true;
                 continue;
             }
@@ -316,6 +357,7 @@ private:
                 if ((uo == Op::IfTrue && !taken) || (uo == Op::IfFalse && taken)) {
                     if (!exec_.contains(u)) {
                         g_.kill(u);
+                        dead_ctrl_.insert(u, true);
                         changed = true;
                     }
                 }
@@ -330,6 +372,43 @@ private:
             g_.kill(id);
             changed = true;
         }
+
+        // 5) cascade: kill the subgraph pinned to removed control. Phases 2-3
+        // realigned phis and trimmed regions, so live nodes no longer
+        // reference the dead subgraph as data; what remains pinned under
+        // killed block heads (stores, loads, consts, jumps, unreachable
+        // returns) must die with its control, otherwise the graph carries
+        // uses-of-killed-nodes until the next DCE run — which never comes
+        // within the same pipeline sweep.
+        if (!dead_ctrl_.empty()) {
+            bool again = true;
+            while (again) {
+                again = false;
+                for (NodeId id = 0; id < g_.size(); ++id) {
+                    Node& n = g_.node(id);
+                    if (n.op == Op::Dead || n.op == Op::Stop) continue;
+                    if (n.n_in == 0) continue;
+                    if (!dead_ctrl_.contains(n.in[0])) continue;
+                    g_.kill(id);
+                    if (is_block_head(n.op)) dead_ctrl_.insert(id, true);
+                    changed = true;
+                    again = true;
+                }
+            }
+            // Stop compaction: returns killed under dead control must leave
+            // the stop list, or Stop keeps a dead input forever.
+            Node& stop = g_.node(g_.stop());
+            if (stop.op == Op::Stop) {
+                u8 keep = 0;
+                for (u8 i = 0; i < stop.n_in; ++i)
+                    if (g_.node(stop.in[i]).op != Op::Dead) stop.in[keep++] = stop.in[i];
+                if (keep != stop.n_in) {
+                    stop.n_in = keep;
+                    g_.touch();
+                    changed = true;
+                }
+            }
+        }
         (void)0;
         return changed;
     }
@@ -339,6 +418,7 @@ private:
     Graph& g_;
     FlatMap<NodeId, LatVal> lat_;
     FlatMap<NodeId, bool> exec_;
+    FlatMap<NodeId, bool> dead_ctrl_; // killed control nodes (cascade roots)
     std::vector<NodeId> work_;
     std::vector<NodeId> exec_work_;
 };

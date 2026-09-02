@@ -86,10 +86,13 @@ bool PassManager::run_one(Pass& p, PassStats& st) {
         }
     }
     if (ctx_.opts.emit_ir && p.stage() == Stage::Son) {
+        std::vector<SymbolId> fn_syms;
+        fn_syms.reserve(ctx_.mod.fns.size());
+        for (const FunctionGraph& fg : ctx_.mod.fns) fn_syms.push_back(fg.name);
         for (FunctionGraph& fg : ctx_.mod.fns) {
             std::fprintf(stdout, "; ---- after pass %d (%s) fn %s ----\n", p.order(),
                          p.name(), ctx_.syms.name(fg.name).data());
-            std::fputs(dump_graph_text(fg.g, ctx_.syms).c_str(), stdout);
+            std::fputs(dump_graph_text(fg.g, ctx_.syms, &fn_syms).c_str(), stdout);
         }
     }
     return true;
@@ -133,9 +136,14 @@ bool PassManager::run() {
         // Post-inline cleanup: re-run the core cleanup/cse set after the
         // inlining phase exposes new folding opportunities (scheduler-level
         // decision; passes are allowed to repeat). SROA/DSE run BEFORE the
-        // folding/cse passes so promoted values are visible to GVN.
+        // folding/cse passes so promoted values are visible to GVN. SCCP (8)
+        // is included: load forwarding/promotion in the main run (passes
+        // 21-26) exposes SSA constants only AFTER SCCP's original slot, so
+        // the post-inline re-run is where its control-conditional lattice
+        // gets real input — the same reason production pipelines (LLVM
+        // IPSCCP, Graal) re-run conditional propagation after inlining.
         if (ctx_.opts.post_inline_cleanup && p->order() == 82 && p->stage() == Stage::Son) {
-            static const int kCleanupOrders[] = {26, 30, 23, 1, 2, 3, 7, 9};
+            static const int kCleanupOrders[] = {26, 30, 23, 1, 2, 3, 7, 8, 9};
             std::vector<Pass*> again = PassRegistry::instance().create_all();
             FlatMap<int, Pass*> by_order;
             for (Pass* q : again)

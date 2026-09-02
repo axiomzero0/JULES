@@ -1,10 +1,22 @@
-// inlining: small helper folded into callers
+// inlining: small helpers folded into callers
+// - add3: trivial body -> AlwaysInlineEnforcement (pass 77)
+// - blend: medium body (node estimate between the trivial floor and the
+//   cost-model ceiling) -> CostBasedInlining (pass 78)
 fn add3(a: i64, b: i64, c: i64) -> i64 {
     return a + b + c;
+}
+
+fn blend(a: i64, b: i64) -> i64 {
+    var s: i64 = a * 3;
+    s = s + b;
+    s = s - a;
+    s = s + b * 2;
+    return s;
 }
 
 fn main() -> i64 {
     print(add3(1 as i64, 2 as i64, 3 as i64));
     print(add3(add3(1 as i64, 1 as i64, 1 as i64), 10 as i64, 20 as i64));
+    print(blend(4 as i64, 5 as i64));
     return 0 as i64;
 }

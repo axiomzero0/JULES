@@ -11,7 +11,7 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 5 | ComptimeResidueFold | IMPLEMENTED | Re-evaluate comptime expressions after specialization. |
 | 6 | AssertElision | VACUOUS (nothing to do in MVP) | Remove checks proven safe (no check nodes in MVP IR). |
 | 7 | PhiSimplification | IMPLEMENTED | Collapse single-input phis, identical inputs. |
-| 8 | SparseConditionalConstantPropagation | IMPLEMENTED | Lattice const prop through control edges. |
+| 8 | SparseConditionalConstantPropagation | IMPLEMENTED | Lattice const prop through control edges; Const lattice is pre-seeded (block-independent) and unresolved branches fall back to both-executable. Fires in the post-inline cleanup re-run: locals-as-memory hides values behind Loads until forwarding/promotion (passes 21-26), so SCCP's original slot at order 8 sees only Bottom loads on MVP input. |
 | 9 | GlobalValueNumbering | IMPLEMENTED | Hash-cons identical computations (dominance-checked). |
 | 10 | RedundantPhiElimination | IMPLEMENTED | Remove phis with identical/single definitions. |
 | 11 | CopyPropagation | IMPLEMENTED | Replace uses of copies with originals. |

@@ -93,9 +93,13 @@ private:
                 changed_ = true;
             }
         }
-        // Remove the allocation from the chain.
+        // Remove the allocation from the chain. Memory phis carry the alloc
+        // in ANY value slot (one per predecessor), so the bypass must use
+        // the memory-aware replacement: phis get every input slot rewritten,
+        // regular nodes get slot 1. A plain slot-1 replacement leaves mem
+        // phis pointing at the killed alloc (verifier: uses a killed node).
         NodeId entry_mem = g_.node(alloc).in[1];
-        g_.replace_uses_in_slot(alloc, entry_mem, 1);
+        g_.replace_uses_as_memory(alloc, entry_mem);
         g_.kill(alloc);
         changed_ = true;
     }

@@ -1,0 +1,4 @@
+jules deopt manifest v1
+functions: 1
+fn 1 blocks 1 slots 0 frame 0
+guard_sites: 0

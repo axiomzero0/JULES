@@ -16,8 +16,11 @@ bool build_function(const FnDecl& fn, const SemaModule& sema, FunctionGraph& fg,
 bool verify_graph(Graph& g, SymbolTable& syms, Diagnostics& diag);
 
 // Dumpers. `text` returns a deterministic per-node listing; `dot` returns
-// graphviz source.
-std::string dump_graph_text(const Graph& g, SymbolTable& syms);
-std::string dump_graph_dot(const Graph& g, SymbolTable& syms, const char* fn_name);
+// graphviz source. `fn_syms` (FnId -> SymbolId, built from mod.fns[].name)
+// resolves Call targets; without it user calls dump as fn<N>.
+std::string dump_graph_text(const Graph& g, SymbolTable& syms,
+                            const std::vector<SymbolId>* fn_syms = nullptr);
+std::string dump_graph_dot(const Graph& g, SymbolTable& syms, const char* fn_name,
+                           const std::vector<SymbolId>* fn_syms = nullptr);
 
 } // namespace jules
