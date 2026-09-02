@@ -72,3 +72,22 @@ Stage Summary:
 - Two real miscompiles found+fixed with regressions (t13, t14); suite 20/20.
 - Benchmarks reproducible end-to-end: ./build.sh + python3 scripts/jules_bench.py.
 - JULES honest position: ~4.5x off -O3 codegen, ~2x off -O0, 2-3x faster compilation; roadmap = register allocation (p85), fused compare-and-branch, f64 loop-local promotion, then vectorization.
+
+---
+Task ID: 4
+Agent: main (Super Z)
+Task: Push JULES to the user's GitHub account (user supplied a fresh PAT, explicitly authorized saving it: "TOKEN IS OK TOO BE SAVED").
+
+Work Log:
+- Token verified via API: account axiomzero0 (id 316036413); account has 9 existing repos, all public C++ compiler projects, no name collision -> repo created public as axiomzero0/JULES to match the portfolio pattern (user can flip visibility in Settings).
+- Workspace repo NOT pushed as-is: it tracks tmp/ (local clang-19 extraction, 349 files), tool-results/, .env, and jules/build/ artifacts. Instead staged a clean repo at release/JULES (185 files, 16,192 lines): src/ + tests/ + bench/ + docs/ + tools/ + build.sh/CMakeLists/sources.cmake + new root README.md + .gitignore (build/, *.o, *.jules_deopt_manifest.txt).
+- Bench portability: scripts moved into bench/scripts/ with repo-relative paths (ROOT from __file__; CLANG via JULES_BENCH_CLANG env > PATH > legacy local extraction); report script's import of the workspace-only pdf.py helper made optional. bench/README.md updated accordingly; final merged PDF copied to bench/results/JULES_Compiler_Benchmark_Report.pdf.
+- Pre-push validation from the staged tree: ./build.sh builds clean (one pre-existing -Wsign-compare warning), tools/test_runner.sh 20/20, bench harness smoke run OK (then restored canonical 6-kernel/7-rep results.csv + summary.md that the smoke run had overwritten; stray generated jules_deopt_manifest.txt removed - fixture copy stays in bench/kernels/).
+- Security: full-tree grep for github_pat/ghp_/gho_/secret/password/Bearer patterns = zero matches; no .env-like files in staged tree. PAT stored only in ~/.git-credentials (0600) with credential.helper store per user authorization; never committed to any repo.
+- Push: git init -b main, identity axiomzero0 <316036413+axiomzero0@users.noreply.github.com>, single initial commit e6ed8d1, remote https://github.com/axiomzero0/JULES.git, push verified: remote refs/heads/main == local HEAD; GitHub API confirms repo exists + pushed_at set.
+- Workspace hygiene: release/ added to .gitignore; pending workspace changes (mode-bit normalizations from final report regen) committed as 2de0e17; git status clean.
+
+Stage Summary:
+- Live at https://github.com/axiomzero0/JULES (public, main, 185 files): full compiler + bench suite + results + PDF report, self-contained and reproducible (verified build/test/bench from the staged tree itself).
+- Token handling changed vs Task 0: user explicitly re-authorized saving this token, so it lives in the local git credential store only (0600), outside all repos.
+- Note: latest upload (Pasted Content_1788375082637.txt, same content pasted 3x) is the optimization-levels design spec (-O0/-Og/-O1/-O2/-O3/-Os/-Oz + --size/--pgo/--lto/--fto/--jit-budget modifiers) = the NEXT task after this push.
