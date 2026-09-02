@@ -224,34 +224,47 @@ story.append(P(
     "programs that compute the same results."))
 story.append(Spacer(1, 8))
 story.append(callout_row([
-    ("4.53x", "JULES AOT vs GCC -O3 (geometric mean of CPU-time ratio)"),
-    ("4.22x", "JULES AOT vs Clang -O3 (geometric mean)"),
-    ("2.03x", "JULES AOT vs GCC -O0 (geometric mean)"),
+    ("2.79x", "JULES AOT vs GCC -O3 (geometric mean of CPU-time ratio)"),
+    ("2.56x", "JULES AOT vs Clang -O3 (geometric mean)"),
+    ("1.23x", "JULES AOT vs GCC -O0 (geometric mean)"),
 ]))
 story.append(Spacer(1, 10))
 story.append(P(
-    "The headline result is that JULES-compiled code runs 4.53 times slower than "
-    "GCC -O3 and 4.22 times slower than Clang -O3 on the geometric mean, while "
-    "sitting 2.03 times slower than unoptimized GCC. On the recursion-heavy fib "
-    "kernel JULES is at parity with GCC -O0. The gap is dominated by two structural "
-    "properties of the current backend: every Sea-of-Nodes value is materialized to "
-    "a stack slot before use, and boolean conditions are lowered through a "
-    "setcc/movzx/test/jcc sequence instead of a fused compare-and-branch. The worst "
-    "case is mandel (10.5x vs GCC -O3), which combines the memory-backed locals "
-    "model with a short-circuit loop condition; the best case is primes (1.86x), "
-    "which is bound by the integer divide unit that both compilers emit equally."))
+    "The headline result is that JULES-compiled code runs 2.79 times slower than "
+    "GCC -O3 and 2.56 times slower than Clang -O3 on the geometric mean, while "
+    "sitting 1.23 times off unoptimized GCC. On fib and inthash JULES now beats "
+    "GCC -O0 outright. This revision of the report follows a backend overhaul: a "
+    "real register allocator (pass 85, linear scan over backwards-liveness-derived "
+    "live ranges with callee-saved, caller-saved and XMM pools plus "
+    "density-ranked, backedge-aware spill heuristics), frame-pointer elision for "
+    "functions whose values all fit registers, fused compare-and-branch lowering, "
+    "an FP constant pool with loop-invariant materialization hoisting, and "
+    "copy-chain elimination in the machine peephole. Against the previous "
+    "measurement the geometric-mean deficit shrank from 4.53x to 2.79x: primes "
+    "reached exact GCC -O3 parity, inthash improved from 5.89x to 2.05x, mandel "
+    "halved from 10.5x to 5.5x, and fib moved from 4.90x to 3.49x. The worst "
+    "remaining case is mandel (5.5x), which is bound by FP instruction selection "
+    "and the allocator's lack of live-range splitting; the best cases are primes "
+    "(1.00x, divide-bound for both compilers) and inthash (2.05x)."))
 story.append(P(
     "Two findings deserve equal billing with the performance numbers. First, the "
-    "benchmark suite caught two real miscompiles in JULES that the existing 20-test "
-    "suite did not cover: a loop-backedge corruption in PhiSimplification that made "
-    "nested loops execute once, and a register-times-constant multiply that was "
-    "silently lowered as an add. Both were fixed and locked in with new regression "
-    "tests. Second, JULES compiles these kernels 2.2 times faster than GCC -O3 and "
-    "3.2 times faster than Clang -O3, a meaningful advantage for a compiler that "
-    "also runs the full 89-pass pipeline. Wall-clock timing in this container is "
-    "quantized by cgroup CPU-quota throttling into roughly 50 ms steps, so the "
-    "primary metric throughout this report is per-process CPU time, which is "
-    "throttle-immune."))
+    "benchmarks and the new optimization-level matrix caught four more real "
+    "miscompiles on top of the two from the first measurement round: the initial "
+    "register allocator computed live ranges as linear intervals, which is unsound "
+    "when a loop backedge re-reads a value whose linear last-use precedes the "
+    "latch; the inliner's resume-block repinning could strand pure nodes left "
+    "behind at the call-site block (a use-before-def that only surfaces at -O0/-Og "
+    "where no post-inline folding repairs the graph); SROA refused to promote "
+    "allocations referenced by dead users or by memory phis, which left loop "
+    "counters in heap cells; and the cast lowering read constant operands from "
+    "stack slots that are never written. All six are fixed and locked in with "
+    "regression tests, and every program is now verified byte-identical across "
+    "all seven optimization levels and both JIT modes. Second, JULES compiles "
+    "these kernels 2.4 times faster than GCC -O3 and 3.2 times faster than "
+    "Clang -O3, a meaningful advantage for a compiler that also runs the full "
+    "89-pass pipeline. Wall-clock timing in this container is quantized by "
+    "cgroup CPU-quota throttling into roughly 50 ms steps, so the primary metric "
+    "throughout this report is per-process CPU time, which is throttle-immune."))
 
 # ============================ 2. METHODOLOGY ============================
 story.extend(section("2. Benchmark Methodology"))
@@ -337,22 +350,22 @@ story.append(P(
     "verifier clean after every pass."))
 story.append(Spacer(1, 6))
 story.append(callout_row([
-    ("54/54", "kernel-configuration pairs with byte-identical output"),
-    ("2", "miscompiles found by the benchmarks and fixed"),
-    ("20/20", "regression tests passing after the fixes"),
+    ("66/66", "kernel-configuration pairs with byte-identical output"),
+    ("6", "miscompiles found by the benchmarks and fixed"),
+    ("132/132", "regression checks passing (22 programs, 7 levels)"),
 ]))
 
 # ============================ 4. RUNTIME ============================
 story.extend(section("4. Runtime Performance"))
-cfg_cols = ["julesc-aot", "julesc-jitb", "julesc-jito", "gcc-O0", "gcc-O2",
-            "gcc-O3", "clang-O0", "clang-O2", "clang-O3"]
+cfg_cols = ["julesc-aot", "julesc-O3", "julesc-jitb", "julesc-jito", "gcc-O0",
+            "gcc-O2", "gcc-O3", "clang-O0", "clang-O2", "clang-O3"]
 med = {
-    "fib":     [0.4778, 0.4625, 0.4607, 0.4591, 0.0955, 0.0975, 0.3368, 0.1556, 0.1556],
-    "tak":     [0.3488, 0.3495, 0.3486, 0.2706, 0.1577, 0.1006, 0.3220, 0.1846, 0.1844],
-    "primes":  [0.4806, 0.4866, 0.4867, 0.2598, 0.2583, 0.2578, 0.2582, 0.1593, 0.1592],
-    "mandel":  [1.0496, 1.0480, 1.0423, 0.1998, 0.0902, 0.0997, 0.2228, 0.0874, 0.0872],
-    "flops":   [0.6514, 0.6500, 0.6526, 0.2728, 0.1476, 0.1470, 0.2721, 0.1485, 0.1485],
-    "inthash": [0.4402, 0.4406, 0.4403, 0.1941, 0.0752, 0.0748, 0.2044, 0.0719, 0.0722],
+    "fib":     [0.3372, 0.3369, 0.3419, 0.3412, 0.4600, 0.0944, 0.0965, 0.3348, 0.1556, 0.1556],
+    "tak":     [0.3327, 0.3347, 0.3322, 0.3342, 0.2660, 0.1574, 0.1010, 0.3218, 0.1845, 0.1841],
+    "primes":  [0.2576, 0.2576, 0.2590, 0.2576, 0.2589, 0.2572, 0.2571, 0.2588, 0.1588, 0.1589],
+    "mandel":  [0.4969, 0.4966, 0.4965, 0.4957, 0.1989, 0.0900, 0.0903, 0.2202, 0.0871, 0.0870],
+    "flops":   [0.5394, 0.5396, 0.5385, 0.5393, 0.2728, 0.1476, 0.1473, 0.2716, 0.1484, 0.1484],
+    "inthash": [0.1522, 0.1513, 0.1550, 0.1528, 0.1925, 0.0744, 0.0743, 0.2035, 0.0715, 0.0716],
 }
 rt = [[P("<b>Kernel</b>", th)] + [P("<b>%s</b>" % c, th) for c in cfg_cols]]
 for k in med:
@@ -360,7 +373,7 @@ for k in med:
     for v in med[k]:
         row.append(P("%.3f" % v, tcs))
     rt.append(row)
-col_w = [AVAIL * 0.108] + [AVAIL * 0.0992] * 9
+col_w = [AVAIL * 0.104] + [AVAIL * 0.0896] * 10
 story.extend(safe_keep(
     [styled_table(rt, col_w),
      Paragraph("Table 2: Median CPU seconds per run, lower is better. jitb/jito are the JIT-baseline and JIT-optimizing pipeline modes.", caption)]))
@@ -369,53 +382,54 @@ story.extend(fig("/home/z/my-project/jules/bench/results/fig_runtime.png",
 ratio = [
     [P("<b>Kernel</b>", th), P("<b>vs gcc-O3</b>", th), P("<b>vs clang-O3</b>", th),
      P("<b>vs gcc-O0</b>", th), P("<b>vs gcc-O2</b>", th)],
-    [P("fib", tcl), P("4.90x", tc), P("3.07x", tc), P("1.04x", tc), P("5.00x", tc)],
-    [P("tak", tcl), P("3.47x", tc), P("1.89x", tc), P("1.29x", tc), P("2.21x", tc)],
-    [P("primes", tcl), P("1.86x", tc), P("3.02x", tc), P("1.85x", tc), P("1.86x", tc)],
-    [P("mandel", tcl), P("10.53x", tc), P("12.04x", tc), P("5.25x", tc), P("11.64x", tc)],
-    [P("flops", tcl), P("4.43x", tc), P("4.39x", tc), P("2.39x", tc), P("4.41x", tc)],
-    [P("inthash", tcl), P("5.89x", tc), P("6.10x", tc), P("2.27x", tc), P("5.85x", tc)],
-    [P("<b>Geometric mean</b>", tcl), P("<b>4.53x</b>", tc), P("<b>4.22x</b>", tc),
-     P("<b>2.03x</b>", tc), P("<b>4.28x</b>", tc)],
+    [P("fib", tcl), P("3.49x", tc), P("2.17x", tc), P("0.73x", tc), P("3.57x", tc)],
+    [P("tak", tcl), P("3.29x", tc), P("1.81x", tc), P("1.25x", tc), P("2.11x", tc)],
+    [P("primes", tcl), P("1.00x", tc), P("1.62x", tc), P("0.99x", tc), P("1.00x", tc)],
+    [P("mandel", tcl), P("5.50x", tc), P("5.71x", tc), P("2.50x", tc), P("5.52x", tc)],
+    [P("flops", tcl), P("3.66x", tc), P("3.63x", tc), P("1.98x", tc), P("3.65x", tc)],
+    [P("inthash", tcl), P("2.05x", tc), P("2.13x", tc), P("0.79x", tc), P("2.05x", tc)],
+    [P("<b>Geometric mean</b>", tcl), P("<b>2.79x</b>", tc), P("<b>2.56x</b>", tc),
+     P("<b>1.23x</b>", tc), P("<b>2.60x</b>", tc)],
 ]
 story.extend(safe_keep(
     [styled_table(ratio, [AVAIL * 0.28, AVAIL * 0.18, AVAIL * 0.18, AVAIL * 0.18, AVAIL * 0.18]),
      Paragraph("Table 3: JULES AOT CPU-time ratios; higher means JULES is slower.", caption)]))
 story.append(P(
-    "Three patterns stand out. First, the three JULES pipeline modes are within "
-    "one percent of each other on every kernel, so the pass subsets that "
-    "distinguish AOT from the two JIT modes do not change the final linearized "
-    "code for these shapes; the modes are semantically distinct pipelines but "
-    "performance-identical here. Second, JULES reaches GCC -O0 parity on fib "
-    "(1.04x) and comes within 1.3x on tak, meaning the SoN optimizer's scalar "
-    "transformations are competitive with unoptimized GCC once the backend's "
-    "slot-materialization overhead is amortized by call frequency. Third, the "
-    "kernel ordering tracks backend cost structure rather than algorithm: "
-    "mandel is the worst case because its inner loop combines f64 arithmetic, "
-    "a short-circuit condition, and loop-carried memory-backed variables, while "
-    "primes is the best case because both compilers are bound by the same "
-    "divide latency."))
+    "Three patterns stand out. First, the JULES pipeline modes and the -O2/-O3 "
+    "levels are within one percent of each other on every kernel: the level "
+    "differences for these shapes concentrate in compile time and pass activity "
+    "rather than final code, because the register allocator's input graph is "
+    "already simplified at -O2. Second, JULES now beats GCC -O0 on fib (0.73x), "
+    "primes (0.99x) and inthash (0.79x): the SoN optimizer plus a real register "
+    "allocator is competitive with unoptimized GCC everywhere except the "
+    "FP-dominated kernels. Third, the kernel ordering tracks backend cost "
+    "structure rather than algorithm: mandel remains the worst case because its "
+    "inner loop keeps seven floating-point values simultaneously live (four "
+    "loop-carried, two loop-invariant, and the iteration temporaries), which "
+    "exceeds what interval-based linear scan can keep in registers without "
+    "live-range splitting, while the intermediates round-trip through the xmm0 "
+    "accumulator between operations."))
 story.append(P(
     "The two production compilers split the field between themselves in an "
-    "instructive way: GCC wins fib and tak by wide margins (0.098 vs 0.156 and "
+    "instructive way: GCC wins fib and tak by wide margins (0.097 vs 0.156 and "
     "0.101 vs 0.184 seconds), while Clang wins mandel, primes, and inthash "
-    "(0.087 vs 0.100, 0.159 vs 0.258, and 0.072 vs 0.075). Against the stronger "
-    "compiler for each kernel, JULES's geometric-mean deficit is 4.22x to 4.53x; "
-    "against the weaker one it is 3.5x. No single reference compiler dominates, "
-    "which is exactly why both are kept in the comparison."))
+    "(0.087 vs 0.090, 0.159 vs 0.257, and 0.072 vs 0.074). Against the stronger "
+    "compiler for each kernel, JULES's geometric-mean deficit is 2.56x to 2.79x. "
+    "No single reference compiler dominates, which is exactly why both are kept "
+    "in the comparison."))
 
 # ============================ 5. COMPILE TIME ============================
 story.extend(section("5. Compile-Time Performance"))
 ct = [
     [P("<b>Kernel</b>", th), P("<b>julesc AOT</b>", th), P("<b>gcc -O3</b>", th),
      P("<b>clang -O3</b>", th)],
-    [P("fib", tcl), P("27 ms", tc), P("63 ms", tc), P("65 ms", tc)],
-    [P("tak", tcl), P("22 ms", tc), P("87 ms", tc), P("62 ms", tc)],
-    [P("primes", tcl), P("21 ms", tc), P("40 ms", tc), P("73 ms", tc)],
-    [P("mandel", tcl), P("20 ms", tc), P("44 ms", tc), P("68 ms", tc)],
-    [P("flops", tcl), P("23 ms", tc), P("36 ms", tc), P("61 ms", tc)],
-    [P("inthash", tcl), P("20 ms", tc), P("35 ms", tc), P("64 ms", tc)],
-    [P("<b>Geometric mean</b>", tcl), P("<b>22 ms</b>", tc), P("<b>48 ms</b>", tc), P("<b>71 ms</b>", tc)],
+    [P("fib", tcl), P("20 ms", tc), P("64 ms", tc), P("65 ms", tc)],
+    [P("tak", tcl), P("21 ms", tc), P("85 ms", tc), P("65 ms", tc)],
+    [P("primes", tcl), P("22 ms", tc), P("42 ms", tc), P("72 ms", tc)],
+    [P("mandel", tcl), P("22 ms", tc), P("63 ms", tc), P("64 ms", tc)],
+    [P("flops", tcl), P("19 ms", tc), P("37 ms", tc), P("65 ms", tc)],
+    [P("inthash", tcl), P("22 ms", tc), P("36 ms", tc), P("82 ms", tc)],
+    [P("<b>Geometric mean</b>", tcl), P("<b>21 ms</b>", tc), P("<b>51 ms</b>", tc), P("<b>68 ms</b>", tc)],
 ]
 story.extend(safe_keep(
     [styled_table(ct, [AVAIL * 0.28, AVAIL * 0.24, AVAIL * 0.24, AVAIL * 0.24]),
@@ -423,8 +437,8 @@ story.extend(safe_keep(
 story.extend(fig("/home/z/my-project/jules/bench/results/fig_compile.png",
                  "Figure 2: Compile-plus-link time per kernel; JULES finishes in roughly a third of the time of the production compilers.", max_h=210))
 story.append(P(
-    "JULES compiles the kernels in 22 milliseconds on the geometric mean against "
-    "48 for GCC -O3 and 71 for Clang -O3, a 2.2x and 3.2x advantage respectively. "
+    "JULES compiles the kernels in 21 milliseconds on the geometric mean against "
+    "51 for GCC -O3 and 68 for Clang -O3, a 2.4x and 3.2x advantage respectively. "
     "Part of this comes from the small input size, where the fixed driver and "
     "link overhead weighs heavily, and julesc's own link step is delegated to the "
     "system cc in all cases; the honest reading is that JULES's 89-pass pipeline "
@@ -437,119 +451,91 @@ story.append(P(
 # ============================ 6. GAP ANALYSIS ============================
 story.extend(section("6. Why the Gap: Assembly-Level Analysis"))
 story.append(P(
-    "The performance deficit decomposes into four identifiable mechanisms, all "
-    "visible by diffing the JULES assembly for fib against GCC's. None of them "
-    "are mysteries of scheduling; they are straight-line structural costs of the "
-    "current backend lowering strategy, and each has a known remedy in the pass "
-    "catalog."))
-story.append(add_heading("6.1 Every Value Round-Trips Through a Stack Slot", h2, level=1))
+    "The remaining 2.79x deficit decomposes into four identifiable mechanisms, "
+    "all visible by diffing the JULES assembly against GCC's. The previous "
+    "report's four mechanisms — slot materialization, unfused branches, absent "
+    "callee-saved promotion, and memory-backed loop locals — are now fixed by "
+    "the pass-85 register allocator, the fused compare-and-branch rewrite, and "
+    "SROA repair; what is left is the next layer of structural cost."))
+story.append(add_heading("6.1 FP Intermediates Round-Trip Through the Accumulator", h2, level=1))
 story.append(P(
-    "The linearizer assigns each SoN node a dedicated frame slot, and the "
-    "emitter loads operands from slots and stores results back to them on every "
-    "operation. The fib prologue stores the incoming argument, then every use "
-    "reloads it: the two recursive calls each spend four extra memory operations "
-    "moving n, the intermediate result, and the sum through the frame. GCC keeps "
-    "the live argument in a callee-saved register across both calls at a cost of "
-    "zero memory operations. With roughly one store and one load per graph node, "
-    "the slot traffic alone accounts for about half of the observed gap on the "
-    "ALU-bound kernels."))
+    "The emitter's SSE contract routes every floating-point operation through "
+    "xmm0 as an accumulator: each intermediate value is computed into xmm0, "
+    "moved to its register home, and moved back into xmm0 for the next "
+    "operation that consumes it. The register allocator removes all memory "
+    "traffic, but one to two register moves per operation remain, and on mandel "
+    "and flops those moves are a third of the inner-loop instruction count. The "
+    "fix is three-operand FP instruction selection — letting FpBin consume "
+    "operands directly from their register homes when the def-use chains allow "
+    "it — plus phi-copy coalescing so loop-carried values change homes without "
+    "the intermediate copy. GCC emits neither the moves nor the copies."))
+story.append(add_heading("6.2 Recursion Pays Full Frame Protocol", h2, level=1))
 story.append(P(
-    "The JULES lowering of the fib base case makes the pattern concrete, and is "
-    "worth comparing line by line with what GCC emits for the same source:"))
-code_cmp = [
-    [P("JULES (build/julesc, fib base case)", ParagraphStyle("CH", parent=th, alignment=TA_LEFT)),
-     P("GCC 14 -O2 (equivalent)", ParagraphStyle("CH2", parent=th, alignment=TA_LEFT))],
-    [P("movq -8(%rbp), %rax<br/>"
-       "cmpq $2, %rax<br/>"
-       "setl %al<br/>"
-       "movzbq %al, %rax<br/>"
-       "testq %rax, %rax<br/>"
-       "jne .L0_2<br/>"
-       "movq -8(%rbp), %rax<br/>"
-       "jmp .L0_100000", code),
-     P("movq -8(%rbp), %rax<br/>"
-       "cmpq $2, %rax<br/>"
-       "jge .L4<br/>"
-       "ret<br/>"
-       "subq $1, %rax<br/>"
-       "call fib<br/>"
-       "movq %rax, %rbx<br/>"
-       "movq -8(%rbp), %rax<br/>"
-       "subq $2, %rax<br/>"
-       "call fib<br/>"
-       "addq %rbx, %rax", code)],
-]
-ct_tbl = Table(code_cmp, colWidths=[AVAIL * 0.5, AVAIL * 0.5], hAlign="CENTER")
-ct_tbl.setStyle(TableStyle([
-    ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEADER_COLOR),
-    ("BACKGROUND", (0, 1), (-1, 1), CARD_BG),
-    ("LINEBEFORE", (0, 1), (0, 1), 2, ACCENT),
-    ("LINEBEFORE", (1, 1), (1, 1), 2, HEADER_FILL),
-    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ("LEFTPADDING", (0, 0), (-1, -1), 8),
-    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-    ("TOPPADDING", (0, 0), (-1, -1), 6),
-    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-]))
-story.extend(safe_keep([ct_tbl,
-                        Paragraph("Table 5: The six-instruction compare-branch pattern versus GCC's two-instruction form.", caption)]))
-story.append(add_heading("6.2 Boolean Conditions Materialize as Integers", h2, level=1))
+    "fib and tak sit at 3.5x and 3.3x because every call still executes the "
+    "complete frame protocol. Frame-pointer elision already removed the rbp "
+    "chain and the stack subtraction for functions whose values fit registers, "
+    "so a leaf-shaped fib is now push, push, compute, pop, pop, ret — but each "
+    "recursive call still moves arguments through the fixed rdi home and each "
+    "result through rax. GCC additionally keeps the fib argument in the same "
+    "register across both recursive calls, saving two moves per frame, and its "
+    "scheduler overlaps the call latency better. Closing the rest requires "
+    "argument-register coalescing at call sites and, more fundamentally, "
+    "self-recursive specialization, which the pass catalog reserves for the "
+    "inlining family."))
+story.append(add_heading("6.3 No Live-Range Splitting in the Allocator", h2, level=1))
 story.append(P(
-    "Every condition is lowered to setcc, movzx, test, and a conditional jump: "
-    "four instructions and two register writes where GCC needs cmp and jge. This "
-    "tax lands on every loop iteration and every if, and on mandel it is paid "
-    "twice per inner-loop step because the short-circuit and operator lowers to "
-    "an If/Region/Phi subgraph whose merge phi is a materialized bool. A fused "
-    "compare-and-branch emission path, falling out of the Cmp node directly "
-    "into jcc, removes three of the four instructions without touching the "
-    "graph structure."))
-story.append(add_heading("6.3 No Callee-Saved Register Promotion", h2, level=1))
+    "mandel's inner loop keeps seven floating-point values live — four "
+    "loop-carried (x, y, xt, yt), two loop-invariant (x0, y0), and the "
+    "iteration temporaries — against twelve allocatable XMM registers, so "
+    "nothing spills for lack of registers. The problem is ordering: the "
+    "temporaries are short-lived but born while all four loop-carried values "
+    "are still live, and interval-based linear scan assigns whole live ranges "
+    "at once, so a value either holds a register for its entire range or "
+    "spends it entirely in memory. A splitting allocator would let xt live in "
+    "a register until its last use in the body and hand the register to a "
+    "temp thereafter; the current pass 85 documents splitting and "
+    "graph-coloring coalescing as the upgrade path, and the spill heuristic "
+    "already refuses to victimize backedge-spanning (loop-carried) values."))
+story.append(add_heading("6.4 No Vectorization", h2, level=1))
 story.append(P(
-    "The backend does not yet use rbx or r12 through r15, so cross-call values "
-    "must spill to the frame. GCC's fib keeps the first recursive result in rbx "
-    "across the second call, which is why its call sequences are two memory "
-    "operations shorter. Register allocation across calls is the single "
-    "highest-leverage backend item: the pass catalog already reserves slot 85 "
-    "for register allocation, and the assembly here shows exactly the spill "
-    "traffic it would eliminate."))
-story.append(add_heading("6.4 No Vectorization and Memory-Backed Loop Locals", h2, level=1))
-story.append(P(
-    "mandel's 10.5x and flops's 4.4x reflect the two O(1)-per-op costs above "
-    "plus a third: JULES has no SIMD path, while both GCC and Clang vectorize "
-    "the mandel inner work and unroll the flops chain, and both keep x and y in "
-    "xmm registers across iterations where JULES reloads them from frame slots "
-    "every step. The vectorization passes in the catalog (54 through 66) are "
-    "documented scaffolds today; until at least the slot-materialization and "
-    "compare-branch costs are removed, vector work would be premature because "
-    "the scalar memory traffic would dominate the speedup."))
+    "Both GCC and Clang vectorize the mandel inner work and the flops "
+    "multiply-add chain; JULES has no SIMD path, so its per-element scalar "
+    "costs cap the achievable ratio near 3x on flops regardless of how clean "
+    "the scalar code becomes. The vectorization passes in the catalog (54 "
+    "through 66) remain documented scaffolds. Unlike the previous round, the "
+    "scalar prerequisites — register allocation, fused branches, constant "
+    "hoisting — are now in place, so vectorization is the next unlock rather "
+    "than premature work whose gains the memory traffic would dominate."))
 
 # ============================ 7. CONCLUSIONS ============================
 story.extend(section("7. Conclusions and Recommendations"))
 story.append(P(
     "The benchmark establishes the honest current position: on scalar kernel "
-    "code, JULES generates correct binaries that run within 2x of unoptimized "
-    "GCC, 4.53x of GCC -O3, and 4.22x of Clang -O3, while compiling 2.2x to "
-    "3.2x faster than both. The three JULES pipeline modes are "
-    "performance-identical on this suite, and the correctness gate now spans "
-    "54 verified kernel-configuration pairs on top of the 20-test regression "
-    "suite. The suite itself proved its worth immediately by catching two real "
-    "miscompiles, one of which produced silently wrong answers for a whole "
-    "class of arithmetic."))
+    "code, JULES generates correct binaries that run 1.23x off unoptimized "
+    "GCC, 2.79x off GCC -O3, and 2.56x off Clang -O3, while compiling 2.4x to "
+    "3.2x faster than both. The -O2 and -O3 levels and the two JIT pipeline "
+    "modes are performance-identical on this suite, and the correctness gate "
+    "now spans 66 verified kernel-configuration pairs on top of a 132-check "
+    "regression suite that sweeps every program through all seven optimization "
+    "levels. The suite proved its worth twice over: six real miscompiles were "
+    "caught and fixed across the two measurement rounds, four of them during "
+    "the backend overhaul this report documents."))
 story.append(P(
     "The recommended order of work follows the leverage identified in the "
-    "assembly analysis. First, implement the register allocator at pass slot 85 "
-    "and teach the emitter to keep values in registers across statements and "
-    "calls; this attacks the dominant cost on every kernel at once. Second, "
-    "add the fused compare-and-branch lowering for Cmp nodes feeding If and "
-    "loop exits, removing the setcc/movzx/test tax that mandel pays twice per "
-    "iteration. Third, promote loop-carried scalars out of the memory model "
-    "after SCCP and SROA confirm they are non-escaping, so hot f64 locals live "
-    "in xmm registers. Vectorization should come after these, both because the "
-    "scalar memory traffic would mask its benefit and because the benchmark "
-    "suite now provides the checksummed ground truth to validate it safely."))
+    "assembly analysis. First, move FP instruction selection to three-operand "
+    "form so intermediates are consumed from their register homes instead of "
+    "the xmm0 accumulator, and coalesce phi copies at the loop latch; together "
+    "these attack the dominant cost on mandel and flops. Second, add "
+    "live-range splitting (and eventually graph-coloring coalescing) to pass "
+    "85 so short-lived temporaries can reuse registers inside ranges that "
+    "loop-carried values hold across the backedge. Third, coalesce call "
+    "arguments directly into argument registers to shrink the recursion "
+    "protocol that dominates fib and tak. Vectorization should come after "
+    "these: the scalar prerequisites are now in place, and the benchmark "
+    "suite's checksummed ground truth makes it safe to validate."))
 story.append(P(
     "The benchmark infrastructure itself deserves maintenance as a first-class "
-    "artifact: it runs the full nine-configuration matrix in under three "
+    "artifact: it runs the full eleven-configuration matrix in under three "
     "minutes, verifies every output, and writes machine-readable results, so "
     "it can gate future backend work the way the regression suite gates "
     "correctness. Re-running it after each of the recommended changes will "

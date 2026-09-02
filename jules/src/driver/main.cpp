@@ -3,6 +3,15 @@
 //   julesc [options] input.jules
 //     -o <file>        output executable (default: a.out)
 //     -S               stop after emitting assembly (write .s, do not link)
+//     -O<lvl>          optimization level: -O0 -Og -O1 -O2 -O3 -Os -Oz
+//                      (bare -O = -O1; no flag defaults to -O2, the release
+//                      preset — levels are compile-time budget presets)
+//     --fp=M           strict (default) | fast — fast opts into FP semantics
+//     --pgo=M          off | instrument | use=<f> | sample=<f> | live
+//     --lto=M          none | thin | full (single module => full visibility)
+//     --fto            summary-assisted visibility alias (accepted)
+//     --jit-budget=B   fast | balanced | peak — JIT compile-latency class
+//                      (caps the effective level; not an execution tier)
 //     --emit-ir        dump IR after every pass
 //     --emit-dot       write final graph as DOT
 //     --stats          per-pass statistics
@@ -22,22 +31,76 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace jules {
 namespace driver {
 
+namespace {
+
+bool parse_kv(const std::string& a, const char* prefix, std::string& value) {
+    size_t n = std::strlen(prefix);
+    if (a.size() > n && a.compare(0, n, prefix) == 0) {
+        value = a.substr(n);
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 int run(int argc, char** argv) {
     std::string input, output = "a.out";
     bool emit_asm_only = false, emit_dot = false;
     PassOptions opts;
+    opts.level = OptLevel::O2;          // default release preset (spec §6)
+    opts.requested_level = OptLevel::O2;
     bool stats = false, list_passes = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+        std::string v;
         if (a == "-o" && i + 1 < argc) output = argv[++i];
         else if (a == "-S") emit_asm_only = true;
+        else if (a == "-O" || a == "-O1") opts.requested_level = OptLevel::O1;
+        else if (a.size() >= 3 && a.compare(0, 2, "-O") == 0) {
+            if (!parse_opt_level(a, opts.requested_level)) {
+                std::fprintf(stderr, "unknown optimization level '%s' (use -O0 -Og -O1 -O2 -O3 -Os -Oz; no -O4, no -Ofast)\n", a.c_str());
+                return 2;
+            }
+        }
+        else if (parse_kv(a, "--fp=", v)) {
+            if (v == "strict") opts.fp = FpMode::Strict;
+            else if (v == "fast") opts.fp = FpMode::Fast;
+            else { std::fprintf(stderr, "unknown --fp mode '%s' (strict|fast)\n", v.c_str()); return 2; }
+        }
+        else if (parse_kv(a, "--pgo=", v)) {
+            if (v == "off") opts.pgo = PgoMode::Off;
+            else if (v == "instrument") opts.pgo = PgoMode::Instrument;
+            else if (v == "live") opts.pgo = PgoMode::Live;
+            else if (v.compare(0, 4, "use=") == 0) opts.pgo = PgoMode::Use;
+            else if (v.compare(0, 7, "sample=") == 0) opts.pgo = PgoMode::Sample;
+            else { std::fprintf(stderr, "unknown --pgo mode '%s' (off|instrument|use=<f>|sample=<f>|live)\n", v.c_str()); return 2; }
+            if (opts.pgo == PgoMode::Instrument || opts.pgo == PgoMode::Use ||
+                opts.pgo == PgoMode::Sample) {
+                std::fprintf(stderr, "note: --pgo=%s accepted; profile plumbing (counters, profile format, evidence thresholds) is not implemented yet — building without profile data\n", v.c_str());
+            }
+        }
+        else if (parse_kv(a, "--lto=", v)) {
+            if (v == "none") opts.lto = LtoMode::None;
+            else if (v == "thin") opts.lto = LtoMode::Thin;
+            else if (v == "full") opts.lto = LtoMode::Full;
+            else { std::fprintf(stderr, "unknown --lto mode '%s' (none|thin|full)\n", v.c_str()); return 2; }
+        }
+        else if (a == "--fto") opts.lto = LtoMode::Fto;
+        else if (parse_kv(a, "--jit-budget=", v)) {
+            if (v == "fast") opts.jit_budget = JitBudget::Fast;
+            else if (v == "balanced") opts.jit_budget = JitBudget::Balanced;
+            else if (v == "peak") opts.jit_budget = JitBudget::Peak;
+            else { std::fprintf(stderr, "unknown --jit-budget '%s' (fast|balanced|peak)\n", v.c_str()); return 2; }
+        }
         else if (a == "--emit-ir") opts.emit_ir = true;
         else if (a == "--emit-dot") emit_dot = true;
         else if (a == "--stats") stats = true;
@@ -64,6 +127,15 @@ int run(int argc, char** argv) {
             return 2;
         } else input = a;
     }
+
+    // JIT compile-latency budget caps the effective level (spec §12); the
+    // requested level is preserved for reporting. Not an execution tier.
+    opts.level = cap_level_for_jit(opts.jit_budget, opts.requested_level);
+    if (opts.level != opts.requested_level)
+        std::fprintf(stderr, "note: --jit-budget=%s caps effective level %s -> %s\n",
+                     opts.jit_budget == JitBudget::Fast ? "fast"
+                     : opts.jit_budget == JitBudget::Balanced ? "balanced" : "peak",
+                     opt_level_name(opts.requested_level), opt_level_name(opts.level));
 
     if (list_passes) {
         std::vector<Pass*> all = PassRegistry::instance().create_all();

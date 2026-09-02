@@ -55,24 +55,45 @@ public:
         c_.g.replace_uses_as_memory(call, exit_mem);
         // 2) value users -> callee exit value
         if (exit_val != kNoNode) c_.g.replace_all_uses(call, exit_val);
-        // 3) repin nodes pinned at B that are NOT part of the call's memory
-        //    ancestry to the resume block
-        FlatMap<NodeId, bool> ancestry;
-        for (NodeId m = call_mem_; m != kNoNode && c_.g.node(m).op != Op::Dead;) {
-            ancestry.insert(m, true);
-            const Node& mn = c_.g.node(m);
-            m = (mn.op == Op::Phi) ? kNoNode : (mn.n_in > 1 ? mn.in[1] : kNoNode);
+        // 3) repin nodes pinned at B that execute AFTER the inlined body to
+        //    the resume block.
+        //
+        //    The classification is a full backward closure over ALL inputs
+        //    (control, memory, data) of the call: every node the call
+        //    transitively depends on must stay at B (or above). The memory
+        //    chain alone is NOT sufficient: reads (Load) carry no memory
+        //    version, so a load pinned at B that feeds the call-site's own
+        //    users was misclassified as "after the call" and stranded its
+        //    consumers — a use-before-def miscompile at low levels where
+        //    no post-inline folding repairs the graph (-O0/-Og).
+        //
+        //    Control nodes (Jump/If) keep the original always-move rule:
+        //    they are ordered by control flow, not data dependencies, and
+        //    moving them preserves the original block topology. Phis are
+        //    structural (pinned to their region) and never move.
+        FlatMap<NodeId, bool> before;
+        {
+            SmallVec<NodeId, 32> stack;
+            for (u8 i = 0; i < c_.g.node(call).n_in; ++i)
+                stack.push_back(c_.g.node(call).in[i]);
+            while (!stack.empty()) {
+                NodeId n = stack.back();
+                stack.pop_back();
+                if (n == kNoNode || before.contains(n)) continue;
+                before.insert(n, true);
+                const Node& nd = c_.g.node(n);
+                for (u8 i = 0; i < nd.n_in; ++i)
+                    if (nd.in[i] != kNoNode) stack.push_back(nd.in[i]);
+            }
         }
         const SmallVec<NodeId, 4> pinned = c_.g.uses_of(B);
         for (NodeId u : pinned) {
             if (u == call || u == j_entry_) continue;
             Node& un = c_.g.node(u);
             if (un.op == Op::Dead || un.n_in == 0 || un.in[0] != B) continue;
-            if (un.op == Op::Jump && un.in[0] == B && u != j_entry_) {
-                // a jump out of B stays (it precedes the call structurally)
-                if (ancestry.contains(u)) continue;
-            }
-            if (ancestry.contains(u)) continue;
+            if (un.op == Op::Phi) continue;        // structural: block-owned
+            bool controlish = un.op == Op::Jump || un.op == Op::If;
+            if (!controlish && before.contains(u)) continue; // feeds the call
             c_.g.set_input(u, 0, j_exit_);
         }
         c_.g.kill(call);

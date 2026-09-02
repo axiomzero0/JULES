@@ -42,6 +42,28 @@ run_test() {
     return 0
 }
 
+# Level-matrix runner: compile + run + diff at a specific -O level.
+run_level() {
+    local name=$1 lvl=$2
+    local src="tests/programs/${name}.jules"
+    local exp="tests/expected/${name}.txt"
+    local out="$WORK/${name}_${lvl}.out"
+
+    if ! timeout 30 $JULESC -"$lvl" "$src" -o "$WORK/${name}_${lvl}.bin" > /dev/null 2>&1; then
+        echo "FAIL $name @ -$lvl (compile)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    timeout 30 "$WORK/${name}_${lvl}.bin" > "$out" 2>&1
+    if ! diff -q "$exp" "$out" > /dev/null 2>&1; then
+        echo "FAIL $name @ -$lvl (output)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    pass=$((pass + 1))
+    return 0
+}
+
 # pass-activity assertion: sum of the `changes` column across ALL per-function
 # stat tables must be > 0 (stats are emitted one table per function; taking the
 # last table's value only would miss work done in earlier functions).
@@ -60,8 +82,21 @@ assert_pass_active() {
     pass=$((pass + 1))
 }
 
+# Level matrix: every program must produce its expected output at every
+# optimization level (levels are budget presets, never semantic changes).
+# t08_tco is exempt at -O0/-Og: its 1M-deep tail recursion requires TCO,
+# which the spec gates off at debug levels (the same program overflows the
+# stack under `gcc -O0`).
+LEVELS="O0 Og O1 O2 O3 Os Oz"
 for t in tests/programs/*.jules; do
-    run_test "$(basename "$t" .jules)"
+    name="$(basename "$t" .jules)"
+    run_test "$name"
+    for lvl in $LEVELS; do
+        if [ "$name" = "t08_tco" ] && { [ "$lvl" = "O0" ] || [ "$lvl" = "Og" ]; }; then
+            continue
+        fi
+        run_level "$name" "$lvl"
+    done
 done
 
 # Optimizer self-verification: the pass must have actually transformed.

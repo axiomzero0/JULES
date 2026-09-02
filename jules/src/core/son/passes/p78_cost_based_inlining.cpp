@@ -4,13 +4,12 @@
 // successful inline exposes new inlinable sites inside the cloned body,
 // until nothing qualifies or the per-function budget (cloned nodes) is
 // exhausted. Recursion is bounded by pass 79's policy.
+//
+// Level budgets (spec §8): threshold and per-function budget are presets —
+// -O1 16/50, -O2 24/225, -O3 48/600, -Os/-Oz smaller (size-biased).
 #include "core/son/passes/inline.h"
 
 namespace jules {
-
-namespace {
-constexpr u32 kInlineThreshold = 24; // callee node estimate must be <= this
-} // namespace
 
 class CostBasedInliningPass : public Pass {
 public:
@@ -23,7 +22,9 @@ public:
     }
     bool run(PassContext& ctx) override {
         bool changed = false;
-        u32 budget = inline_budget_default();
+        LevelBudgets lb = level_budgets(ctx.opts.level);
+        u32 threshold = lb.inline_threshold;
+        u32 budget = lb.inline_budget;
         for (u32 round = 0; round < kMaxRounds && budget > 0; ++round) {
             bool this_round = false;
             for (FunctionGraph& caller : ctx.mod.fns) {
@@ -33,7 +34,7 @@ public:
                     if (n.op != Op::Call || n.aux == kFnPrint || n.aux == kFnFree) continue;
                     const FunctionGraph* callee = ctx.mod.find_fn(n.aux);
                     if (!callee || callee->no_inline) continue;
-                    if (callee->node_estimate > kInlineThreshold) continue;
+                    if (callee->node_estimate > threshold) continue;
                     if (!inline_recursion_ok(caller.fid, callee->fid)) continue;
                     // constant arguments make the clone cheap (pass 80 policy hook)
                     u32 effective = callee->node_estimate;

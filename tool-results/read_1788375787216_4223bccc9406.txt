@@ -1,0 +1,1027 @@
+     1→// x86-64 System V backend: SoN linear blocks -> MIR (pass 84), frame layout
+     2→// (pass 85), and AT&T assembly serialization. Correctness-first design:
+     3→// spill-everywhere slot allocator (every value lives in a frame slot; the
+     4→// linear-scan upgrade path is documented in docs/architecture.md).
+     5→#include "core/codegen/linear.h"
+     6→#include "core/son/passes/pass_utils.h"
+     7→#include "core/son/son.h"
+     8→
+     9→#include <cstdio>
+    10→#include <cstring>
+    11→#include <sstream>
+    12→
+    13→namespace jules {
+    14→
+    15→namespace {
+    16→
+    17→// ---- helpers -----------------------------------------------------------------
+    18→const char* rname(R r) {
+    19→    switch (r) {
+    20→        case R::Rax: return "rax"; case R::Rcx: return "rcx";
+    21→        case R::Rdx: return "rdx"; case R::Rsi: return "rsi";
+    22→        case R::Rdi: return "rdi"; case R::R8:  return "r8";
+    23→        case R::R9:  return "r9";  case R::R10: return "r10";
+    24→        case R::R11: return "r11"; case R::Rbp: return "rbp";
+    25→        case R::Rsp: return "rsp";
+    26→        case R::Xmm0: return "xmm0"; case R::Xmm1: return "xmm1";
+    27→        case R::Xmm2: return "xmm2"; case R::Xmm3: return "xmm3";
+    28→        case R::Xmm4: return "xmm4"; case R::Xmm5: return "xmm5";
+    29→        case R::Xmm6: return "xmm6"; case R::Xmm7: return "xmm7";
+    30→    }
+    31→    return "rax";
+    32→}
+    33→
+    34→const char* rname32(R r) {
+    35→    switch (r) {
+    36→        case R::Rax: return "eax"; case R::Rcx: return "ecx";
+    37→        case R::Rdx: return "edx"; case R::Rsi: return "esi";
+    38→        case R::Rdi: return "edi"; case R::R8:  return "r8d";
+    39→        case R::R9:  return "r9d";  case R::R10: return "r10d";
+    40→        case R::R11: return "r11d"; case R::Rbp: return "ebp";
+    41→        case R::Rsp: return "esp";
+    42→        default: return rname(r); // xmm regs keep their names
+    43→    }
+    44→}
+    45→
+    46→const char* cc(Cond c) {
+    47→    switch (c) {
+    48→        case Cond::E: return "e";  case Cond::NE: return "ne";
+    49→        case Cond::L: return "l";  case Cond::LE: return "le";
+    50→        case Cond::G: return "g";  case Cond::GE: return "ge";
+    51→        case Cond::B: return "b";  case Cond::BE: return "be";
+    52→        case Cond::A: return "a";  case Cond::AE: return "ae";
+    53→    }
+    54→    return "e";
+    55→}
+    56→
+    57→const char* ssz(u8 size) { return size == 8 ? "q" : size == 4 ? "l" : "b"; }
+    58→const char* fpsz(u8 size) { return size == 8 ? "sd" : "ss"; }
+    59→
+    60→Cond cmp_cond(CmpOp op, bool is_signed) {
+    61→    switch (op) {
+    62→        case CmpOp::Eq: return Cond::E;
+    63→        case CmpOp::Ne: return Cond::NE;
+    64→        case CmpOp::Lt: return is_signed ? Cond::L : Cond::B;
+    65→        case CmpOp::Le: return is_signed ? Cond::LE : Cond::BE;
+    66→        case CmpOp::Gt: return is_signed ? Cond::G : Cond::A;
+    67→        case CmpOp::Ge: return is_signed ? Cond::GE : Cond::AE;
+    68→    }
+    69→    return Cond::E;
+    70→}
+    71→
+    72→const R kArgGpRegs[] = {R::Rdi, R::Rsi, R::Rdx, R::Rcx, R::R8, R::R9};
+    73→constexpr u8 kArgGpCount = 6;
+    74→const R kArgXmmRegs[] = {R::Xmm0, R::Xmm1, R::Xmm2, R::Xmm3, R::Xmm4, R::Xmm5,
+    75→                         R::Xmm6, R::Xmm7};
+    76→constexpr u8 kArgXmmCount = 8;
+    77→constexpr int kBlockLabelBase = 0;     // block labels: 0..N-1
+    78→constexpr int kLocalLabelBase = 100000; // local labels (epilogue, fp selects)
+    79→constexpr int kEntryLabelId = 999999;   // function entry: BEFORE the prologue
+    80→
+    81→u8 sz_of(TypeId t) { return ty_bits(t) == 32 ? 4 : 8; }
+    82→bool fp_of(TypeId t) { return ty_is_float(t); }
+    83→
+    84→struct Emitter {
+    85→    Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms)
+    86→        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms) {
+    87→        lf_.label_counter = kLocalLabelBase;
+    88→    }
+    89→
+    90→    // ---- slots ---------------------------------------------------------------
+    91→    i32 slot(NodeId n) {
+    92→        if (const i32* s = lf_.slot_of.find(n)) return *s;
+    93→        i32 s = lf_.slot_count++;
+    94→        lf_.slot_of.insert(n, s);
+    95→        return s;
+    96→    }
+    97→
+    98→    // ---- emit shorthands --------------------------------------------------------
+    99→    Inst& emit(IOp op) {
+   100→        lf_.code.push_back(Inst{});
+   101→        Inst& i = lf_.code.back();
+   102→        i.op = op;
+   103→        return i;
+   104→    }
+   105→    Inst& reg2(IOp op, R a, R b, u8 size = 8) {
+   106→        Inst& i = emit(op);
+   107→        i.a.k = Operand::K::Reg; i.a.reg = a;
+   108→        i.b.k = Operand::K::Reg; i.b.reg = b;
+   109→        i.size = size;
+   110→        return i;
+   111→    }
+   112→    Inst& st_slot(IOp op, R a, i32 s, u8 size = 8) {
+   113→        Inst& i = emit(op);
+   114→        i.a.k = Operand::K::Reg; i.a.reg = a;
+   115→        i.b.k = Operand::K::Slot; i.b.slot = s;
+   116→        i.size = size;
+   117→        return i;
+   118→    }
+   119→    Inst& ld_slot(IOp op, R a, i32 s, u8 size = 8) {
+   120→        Inst& i = emit(op);
+   121→        i.a.k = Operand::K::Reg; i.a.reg = a;
+   122→        i.b.k = Operand::K::Slot; i.b.slot = s;
+   123→        i.size = size;
+   124→        return i;
+   125→    }
+   126→    Inst& imm_reg(IOp op, R a, i64 v) {
+   127→        Inst& i = emit(op);
+   128→        i.a.k = Operand::K::Reg; i.a.reg = a;
+   129→        i.b.k = Operand::K::Imm; i.b.imm = v;
+   130→        return i;
+   131→    }
+   132→    Inst& imm_slot(i32 s, i64 v) {
+   133→        Inst& i = emit(IOp::MovSImm);
+   134→        i.a.k = Operand::K::Slot; i.a.slot = s;
+   135→        i.b.k = Operand::K::Imm; i.b.imm = v;
+   136→        return i;
+   137→    }
+   138→    Inst& label(int id) {
+   139→        Inst& i = emit(IOp::Label);
+   140→        i.a.k = Operand::K::Label; i.a.label = id;
+   141→        return i;
+   142→    }
+   143→    Inst& jump(int id) {
+   144→        Inst& i = emit(IOp::Jmp);
+   145→        i.a.k = Operand::K::Label; i.a.label = id;
+   146→        return i;
+   147→    }
+   148→    Inst& jcc(Cond c, int id) {
+   149→        Inst& i = emit(IOp::Jcc);
+   150→        i.cond = c;
+   151→        i.a.k = Operand::K::Label; i.a.label = id;
+   152→        return i;
+   153→    }
+   154→    int new_label() { return lf_.label_counter++; }
+   155→
+   156→    // ---- operand loading ----------------------------------------------------------
+   157→    void load_value(NodeId n, R r, u8 size = 8) {
+   158→        const Node& nd = g_.node(n);
+   159→        if (nd.op == Op::Const) {
+   160→            imm_reg(IOp::MovRImm, r, nd.ival);
+   161→            return;
+   162→        }
+   163→        if (nd.op == Op::Alloc && (nd.flags & kFlagStackPromoted)) {
+   164→            Inst& i = emit(IOp::LeaSlot);
+   165→            i.a.k = Operand::K::Reg; i.a.reg = r;
+   166→            i.b.k = Operand::K::Slot; i.b.slot = slot(n);
+   167→            return;
+   168→        }
+   169→        ld_slot(IOp::MovSR, r, slot(n), size);
+   170→    }
+   171→    void load_fp(NodeId n, R r) {
+   172→        const Node& nd = g_.node(n);
+   173→        u8 size = sz_of(nd.ty);
+   174→        if (nd.op == Op::Const) {
+   175→            u64 bits = 0;
+   176→            if (size == 8) {
+   177→                std::memcpy(&bits, &nd.fval, sizeof bits);
+   178→                imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
+   179→                reg2(IOp::MovFpFromGpr, r, R::Rax);
+   180→            } else {
+   181→                f32 f = static_cast<f32>(nd.fval);
+   182→                u32 b32 = 0;
+   183→                std::memcpy(&b32, &f, sizeof b32);
+   184→                imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(b32));
+   185→                reg2(IOp::MovFpFromGpr32, r, R::Rax);
+   186→            }
+   187→            return;
+   188→        }
+   189→        Inst& i = emit(IOp::MovFpR);
+   190→        i.a.k = Operand::K::Reg; i.a.reg = r;
+   191→        i.b.k = Operand::K::Slot; i.b.slot = slot(n);
+   192→        i.size = size;
+   193→    }
+   194→    void store_result(NodeId n, u8 size = 8) { st_slot(IOp::MovRS, R::Rax, slot(n), size); }
+   195→
+   196→    // ---- function ---------------------------------------------------------------------
+   197→    bool run() {
+   198→        epilogue_label_ = new_label();
+   199→
+   200→        // the entry label sits BEFORE the prologue: call targets land here
+   201→        label(kEntryLabelId);
+   202→        emit(IOp::PushRbp);
+   203→        reg2(IOp::MovRR, R::Rbp, R::Rsp);
+   204→        {
+   205→            Inst& i = emit(IOp::FrameSub);
+   206→            i.b.k = Operand::K::Imm;
+   207→            i.b.imm = 0;
+   208→        }
+   209→
+   210→        u8 gp = 0, xm = 0;
+   211→        for (NodeId id = 0; id < g_.size(); ++id) {
+   212→            const Node& n = g_.node(id);
+   213→            if (n.op != Op::Param) continue;
+   214→            i32 s = slot(id);
+   215→            if (fp_of(n.ty)) {
+   216→                if (xm >= kArgXmmCount) return false;
+   217→                st_slot(IOp::MovFpS, kArgXmmRegs[xm++], s, sz_of(n.ty));
+   218→            } else {
+   219→                if (gp >= kArgGpCount) return false;
+   220→                st_slot(IOp::MovRS, kArgGpRegs[gp++], s, 8);
+   221→            }
+   222→        }
+   223→
+   224→        for (LBlock& b : lf_.blocks) {
+   225→            label(kBlockLabelBase + b.index);
+   226→            for (NodeId n : b.nodes) emit_node(n);
+   227→            for (int ci : b.phi_copy_indices) {
+   228→                const LPhiCopy& cp = lf_.phi_copies[static_cast<size_t>(ci)];
+   229→                emit_phi_copy(cp);
+   230→            }
+   231→            emit_terminator(b);
+   232→        }
+   233→
+   234→        label(epilogue_label_);
+   235→        emit(IOp::Ret);
+   236→        return true;
+   237→    }
+   238→
+   239→    // ---- nodes -------------------------------------------------------------------------
+   240→    void emit_node(NodeId n) {
+   241→        const Node& nd = g_.node(n);
+   242→        switch (nd.op) {
+   243→            case Op::Bin:
+   244→                if (fp_of(nd.ty)) emit_fp_bin(n);
+   245→                else emit_int_bin(n);
+   246→                break;
+   247→            case Op::Cmp:  emit_cmp(n);  break;
+   248→            case Op::Un:   emit_un(n);   break;
+   249→            case Op::Cast: emit_cast(n); break;
+   250→            case Op::Select: emit_select(n); break;
+   251→            case Op::Load:  emit_load(n);  break;
+   252→            case Op::Store: emit_store(n); break;
+   253→            case Op::Alloc: emit_alloc(n); break;
+   254→            case Op::Call:  emit_call(n);  break;
+   255→            default: break; // Const/Param/Phi/control handled elsewhere
+   256→        }
+   257→    }
+   258→
+   259→    // signed i32 division needs sign-extension to 64-bit before idivq
+   260→    void load_div_operand(NodeId n, R r) {
+   261→        const Node& nd = g_.node(n);
+   262→        u8 size = sz_of(nd.ty);
+   263→        if (nd.op == Op::Const) {
+   264→            imm_reg(IOp::MovRImm, r, nd.ival);
+   265→            if (size == 4 && ty_is_signed(nd.ty)) return; // imm already exact
+   266→            return;
+   267→        }
+   268→        ld_slot(IOp::MovSR, r, slot(n), size);
+   269→        if (size == 4 && ty_is_signed(nd.ty)) emit(IOp::SExt32);
+   270→    }
+   271→
+   272→    void emit_int_bin(NodeId n) {
+   273→        const Node& nd = g_.node(n);
+   274→        BinOp op = static_cast<BinOp>(nd.sub);
+   275→        u8 size = sz_of(nd.ty);
+   276→        if (op == BinOp::Div || op == BinOp::Mod) {
+   277→            load_div_operand(nd.in[1], R::Rax);
+   278→            load_div_operand(nd.in[2], R::Rcx);
+   279→            if (ty_is_signed(nd.ty)) {
+   280→                emit(IOp::Cqo);
+   281→            } else {
+   282→                // unsigned divide needs edx zeroed (rdx:rax dividend)
+   283→                Inst& z = emit(IOp::ArithRImm);
+   284→                z.bin = BinOp::Xor;
+   285→                z.a.k = Operand::K::Reg; z.a.reg = R::Rdx;
+   286→                z.b.k = Operand::K::Imm; z.b.imm = 0;
+   287→            }
+   288→            Inst& dv = emit(ty_is_signed(nd.ty) ? IOp::IDiv : IOp::UDiv);
+   289→            dv.a.k = Operand::K::Reg; dv.a.reg = R::Rcx;
+   290→            if (op == BinOp::Mod) reg2(IOp::MovRR, R::Rax, R::Rdx, 8);
+   291→            store_result(n, size);
+   292→            return;
+   293→        }
+   294→        if (op == BinOp::Shl || op == BinOp::Shr) {
+   295→            load_value(nd.in[1], R::Rax, size);
+   296→            if (g_.node(nd.in[2]).op == Op::Const) {
+   297→                ConstVal c;
+   298→                const_of(g_, nd.in[2], c);
+   299→                Inst& i = emit(IOp::ShiftImm);
+   300→                i.bin = op;
+   301→                i.sar = (op == BinOp::Shr && ty_is_signed(nd.ty));
+   302→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   303→                i.b.k = Operand::K::Imm; i.b.imm = c.iv;
+   304→                i.size = size;
+   305→            } else {
+   306→                load_value(nd.in[2], R::Rcx, size);
+   307→                Inst& i = emit(IOp::ShiftCl);
+   308→                i.bin = op;
+   309→                i.sar = (op == BinOp::Shr && ty_is_signed(nd.ty));
+   310→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   311→                i.size = size;
+   312→            }
+   313→            store_result(n, size);
+   314→            return;
+   315→        }
+   316→        load_value(nd.in[1], R::Rax, size);
+   317→        if (g_.node(nd.in[2]).op == Op::Const) {
+   318→            ConstVal c;
+   319→            const_of(g_, nd.in[2], c);
+   320→            if (c.iv == 0 && (op == BinOp::Add || op == BinOp::Sub)) {
+   321→                store_result(n, size);
+   322→                return;
+   323→            }
+   324→            // Immediate-operand forms (add/sub/imul/and/or/xor $imm, reg)
+   325→            // only encode a sign-extended imm32; wider constants must be
+   326→            // materialized into a register (movq $imm picks movabs as needed).
+   327→            i64 sv = static_cast<i64>(c.iv);
+   328→            i32 low = static_cast<i32>(static_cast<u32>(c.iv));
+   329→            bool fits32 = (sv >= -2147483648LL && sv <= 2147483647LL) ||
+   330→                          (static_cast<u64>(static_cast<i64>(low)) == c.iv);
+   331→            if (fits32) {
+   332→                Inst& i = emit(IOp::ArithRImm);
+   333→                i.bin = op;
+   334→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   335→                i.b.k = Operand::K::Imm; i.b.imm = c.iv;
+   336→                i.size = size;
+   337→            } else {
+   338→                imm_reg(IOp::MovRImm, R::Rcx, static_cast<i64>(c.iv));
+   339→                Inst& i = reg2(IOp::ArithRR, R::Rax, R::Rcx, size);
+   340→                i.bin = op;
+   341→            }
+   342→        } else {
+   343→            load_value(nd.in[2], R::Rcx, size);
+   344→            Inst& i = reg2(IOp::ArithRR, R::Rax, R::Rcx, size);
+   345→            i.bin = op;
+   346→        }
+   347→        store_result(n, size);
+   348→    }
+   349→
+   350→    void emit_fp_bin(NodeId n) {
+   351→        const Node& nd = g_.node(n);
+   352→        u8 size = sz_of(nd.ty);
+   353→        load_fp(nd.in[1], R::Xmm0);
+   354→        load_fp(nd.in[2], R::Xmm1);
+   355→        Inst& i = emit(IOp::FpBin);
+   356→        i.bin = static_cast<BinOp>(nd.sub);
+   357→        i.size = size;
+   358→        Inst& st = emit(IOp::MovFpS);
+   359→        st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   360→        st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   361→        st.size = size;
+   362→    }
+   363→
+   364→    void emit_cmp(NodeId n) {
+   365→        const Node& nd = g_.node(n);
+   366→        const Node& an = g_.node(nd.in[1]);
+   367→        u8 size = sz_of(an.ty);
+   368→        Cond cond = cmp_cond(static_cast<CmpOp>(nd.sub), ty_is_signed(an.ty));
+   369→        if (fp_of(an.ty)) {
+   370→            load_fp(nd.in[1], R::Xmm0);
+   371→            load_fp(nd.in[2], R::Xmm1);
+   372→            emit(IOp::FpCmp).size = sz_of(an.ty);
+   373→        } else {
+   374→            load_value(nd.in[1], R::Rax, size);
+   375→            if (g_.node(nd.in[2]).op == Op::Const) {
+   376→                ConstVal c;
+   377→                const_of(g_, nd.in[2], c);
+   378→                Inst& i = emit(IOp::CmpRImm);
+   379→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   380→                i.b.k = Operand::K::Imm; i.b.imm = c.iv;
+   381→                i.size = size;
+   382→            } else {
+   383→                load_value(nd.in[2], R::Rcx, size);
+   384→                reg2(IOp::CmpRR, R::Rax, R::Rcx, size);
+   385→            }
+   386→        }
+   387→        Inst& sc = emit(IOp::Setcc);
+   388→        sc.cond = cond;
+   389→        emit(IOp::MovZX);
+   390→        store_result(n, 8);
+   391→    }
+   392→
+   393→    void emit_un(NodeId n) {
+   394→        const Node& nd = g_.node(n);
+   395→        UnOp op = static_cast<UnOp>(nd.sub);
+   396→        if (fp_of(nd.ty)) {
+   397→            load_fp(nd.in[1], R::Xmm0);
+   398→            Inst& i = emit(IOp::FpNeg);
+   399→            i.size = sz_of(nd.ty);
+   400→            Inst& st = emit(IOp::MovFpS);
+   401→            st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   402→            st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   403→            st.size = i.size;
+   404→            return;
+   405→        }
+   406→        load_value(nd.in[1], R::Rax, 8);
+   407→        switch (op) {
+   408→            case UnOp::Neg: {
+   409→                Inst& i = emit(IOp::Neg);
+   410→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   411→                break;
+   412→            }
+   413→            case UnOp::Not: {
+   414→                Inst& i = emit(IOp::ArithRImm);
+   415→                i.bin = BinOp::Xor;
+   416→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   417→                i.b.k = Operand::K::Imm; i.b.imm = 1;
+   418→                break;
+   419→            }
+   420→            case UnOp::BNot: {
+   421→                Inst& i = emit(IOp::Not);
+   422→                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   423→                break;
+   424→            }
+   425→        }
+   426→        store_result(n, 8);
+   427→    }
+   428→
+   429→    void emit_cast(NodeId n) {
+   430→        const Node& nd = g_.node(n);
+   431→        NodeId src = nd.in[1];
+   432→        const Node& sn = g_.node(src);
+   433→        u8 src_size = sz_of(sn.ty);
+   434→        u8 dst_size = sz_of(nd.ty);
+   435→
+   436→        switch (static_cast<CastOp>(nd.sub)) {
+   437→            case CastOp::ZExt:
+   438→                load_value(src, R::Rax, src_size);
+   439→                store_result(n, 8);
+   440→                return;
+   441→            case CastOp::SExt:
+   442→                if (src_size == 4) {
+   443→                    ld_slot(IOp::MovSR, R::Rax, slot(src), 4);
+   444→                    emit(IOp::SExt32);
+   445→                } else {
+   446→                    load_value(src, R::Rax, 8);
+   447→                }
+   448→                store_result(n, 8);
+   449→                return;
+   450→            case CastOp::Trunc:
+   451→                load_value(src, R::Rax, dst_size);
+   452→                store_result(n, dst_size);
+   453→                return;
+   454→            case CastOp::SiToFp: {
+   455→                load_value(src, R::Rax, src_size);
+   456→                Inst& i = emit(IOp::CvtToFp);
+   457→                i.size = dst_size;
+   458→                Inst& st = emit(IOp::MovFpS);
+   459→                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   460→                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   461→                st.size = dst_size;
+   462→                return;
+   463→            }
+   464→            case CastOp::FpToSi: {
+   465→                load_fp(src, R::Xmm0);
+   466→                emit(IOp::CvtToInt).size = dst_size;
+   467→                store_result(n, dst_size);
+   468→                return;
+   469→            }
+   470→            case CastOp::FpExt: {
+   471→                load_fp(src, R::Xmm0);
+   472→                emit(IOp::FpExt);
+   473→                Inst& st = emit(IOp::MovFpS);
+   474→                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   475→                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   476→                st.size = 8;
+   477→                return;
+   478→            }
+   479→            case CastOp::FpTrunc: {
+   480→                load_fp(src, R::Xmm0);
+   481→                emit(IOp::FpTrunc);
+   482→                Inst& st = emit(IOp::MovFpS);
+   483→                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   484→                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   485→                st.size = 4;
+   486→                return;
+   487→            }
+   488→            case CastOp::Ptr:
+   489→                load_value(src, R::Rax, 8);
+   490→                store_result(n, 8);
+   491→                return;
+   492→        }
+   493→    }
+   494→
+   495→    void emit_select(NodeId n) {
+   496→        const Node& nd = g_.node(n);
+   497→        NodeId c = nd.in[1], t = nd.in[2], f = nd.in[3];
+   498→        bool fp = fp_of(nd.ty);
+   499→        u8 size = sz_of(nd.ty);
+   500→        load_value(c, R::Rdx, 8);
+   501→        if (!fp) {
+   502→            // cmovcc src, dst: dst = cond ? src : dst — so the FALSE value
+   503→            // lives in the destination and the TRUE value in the source.
+   504→            load_value(f, R::Rax, size);
+   505→            load_value(t, R::Rcx, size);
+   506→            Inst& i = reg2(IOp::Cmov, R::Rax, R::Rcx, size);
+   507→            i.cond = Cond::NE;
+   508→            store_result(n, size);
+   509→            return;
+   510→        }
+   511→        int ltrue = new_label();
+   512→        int lend = new_label();
+   513→        jcc(Cond::NE, ltrue);
+   514→        load_fp(f, R::Xmm0);
+   515→        jump(lend);
+   516→        label(ltrue);
+   517→        load_fp(t, R::Xmm0);
+   518→        label(lend);
+   519→        Inst& st = emit(IOp::MovFpS);
+   520→        st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   521→        st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   522→        st.size = size;
+   523→    }
+   524→
+   525→    void emit_load(NodeId n) {
+   526→        const Node& nd = g_.node(n);
+   527→        u8 size = sz_of(nd.ty);
+   528→        load_value(nd.in[2], R::Rax, 8);
+   529→        Inst& i = emit(IOp::LoadMem);
+   530→        i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   531→        i.b.k = Operand::K::Reg; i.b.reg = R::Rax;
+   532→        i.size = size;
+   533→        store_result(n, size);
+   534→    }
+   535→
+   536→    void emit_store(NodeId n) {
+   537→        const Node& nd = g_.node(n);
+   538→        NodeId val = nd.in[3];
+   539→        bool fp = fp_of(g_.node(val).ty);
+   540→        u8 size = sz_of(g_.node(val).ty);
+   541→        load_value(nd.in[2], R::Rcx, 8);
+   542→        if (fp) {
+   543→            load_fp(val, R::Xmm0);
+   544→            Inst& i = emit(IOp::StoreMem);
+   545→            i.a.k = Operand::K::Reg; i.a.reg = R::Rcx;
+   546→            i.b.k = Operand::K::Reg; i.b.reg = R::Xmm0;
+   547→            i.size = size;
+   548→        } else {
+   549→            load_value(val, R::Rdx, size);
+   550→            Inst& i = emit(IOp::StoreMem);
+   551→            i.a.k = Operand::K::Reg; i.a.reg = R::Rcx;
+   552→            i.b.k = Operand::K::Reg; i.b.reg = R::Rdx;
+   553→            i.size = size;
+   554→        }
+   555→    }
+   556→
+   557→    void emit_alloc(NodeId n) {
+   558→        const Node& nd = g_.node(n);
+   559→        if (nd.flags & kFlagStackPromoted) {
+   560→            (void)slot(n); // reserve the slot; address computed via LeaSlot
+   561→            return;
+   562→        }
+   563→        const Node& size = g_.node(nd.in[2]);
+   564→        imm_reg(IOp::MovRImm, R::Rdi, size.ival);
+   565→        Inst& c = emit(IOp::CallSym);
+   566→        c.a.k = Operand::K::Sym; c.a.sym = "malloc";
+   567→        store_result(n, 8);
+   568→    }
+   569→
+   570→    void emit_call(NodeId n) {
+   571→        const Node& nd = g_.node(n);
+   572→        if (nd.aux == kFnPrint) {
+   573→            emit_print(n);
+   574→            return;
+   575→        }
+   576→        if (nd.aux == kFnFree) {
+   577→            // free(ptr): single pointer argument
+   578→            load_value(nd.in[2], R::Rdi, 8);
+   579→            Inst& c = emit(IOp::CallSym);
+   580→            c.a.k = Operand::K::Sym; c.a.sym = "free";
+   581→            return;
+   582→        }
+   583→        u8 gp = 0, xm = 0;
+   584→        for (u8 i = 2; i < nd.n_in; ++i) {
+   585→            NodeId a = nd.in[i];
+   586→            if (fp_of(g_.node(a).ty)) {
+   587→                if (xm >= kArgXmmCount) return;
+   588→                load_fp(a, kArgXmmRegs[xm++]);
+   589→            } else {
+   590→                if (gp >= kArgGpCount) return;
+   591→                load_value(a, kArgGpRegs[gp++], sz_of(g_.node(a).ty));
+   592→            }
+   593→        }
+   594→        if (nd.flags & kFlagTailCall) {
+   595→            Inst& tc = emit(IOp::TailCallFn);
+   596→            tc.a.k = Operand::K::Label; tc.a.label = static_cast<int>(nd.aux);
+   597→            return;
+   598→        }
+   599→        Inst& c = emit(IOp::CallFn);
+   600→        c.a.k = Operand::K::Label; c.a.label = static_cast<int>(nd.aux);
+   601→        if (nd.ty != ty_void()) {
+   602→            if (fp_of(nd.ty)) {
+   603→                Inst& st = emit(IOp::MovFpS);
+   604→                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   605→                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+   606→                st.size = sz_of(nd.ty);
+   607→            } else {
+   608→                store_result(n, 8);
+   609→            }
+   610→        }
+   611→    }
+   612→
+   613→    void emit_print(NodeId n) {
+   614→        const Node& nd = g_.node(n);
+   615→        NodeId v = nd.in[2];
+   616→        const Node& vn = g_.node(v);
+   617→        const char* fmt = "%ld\n";
+   618→        bool promote_f32 = false;
+   619→        switch (vn.ty) {
+   620→            case 3: fmt = "%d\n"; break;
+   621→            case 4: fmt = "%ld\n"; break;
+   622→            case 5: fmt = "%u\n"; break;
+   623→            case 6: fmt = "%lu\n"; break;
+   624→            case 2: fmt = "%d\n"; break;
+   625→            case 7: fmt = "%f\n"; promote_f32 = true; break;
+   626→            case 8: fmt = "%f\n"; break;
+   627→            default: break;
+   628→        }
+   629→        std::string lbl = ".Lstr_" + std::to_string(lf_.fid) + "_" +
+   630→                          std::to_string(lf_.strings.size());
+   631→        StringConst sc;
+   632→        sc.label = lbl;
+   633→        sc.text = fmt;
+   634→        lf_.strings.push_back(sc);
+   635→
+   636→        Inst& lea = emit(IOp::LeaSym);
+   637→        lea.a.k = Operand::K::Reg; lea.a.reg = R::Rdi;
+   638→        lea.b.k = Operand::K::Sym;
+   639→        lea.b.slot = static_cast<i32>(lf_.strings.size() - 1); // index into lf.strings
+   640→
+   641→        if (fp_of(vn.ty)) {
+   642→            load_fp(v, R::Xmm0);
+   643→            if (promote_f32) emit(IOp::FpExt);
+   644→            // SysV varargs: al = number of vector registers used
+   645→            imm_reg(IOp::MovRImm, R::Rax, 1);
+   646→        } else {
+   647→            load_value(v, R::Rsi, sz_of(vn.ty));
+   648→            emit(IOp::XorEax);
+   649→        }
+   650→        Inst& c = emit(IOp::CallSym);
+   651→        c.a.k = Operand::K::Sym; c.a.sym = "printf";
+   652→        if (nd.ty != ty_void()) store_result(n, 8);
+   653→    }
+   654→
+   655→    void emit_phi_copy(const LPhiCopy& cp) {
+   656→        const Node& src = g_.node(cp.src);
+   657→        const Node& dst = g_.node(cp.dst);
+   658→        if (fp_of(dst.ty)) {
+   659→            load_fp(cp.src, R::Xmm0);
+   660→            Inst& st = emit(IOp::MovFpS);
+   661→            st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+   662→            st.b.k = Operand::K::Slot; st.b.slot = slot(cp.dst);
+   663→            st.size = sz_of(dst.ty);
+   664→            return;
+   665→        }
+   666→        if (src.op == Op::Const) {
+   667→            imm_slot(slot(cp.dst), src.ival);
+   668→            return;
+   669→        }
+   670→        if (src.op == Op::Alloc && (src.flags & kFlagStackPromoted)) {
+   671→            Inst& i = emit(IOp::LeaSlot);
+   672→            i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+   673→            i.b.k = Operand::K::Slot; i.b.slot = slot(cp.src);
+   674→            st_slot(IOp::MovRS, R::Rax, slot(cp.dst), 8);
+   675→            return;
+   676→        }
+   677→        ld_slot(IOp::MovSR, R::Rax, slot(cp.src), sz_of(dst.ty));
+   678→        st_slot(IOp::MovRS, R::Rax, slot(cp.dst), sz_of(dst.ty));
+   679→    }
+   680→
+   681→    void emit_terminator(LBlock& b) {
+   682→        if (b.terminator_return != kNoNode) {
+   683→            const Node& r = g_.node(b.terminator_return);
+   684→            if (r.n_in == 3) {
+   685→                if (fp_of(g_.node(r.in[2]).ty)) load_fp(r.in[2], R::Xmm0);
+   686→                else load_value(r.in[2], R::Rax, sz_of(g_.node(r.in[2]).ty));
+   687→            }
+   688→            jump(epilogue_label_);
+   689→            return;
+   690→        }
+   691→        if (b.terminator_if != kNoNode) {
+   692→            const Node& ifn = g_.node(b.terminator_if);
+   693→            load_value(ifn.in[1], R::Rax, 8);
+   694→            Inst& t = emit(IOp::Test);
+   695→            t.a.k = Operand::K::Reg; t.a.reg = R::Rax;
+   696→
+   697→            int true_label = kBlockLabelBase, false_label = kBlockLabelBase;
+   698→            bool have_true = false, have_false = false;
+   699→            for (int s : b.succs) {
+   700→                if (s < 0 || static_cast<size_t>(s) >= lf_.blocks.size()) continue;
+   701→                Op so = g_.node(lf_.blocks[static_cast<size_t>(s)].head).op;
+   702→                if (so == Op::IfTrue) { true_label = kBlockLabelBase + s; have_true = true; }
+   703→                if (so == Op::IfFalse) { false_label = kBlockLabelBase + s; have_false = true; }
+   704→            }
+   705→            if (!have_true || !have_false) {
+   706→                // degenerate: fall back to successor order
+   707→                if (!b.succs.empty()) {
+   708→                    true_label = kBlockLabelBase + b.succs[0];
+   709→                    have_true = true;
+   710→                }
+   711→                if (b.succs.size() > 1) {
+   712→                    false_label = kBlockLabelBase + b.succs[1];
+   713→                    have_false = true;
+   714→                }
+   715→            }
+   716→            if (!have_true && !have_false) return;
+   717→            int next = b.index + 1;
+   718→            if (static_cast<size_t>(next) < lf_.blocks.size()) {
+   719→                int nb = kBlockLabelBase + next;
+   720→                if (nb == true_label) { jcc(Cond::E, false_label); return; }
+   721→                if (nb == false_label) { jcc(Cond::NE, true_label); return; }
+   722→            }
+   723→            jcc(Cond::NE, true_label);
+   724→            if (have_false && false_label != true_label) jump(false_label);
+   725→            return;
+   726→        }
+   727→        // Jump / fallthrough block
+   728→        if (!b.succs.empty()) {
+   729→            int next = b.index + 1;
+   730→            if (static_cast<size_t>(next) >= lf_.blocks.size() ||
+   731→                kBlockLabelBase + next != kBlockLabelBase + b.succs[0]) {
+   732→                jump(kBlockLabelBase + b.succs[0]);
+   733→            }
+   734→        }
+   735→    }
+   736→
+   737→    int epilogue_label_ = 0;
+   738→    LFunction& lf_;
+   739→    FunctionGraph& fg_;
+   740→    Graph& g_;
+   741→    SymbolTable& syms_;
+   742→};
+   743→
+   744→} // namespace
+   745→
+   746→// ---- pass 84 ------------------------------------------------------------------
+   747→bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms) {
+   748→    Emitter e(lf, fg, syms);
+   749→    return e.run();
+   750→}
+   751→
+   752→// ---- pass 85: frame layout (spill-everywhere allocator) --------------------------
+   753→bool x64_allocate_frame(LFunction& lf) {
+   754→    lf.slot_offset.assign(static_cast<size_t>(lf.slot_count), 0);
+   755→    for (i32 s = 0; s < lf.slot_count; ++s)
+   756→        lf.slot_offset[static_cast<size_t>(s)] = -(s + 1) * 8;
+   757→    i32 frame = lf.slot_count * 8;
+   758→    frame = (frame + 15) & ~15; // 16-byte call alignment
+   759→    lf.frame_size = frame;
+   760→    for (Inst& i : lf.code)
+   761→        if (i.op == IOp::FrameSub) i.b.imm = frame;
+   762→    return true;
+   763→}
+   764→
+   765→// ---- pass 86 ---------------------------------------------------------------------
+   766→namespace {
+   767→// Is `slot` read by any instruction at or after `from`? Folding a store+load
+   768→// pair is only sound when nothing else reads the slot afterwards.
+   769→bool slot_read_later(const std::vector<Inst>& code, size_t from, i32 slot) {
+   770→    for (size_t i = from; i < code.size(); ++i) {
+   771→        const Inst& c = code[i];
+   772→        if ((c.op == IOp::MovSR || c.op == IOp::MovFpR) && c.b.k == Operand::K::Slot &&
+   773→            c.b.slot == slot)
+   774→            return true;
+   775→    }
+   776→    return false;
+   777→}
+   778→} // namespace
+   779→
+   780→bool x64_post_ra_cleanup(LFunction& lf) {
+   781→    bool changed = false;
+   782→    std::vector<Inst> out;
+   783→    out.reserve(lf.code.size());
+   784→    for (size_t i = 0; i < lf.code.size(); ++i) {
+   785→        const Inst& cur = lf.code[i];
+   786→        if (cur.op == IOp::MovRS && i + 1 < lf.code.size()) {
+   787→            const Inst& nxt = lf.code[i + 1];
+   788→            if (nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
+   789→                cur.b.k == Operand::K::Slot && nxt.b.slot == cur.b.slot &&
+   790→                nxt.a.k == Operand::K::Reg &&
+   791→                !slot_read_later(lf.code, i + 2, cur.b.slot)) {
+   792→                Inst mv;
+   793→                mv.op = IOp::MovRR;
+   794→                mv.a.k = Operand::K::Reg; mv.a.reg = nxt.a.reg;
+   795→                mv.b.k = Operand::K::Reg; mv.b.reg = cur.a.reg;
+   796→                mv.size = 8;
+   797→                out.push_back(mv);
+   798→                ++i;
+   799→                changed = true;
+   800→                continue;
+   801→            }
+   802→        }
+   803→        if (cur.op == IOp::MovSImm && i + 1 < lf.code.size()) {
+   804→            const Inst& nxt = lf.code[i + 1];
+   805→            if (nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
+   806→                cur.a.k == Operand::K::Slot && nxt.b.slot == cur.a.slot &&
+   807→                nxt.a.k == Operand::K::Reg &&
+   808→                !slot_read_later(lf.code, i + 2, cur.a.slot)) {
+   809→                Inst mv;
+   810→                mv.op = IOp::MovRImm;
+   811→                mv.a.k = Operand::K::Reg; mv.a.reg = nxt.a.reg;
+   812→                mv.b.k = Operand::K::Imm; mv.b.imm = cur.b.imm;
+   813→                out.push_back(mv);
+   814→                ++i;
+   815→                changed = true;
+   816→                continue;
+   817→            }
+   818→        }
+   819→        out.push_back(cur);
+   820→    }
+   821→    lf.code = std::move(out);
+   822→    return changed;
+   823→}
+   824→
+   825→// ---- pass 87 -----------------------------------------------------------------------
+   826→bool x64_machine_peephole(LFunction& lf) {
+   827→    bool changed = false;
+   828→    for (Inst& i : lf.code) {
+   829→        if (i.op == IOp::CmpRImm && i.b.k == Operand::K::Imm && i.b.imm == 0) {
+   830→            i.op = IOp::Test;
+   831→            i.b = Operand{};
+   832→            changed = true;
+   833→            continue;
+   834→        }
+   835→        if (i.op == IOp::MovRR && i.a.k == Operand::K::Reg && i.b.k == Operand::K::Reg &&
+   836→            i.a.reg == i.b.reg) {
+   837→            i.op = IOp::Nop;
+   838→            changed = true;
+   839→            continue;
+   840→        }
+   841→    }
+   842→    std::vector<Inst> out;
+   843→    out.reserve(lf.code.size());
+   844→    for (const Inst& i : lf.code)
+   845→        if (i.op != IOp::Nop) out.push_back(i);
+   846→    if (out.size() != lf.code.size()) changed = true;
+   847→    lf.code = std::move(out);
+   848→    return changed;
+   849→}
+   850→
+   851→// ---- serialization --------------------------------------------------------------------
+   852→namespace {
+   853→
+   854→void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, u32 fid) {
+   855→    auto r = [&](R reg) { return std::string("%") + rname(reg); };
+   856→    auto rs = [&](R reg, u8 size) {
+   857→        return std::string("%") + (size == 4 ? rname32(reg) : rname(reg));
+   858→    };
+   859→    auto lbl = [&](int id) {
+   860→        if (id == kEntryLabelId) return ".L" + std::to_string(fid) + "_E";
+   861→        return ".L" + std::to_string(fid) + "_" + std::to_string(id);
+   862→    };
+   863→    auto off = [&](i32 s) {
+   864→        i32 o = (s >= 0 && static_cast<size_t>(s) < lf.slot_offset.size())
+   865→                    ? lf.slot_offset[static_cast<size_t>(s)]
+   866→                    : 0;
+   867→        return (o < 0 ? "-" + std::to_string(-o) : std::to_string(o)) + "(%rbp)";
+   868→    };
+   869→    auto slotstr = [&](const Operand& o) { return off(o.slot); };
+   870→
+   871→    switch (i.op) {
+   872→        case IOp::Nop: break;
+   873→        case IOp::Label: os << lbl(i.a.label) << ":\n"; break;
+   874→        case IOp::PushRbp: os << "\tpushq %rbp\n"; break;
+   875→        case IOp::PopRbp: os << "\tpopq %rbp\n"; break;
+   876→        case IOp::Ret: os << "\tleave\n\tret\n"; break;
+   877→        case IOp::FrameSub: os << "\tsubq $" << i.b.imm << ", %rsp\n"; break;
+   878→        case IOp::MovRR: os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
+   879→        case IOp::MovRS: os << "\tmov" << ssz(i.size) << " " << rs(i.a.reg, i.size) << ", " << slotstr(i.b) << "\n"; break;
+   880→        case IOp::MovSR: os << "\tmov" << ssz(i.size) << " " << slotstr(i.b) << ", " << rs(i.a.reg, i.size) << "\n"; break;
+   881→        case IOp::MovRImm: os << "\tmovq $" << i.b.imm << ", " << r(i.a.reg) << "\n"; break;
+   882→        case IOp::MovSImm: os << "\tmovq $" << i.b.imm << ", " << slotstr(i.a) << "\n"; break;
+   883→        case IOp::MovZX: os << "\tmovzbq %al, %rax\n"; break;
+   884→        case IOp::LoadMem: os << "\tmov" << ssz(i.size) << " (" << r(i.b.reg) << "), " << rs(i.a.reg, i.size) << "\n"; break;
+   885→        case IOp::StoreMem: os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", (" << r(i.a.reg) << ")\n"; break;
+   886→        case IOp::LeaSlot: os << "\tleaq " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;
+   887→        case IOp::LeaSym: {
+   888→            std::string l = "?";
+   889→            if (i.b.k == Operand::K::Sym && i.b.slot >= 0 &&
+   890→                static_cast<size_t>(i.b.slot) < lf.strings.size())
+   891→                l = lf.strings[static_cast<size_t>(i.b.slot)].label;
+   892→            os << "\tleaq " << l << "(%rip), " << r(i.a.reg) << "\n";
+   893→            break;
+   894→        }
+   895→        case IOp::ArithRR: {
+   896→            const char* mn = "add";
+   897→            switch (i.bin) {
+   898→                case BinOp::Add: mn = "add"; break;
+   899→                case BinOp::Sub: mn = "sub"; break;
+   900→                case BinOp::Mul: mn = "imul"; break;
+   901→                case BinOp::And: mn = "and"; break;
+   902→                case BinOp::Or:  mn = "or";  break;
+   903→                case BinOp::Xor: mn = "xor"; break;
+   904→                default: break;
+   905→            }
+   906→            os << "\t" << mn << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n";
+   907→            break;
+   908→        }
+   909→        case IOp::ArithRImm: {
+   910→            if (i.bin == BinOp::Mul) {
+   911→                // imul has no add-style two-operand immediate form; use the
+   912→                // explicit three-operand encoding (dst = dst * imm). The
+   913→                // add/sub default here previously swallowed Mul and emitted
+   914→                // `add $imm` — a silent miscompile for reg*const.
+   915→                os << "\timul" << ssz(i.size) << " $" << i.b.imm << ", "
+   916→                   << rs(i.a.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n";
+   917→                break;
+   918→            }
+   919→            const char* mn = "add";
+   920→            switch (i.bin) {
+   921→                case BinOp::Add: mn = "add"; break;
+   922→                case BinOp::Sub: mn = "sub"; break;
+   923→                case BinOp::And: mn = "and"; break;
+   924→                case BinOp::Or:  mn = "or";  break;
+   925→                case BinOp::Xor: mn = "xor"; break;
+   926→                default: break;
+   927→            }
+   928→            os << "\t" << mn << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n";
+   929→            break;
+   930→        }
+   931→        case IOp::ShiftImm: {
+   932→            const char* mn = "shl";
+   933→            if (i.bin == BinOp::Shr) mn = i.sar ? "sar" : "shr";
+   934→            os << "\t" << mn << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n";
+   935→            break;
+   936→        }
+   937→        case IOp::ShiftCl: {
+   938→            const char* mn = "shl";
+   939→            if (i.bin == BinOp::Shr) mn = i.sar ? "sar" : "shr";
+   940→            os << "\t" << mn << ssz(i.size) << " %cl, " << rs(i.a.reg, i.size) << "\n";
+   941→            break;
+   942→        }
+   943→        case IOp::Cqo: os << "\tcqo\n"; break;
+   944→        case IOp::IDiv: os << "\tidivq " << r(i.a.reg) << "\n"; break;
+   945→        case IOp::UDiv: os << "\tdivq " << r(i.a.reg) << "\n"; break;
+   946→        case IOp::CmpRR: os << "\tcmp" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
+   947→        case IOp::CmpRImm: os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n"; break;
+   948→        case IOp::Test: os << "\ttestq " << r(i.a.reg) << ", " << r(i.a.reg) << "\n"; break;
+   949→        case IOp::Setcc: os << "\tset" << cc(i.cond) << " %al\n"; break;
+   950→        case IOp::Cmov: os << "\tcmov" << cc(i.cond) << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
+   951→        case IOp::Jcc: os << "\tj" << cc(i.cond) << " " << lbl(i.a.label) << "\n"; break;
+   952→        case IOp::Jmp: os << "\tjmp " << lbl(i.a.label) << "\n"; break;
+   953→        case IOp::CallSym: os << "\tcall " << i.a.sym << "@PLT\n"; break;
+   954→        case IOp::CallFn: os << "\tcall .L" << i.a.label << "_E\n"; break;
+   955→        case IOp::TailCallFn: os << "\tleave\n\tjmp .L" << i.a.label << "_E\n"; break;
+   956→        case IOp::XorEax: os << "\txorl %eax, %eax\n"; break;
+   957→        case IOp::FpBin: {
+   958→            const char* mn = "add";
+   959→            switch (i.bin) {
+   960→                case BinOp::Add: mn = "add"; break;
+   961→                case BinOp::Sub: mn = "sub"; break;
+   962→                case BinOp::Mul: mn = "mul"; break;
+   963→                case BinOp::Div: mn = "div"; break;
+   964→                default: break;
+   965→            }
+   966→            os << "\t" << mn << fpsz(i.size) << " %xmm1, %xmm0\n";
+   967→            break;
+   968→        }
+   969→        case IOp::FpCmp: os << "\tucomi" << fpsz(i.size) << " %xmm1, %xmm0\n"; break;
+   970→        case IOp::FpNeg:
+   971→            if (i.size == 8) os << "\txorpd .Lnegmask64(%rip), %xmm0\n";
+   972→            else os << "\txorps .Lnegmask32(%rip), %xmm0\n";
+   973→            break;
+   974→        case IOp::SExt32: os << "\tmovslq %eax, %rax\n"; break;
+   975→        case IOp::CvtToFp:
+   976→            os << (i.size == 8 ? "\tcvtsi2sdq %rax, %xmm0\n" : "\tcvtsi2sdl %eax, %xmm0\n");
+   977→            break;
+   978→        case IOp::CvtToInt:
+   979→            os << (i.size == 8 ? "\tcvttsd2siq %xmm0, %rax\n" : "\tcvttsd2sil %xmm0, %eax\n");
+   980→            break;
+   981→        case IOp::FpExt: os << "\tcvtss2sd %xmm0, %xmm0\n"; break;
+   982→        case IOp::FpTrunc: os << "\tcvtsd2ss %xmm0, %xmm0\n"; break;
+   983→        case IOp::MovFpS: os << "\tmov" << fpsz(i.size) << " " << r(i.a.reg) << ", " << slotstr(i.b) << "\n"; break;
+   984→        case IOp::MovFpR: os << "\tmov" << fpsz(i.size) << " " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;
+   985→        case IOp::Neg: os << "\tnegq " << r(i.a.reg) << "\n"; break;
+   986→        case IOp::Not: os << "\tnotq " << r(i.a.reg) << "\n"; break;
+   987→        case IOp::MovFpFromGpr: os << "\tmovq " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
+   988→        case IOp::MovFpFromGpr32: os << "\tmovd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
+   989→        case IOp::Comment: break;
+   990→    }
+   991→}
+   992→
+   993→} // namespace
+   994→
+   995→std::string serialize_module_asm(const LinearModule& lin, SymbolTable& syms) {
+   996→    (void)syms;
+   997→    std::ostringstream os;
+   998→    os << "\t.text\n";
+   999→    for (const LFunction& lf : lin.fns) {
+  1000→        if (lf.is_main) {
+  1001→            os << ".globl main\n";
+  1002→            os << "main:\n";
+  1003→        }
+  1004→        for (const Inst& i : lf.code) serialize_inst(os, i, lf, lf.fid);
+  1005→        os << "\n";
+  1006→    }
+  1007→    os << "\t.section .rodata\n";
+  1008→    os << ".Lnegmask64:\n\t.quad 0x8000000000000000\n\t.quad 0\n";
+  1009→    os << ".Lnegmask32:\n\t.long 0x80000000\n\t.long 0\n";
+  1010→    for (const LFunction& lf : lin.fns) {
+  1011→        for (const StringConst& s : lf.strings) {
+  1012→            std::string esc;
+  1013→            for (char ch : s.text) {
+  1014→                if (ch == '\n') esc += "\\n";
+  1015→                else if (ch == '\t') esc += "\\t";
+  1016→                else if (ch == '\\') esc += "\\\\";
+  1017→                else if (ch == '"') esc += "\\\"";
+  1018→                else esc += ch;
+  1019→            }
+  1020→            os << s.label << ":\n\t.string \"" << esc << "\"\n";
+  1021→        }
+  1022→    }
+  1023→    return os.str();
+  1024→}
+  1025→
+  1026→} // namespace jules
+  1027→

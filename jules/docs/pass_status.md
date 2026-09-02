@@ -16,7 +16,7 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 10 | RedundantPhiElimination | IMPLEMENTED | Remove phis with identical/single definitions. |
 | 11 | CopyPropagation | IMPLEMENTED | Replace uses of copies with originals. |
 | 12 | AlgebraicSimplification | IMPLEMENTED | Multi-pattern algebra with side conditions. |
-| 13 | Reassociation | IMPLEMENTED | Canonical operand order (FP untouched). |
+| 13 | Reassociation | IMPLEMENTED | Canonical operand order (FP gated by --fp=fast). |
 | 14 | SignExtensionElimination | IMPLEMENTED | Remove redundant extends via width analysis. |
 | 15 | NarrowingTransform | SCAFFOLD (honest no-op) | Demote ops to narrower types when consumers allow. |
 | 16 | BitwiseOptimization | IMPLEMENTED | Bit-level rewrites, bitfield extracts, De Morgan. |
@@ -29,7 +29,7 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 23 | DeadStoreElimination | IMPLEMENTED | Remove overwritten/unread stores. |
 | 24 | StoreMerging | SCAFFOLD (honest no-op) | Combine adjacent narrow stores (alignment-aware). |
 | 25 | LoadHoisting | IMPLEMENTED | Hoist provably-safe loads out of loops. |
-| 26 | ScalarReplacementOfAggregates | IMPLEMENTED | Promote memory-backed locals to SSA values. |
+| 26 | ScalarReplacementOfAggregates | IMPLEMENTED | Promote memory-backed locals to SSA values. Promotion also treats memory-phi users as chain uses (not escapes) and ignores dead users, so loop counters/temps promote even when earlier passes killed their consumers. |
 | 27 | BitfieldLowering | SCAFFOLD (honest no-op) | Lower bitfield access to mask/shift (needs bitfield types). |
 | 28 | StackSlotColoring | SCAFFOLD (honest no-op) | Merge non-overlapping stack slots (post-SROA). |
 | 29 | HeapToStackPromotion | IMPLEMENTED | Promote NoEscape allocations to stack slots. |
@@ -88,8 +88,8 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 82 | LTOSummaryGeneration | SCAFFOLD (honest no-op) | Serialize cross-module info for LTO (AOT). |
 | 83 | CFGLinearization | IMPLEMENTED | SoN -> ordered blocks with scheduled nodes. |
 | 84 | InstructionSelection | IMPLEMENTED | x86-64 MIR emission (SysV). |
-| 85 | RegisterAllocation | SIMPLIFIED | Spill-everywhere slots (linear-scan is the upgrade). |
-| 86 | PostRACleanup | SIMPLIFIED | Fold spills, eliminate moves. |
-| 87 | MachinePeephole | SIMPLIFIED | test-vs-cmp, self-move elimination. |
+| 85 | RegisterAllocation | IMPLEMENTED | Level-dispatched: -O0/-Og spill-everywhere; -O1+ linear scan over live ranges derived from backwards-liveness dataflow over the emitted blocks (sound with loop backedges). Pools: callee-saved GPRs (rbx, r12-r15) for call-crossing ranges, caller-saved r10/r11 + xmm2-13 for local ranges, xmm14-15 reserved for the isel FP const pool. Spill heuristic: density-ranked, never victimizes backedge-spanning (loop-carried) ranges; a spilled value degenerates to memory operands. Frame elision (omit frame pointer) when no value needs a stack slot, with SysV call-alignment padding. |
+| 86 | PostRACleanup | IMPLEMENTED | Fold store+load pairs (GP and FP) including same-register elision; slot-immediate to register-immediate forwarding. |
+| 87 | MachinePeephole | IMPLEMENTED | Fused compare-and-branch (cmp/jcc from setcc/movzx/test chains, incl. post-fold short chains), loop-invariant FP constant hoisting (isel const pool materializations), mov+test folding (register and cmp-$0,[mem] forms), rax accumulator folding, copy-chain elimination through scratch registers, adjacent mov-pair elimination, dead store removal, cmp-$0 to test. |
 | 88 | MachineLICM | SIMPLIFIED | Post-isel invariant hoisting (scan phase). |
 | 89 | DeoptMetadataEmission | SIMPLIFIED | Deopt manifest (JIT modes; empty guard set). |

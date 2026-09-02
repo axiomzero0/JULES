@@ -1,4 +1,4 @@
 jules deopt manifest v1
 functions: 1
-fn 0 blocks 4 slots 11 frame 96
+fn 0 blocks 4 slots 10 frame 72
 guard_sites: 0

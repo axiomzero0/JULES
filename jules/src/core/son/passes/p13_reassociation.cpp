@@ -1,11 +1,14 @@
 // Pass 13 — Reassociation (Phase 1)
 //
-// Reorders associative integer ops into canonical form so equivalent
-// expressions hash equal in GVN:
+// Reorders associative ops into canonical form so equivalent expressions
+// hash equal in GVN:
 //   * commutative ops (add/mul/and/or/xor): operands ordered by node id
 //   * constants moved to the right operand
-// Floating point is deliberately untouched: reassociation changes results
-// under IEEE semantics (this is the side-condition the catalog calls out).
+// Floating point is deliberately untouched by default: reassociation
+// changes results under IEEE semantics (the side-condition the catalog
+// calls out). --fp=fast is the explicit, documented opt-in that allows FP
+// reassociation (still no reordering across divisions or mixed signs —
+// only operand canonicalization of add/mul pairs).
 #include "core/son/passes/pass_utils.h"
 
 namespace jules {
@@ -13,7 +16,7 @@ namespace jules {
 namespace {
 class Reassociator {
 public:
-    explicit Reassociator(Graph& g) : g_(g) {}
+    explicit Reassociator(Graph& g, bool fp_fast) : g_(g), fp_fast_(fp_fast) {}
 
     bool run() {
         for (u32 round = 0; round < kMaxRounds; ++round) {
@@ -31,7 +34,7 @@ private:
     bool visit(NodeId id) {
         Node& n = g_.node(id);
         if (n.op != Op::Bin) return false;
-        if (ty_is_float(n.ty)) return false; // FP semantics preserved
+        if (ty_is_float(n.ty) && !fp_fast_) return false; // FP semantics preserved
 
         BinOp op = static_cast<BinOp>(n.sub);
         bool commutative = op == BinOp::Add || op == BinOp::Mul || op == BinOp::And ||
@@ -59,6 +62,7 @@ private:
     }
 
     Graph& g_;
+    bool fp_fast_ = false;
     bool changed_ = false;
 };
 } // namespace
@@ -71,8 +75,9 @@ public:
     bool parallelizable() const override { return true; }
     bool run(PassContext& ctx) override {
         bool changed = false;
+        bool fp_fast = fp_fast_allowed(ctx.opts.fp);
         for (FunctionGraph& fg : ctx.mod.fns) {
-            Reassociator r(fg.g);
+            Reassociator r(fg.g, fp_fast);
             changed |= r.run();
         }
         return changed;

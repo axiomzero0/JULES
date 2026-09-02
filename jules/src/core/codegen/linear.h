@@ -37,12 +37,36 @@ struct LBlock {
 
 // ---------------------------------------------------------------------------
 // x86-64 MIR (System V AMD64, AT&T syntax at serialization)
+//
+// Register classes: GPR scratch (rax..r11 minus rbp/rsp), GPR callee-saved
+// (rbx, r12-r15 — reserved for the pass 85 allocator), XMM scratch (xmm0/1
+// used by isel; xmm2-7 allocatable). Rbp/Rsp are never allocatable.
 // ---------------------------------------------------------------------------
 enum class R : u8 {
-    Rax, Rcx, Rdx, Rsi, Rdi, R8, R9, R10, R11, Rbp, Rsp,
+    Rax, Rcx, Rdx, Rsi, Rdi, R8, R9, R10, R11,
+    Rbx, R12, R13, R14, R15, // callee-saved: allocator-owned
+    Rbp, Rsp,
     Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7,
+    Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, // allocator: caller-saved XMM pool
+    Xmm14, Xmm15,                      // isel FP const pool (loop-hoisted)
 };
 inline constexpr bool reg_is_xmm(R r) { return r >= R::Xmm0; }
+// Callee-saved GPRs the register allocator may assign (SysV: preserved
+// across calls; saved in the prologue via PushCal, restored pre-epilogue).
+inline constexpr bool reg_is_callee_saved_gpr(R r) {
+    return r == R::Rbx || r == R::R12 || r == R::R13 || r == R::R14 || r == R::R15;
+}
+// Caller-saved GPRs the allocator may use for values not live across calls
+// (isel never touches r10/r11; argument registers are excluded).
+inline constexpr bool reg_is_alloc_gpr(R r) {
+    return r == R::R10 || r == R::R11 || reg_is_callee_saved_gpr(r);
+}
+inline constexpr bool reg_is_alloc_xmm(R r) {
+    return r >= R::Xmm2 && r <= R::Xmm13; // xmm14-15: isel const pool
+}
+// The high XMM bank is the isel constant pool: never an argument register
+// (SysV vector args use xmm0-7), never allocator-assigned.
+inline constexpr bool reg_is_const_pool_xmm(R r) { return r >= R::Xmm8; }
 
 enum class Cond : u8 { E, NE, L, LE, G, GE, B, BE, A, AE };
 
@@ -94,6 +118,12 @@ enum class IOp : u16 {
     Not,            // notq reg
     MovFpFromGpr,   // movq %rax, %xmmN (bit pattern move)
     MovFpFromGpr32, // movd %eax, %xmmN
+    MovFpFp,        // movsd/movss %xmmN, %xmmM (allocator reg-reg fp move)
+    PushCal,        // pushq %reg — callee-saved spill area reservation (pass 85)
+    RestoreCal,     // movq OFF(%rbp), %reg — callee-saved restore (pass 85)
+    PopCal,         // popq %reg — frame-elided callee restore (pass 85)
+    RetNaked,       // ret — no leave (frame elided)
+    TailCallNaked,  // jmp fn — tail call without a frame (frame elided)
     Comment,        // emission-time annotation (MIR comments, disabled in release)
 };
 
@@ -136,6 +166,9 @@ struct LFunction {
     FlatMap<NodeId, i32> slot_of;       // value node -> virtual slot
     i32 slot_count = 0;
     std::vector<i32> slot_offset;       // pass 85: concrete rbp offsets
+    FlatMap<i32, R> slot_reg;           // pass 85: slot -> assigned register
+    u32 ra_promoted = 0;                // pass 85 telemetry: promoted slots
+    u32 ra_spilled = 0;                 // pass 85 telemetry: memory slots
     i32 frame_size = 0;
     std::vector<StringConst> strings;   // printf formats owned by this fn
     int label_counter = 0;
@@ -160,7 +193,14 @@ std::string serialize_module_asm(const LinearModule& lin, SymbolTable& syms);
 // Machine pass entry points (invoked by pass files 84-87).
 bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms);
 bool x64_allocate_frame(LFunction& lf);
+// Pass 85 allocator: linear scan over slot live ranges (see x64_ra.cpp).
+//   level < O1  -> spill-everywhere (correctness-first, spec "simple")
+//   level >= O1 -> linear scan with callee-saved/caller-saved/XMM pools
+bool x64_allocate_registers(LFunction& lf, const Graph* g, bool use_registers,
+                            bool aggressive, bool size_biased);
 bool x64_post_ra_cleanup(LFunction& lf);
 bool x64_machine_peephole(LFunction& lf);
+// Pass 87 helper: fused compare-and-branch + accumulator folds.
+bool x64_branch_fusion(LFunction& lf);
 
 } // namespace jules

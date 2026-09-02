@@ -49,6 +49,15 @@ bool PassManager::should_skip(Pass& p, const char*& reason) {
     }
     if ((p.modes() & want) == 0) { reason = "mode"; return true; }
 
+    // Level gating (spec §7 availability matrix). Required lowering passes
+    // are On at every level; everything else follows the matrix / phase
+    // defaults. LTO visibility: pass 82's summaries only make sense with
+    // more-than-none visibility (single-module compiler defaults to Full).
+    if (!level_runs(p.order(), ctx_.opts.level)) { reason = "level"; return true; }
+    if (p.order() == 82 && ctx_.opts.lto == LtoMode::None) {
+        reason = "level"; return true;
+    }
+
     if (p.stage() == Stage::Linear && ctx_.lin == nullptr) { reason = "stage"; return true; }
     return false;
 }
@@ -135,32 +144,40 @@ bool PassManager::run() {
 
         // Post-inline cleanup: re-run the core cleanup/cse set after the
         // inlining phase exposes new folding opportunities (scheduler-level
-        // decision; passes are allowed to repeat). SROA/DSE run BEFORE the
-        // folding/cse passes so promoted values are visible to GVN. SCCP (8)
-        // is included: load forwarding/promotion in the main run (passes
+        // decision; passes are allowed to repeat). Rounds are budget presets
+        // (spec §8 fixpoint iterations): O0/Og skip, O1=1, O2=2, O3=3;
+        // rounds stop early when a fixpoint is reached. SROA/DSE run BEFORE
+        // the folding/cse passes so promoted values are visible to GVN. SCCP
+        // (8) is included: load forwarding/promotion in the main run (passes
         // 21-26) exposes SSA constants only AFTER SCCP's original slot, so
         // the post-inline re-run is where its control-conditional lattice
         // gets real input — the same reason production pipelines (LLVM
         // IPSCCP, Graal) re-run conditional propagation after inlining.
         if (ctx_.opts.post_inline_cleanup && p->order() == 82 && p->stage() == Stage::Son) {
+            u32 rounds = level_budgets(ctx_.opts.level).cleanup_rounds;
             static const int kCleanupOrders[] = {26, 30, 23, 1, 2, 3, 7, 8, 9};
-            std::vector<Pass*> again = PassRegistry::instance().create_all();
-            FlatMap<int, Pass*> by_order;
-            for (Pass* q : again)
-                if (q->stage() == Stage::Son) by_order.insert(q->order(), q);
-            for (int order : kCleanupOrders) {
-                Pass** q = by_order.find(order);
-                if (!q || !*q) continue;
-                PassStats st2;
-                st2.name = (*q)->name();
-                st2.order = order;
-                if (!run_one(**q, st2)) {
+            for (u32 r = 0; r < rounds; ++r) {
+                std::vector<Pass*> again = PassRegistry::instance().create_all();
+                FlatMap<int, Pass*> by_order;
+                for (Pass* q : again)
+                    if (q->stage() == Stage::Son) by_order.insert(q->order(), q);
+                bool any_change = false;
+                for (int order : kCleanupOrders) {
+                    Pass** q = by_order.find(order);
+                    if (!q || !*q) continue;
+                    PassStats st2;
+                    st2.name = (*q)->name();
+                    st2.order = order;
+                    if (!run_one(**q, st2)) {
+                        stats_.push_back(st2);
+                        break;
+                    }
+                    if (st2.changes > 0) any_change = true;
                     stats_.push_back(st2);
-                    break;
                 }
-                stats_.push_back(st2);
+                for (Pass* q : again) delete q;
+                if (!any_change) break; // fixpoint reached early
             }
-            for (Pass* q : again) delete q;
         }
     }
 

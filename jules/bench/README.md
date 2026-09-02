@@ -43,9 +43,11 @@ or edit `CLANG` in the harness if that path is gone.
 
 | julesc-aot vs | geometric mean |
 |---|---|
-| gcc -O3 | 4.53x |
-| clang -O3 | 4.22x |
-| gcc -O0 | 2.03x |
+| gcc -O3 | 2.79x |
+| clang -O3 | 2.56x |
+| gcc -O0 | 1.23x |
 
-Compile-time geometric mean: julesc 22 ms vs gcc -O3 48 ms vs clang -O3 71 ms.
+Compile-time geometric mean: julesc 21 ms vs gcc -O3 51 ms vs clang -O3 68 ms.
 Kernel-level detail: see `results/summary.md` and the PDF report.
+Configurations now include `julesc-aot-O3`; the default `julesc-aot` row
+compiles at the -O2 release preset.

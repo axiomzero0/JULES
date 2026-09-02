@@ -21,12 +21,18 @@ const char* rname(R r) {
         case R::Rdx: return "rdx"; case R::Rsi: return "rsi";
         case R::Rdi: return "rdi"; case R::R8:  return "r8";
         case R::R9:  return "r9";  case R::R10: return "r10";
-        case R::R11: return "r11"; case R::Rbp: return "rbp";
-        case R::Rsp: return "rsp";
+        case R::R11: return "r11"; case R::Rbx: return "rbx";
+        case R::R12: return "r12"; case R::R13: return "r13";
+        case R::R14: return "r14"; case R::R15: return "r15";
+        case R::Rbp: return "rbp"; case R::Rsp: return "rsp";
         case R::Xmm0: return "xmm0"; case R::Xmm1: return "xmm1";
         case R::Xmm2: return "xmm2"; case R::Xmm3: return "xmm3";
         case R::Xmm4: return "xmm4"; case R::Xmm5: return "xmm5";
         case R::Xmm6: return "xmm6"; case R::Xmm7: return "xmm7";
+        case R::Xmm8: return "xmm8"; case R::Xmm9: return "xmm9";
+        case R::Xmm10: return "xmm10"; case R::Xmm11: return "xmm11";
+        case R::Xmm12: return "xmm12"; case R::Xmm13: return "xmm13";
+        case R::Xmm14: return "xmm14"; case R::Xmm15: return "xmm15";
     }
     return "rax";
 }
@@ -37,8 +43,10 @@ const char* rname32(R r) {
         case R::Rdx: return "edx"; case R::Rsi: return "esi";
         case R::Rdi: return "edi"; case R::R8:  return "r8d";
         case R::R9:  return "r9d";  case R::R10: return "r10d";
-        case R::R11: return "r11d"; case R::Rbp: return "ebp";
-        case R::Rsp: return "esp";
+        case R::R11: return "r11d"; case R::Rbx: return "ebx";
+        case R::R12: return "r12d"; case R::R13: return "r13d";
+        case R::R14: return "r14d"; case R::R15: return "r15d";
+        case R::Rbp: return "ebp"; case R::Rsp: return "esp";
         default: return rname(r); // xmm regs keep their names
     }
 }
@@ -94,6 +102,35 @@ struct Emitter {
         lf_.slot_of.insert(n, s);
         return s;
     }
+
+    // ---- FP constant pool ------------------------------------------------
+    // f64/f32 constants are materialized into the high XMM bank (xmm8-15):
+    // never used for argument passing (SysV vector args use xmm0-7), never
+    // assigned by the register allocator (pool = xmm2-7), and dead across
+    // nothing except calls, where the cache is invalidated and the constant
+    // re-materialized — a loop without calls sees one materialization total
+    // instead of one per use per iteration.
+    R fp_const_reg(u64 bits, u8 size) {
+        if (const R* r = fp_const_cache_.find(bits)) return *r;
+        if (next_const_xmm_ > 15) {
+            // pool exhausted: re-materialize per use; the loop-invariant
+            // hoist in pass 87 moves repeated materializations out of
+            // loops, so per-iteration cost stays bounded
+            imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
+            Inst& mv = reg2(IOp::MovFpFromGpr, R::Xmm1, R::Rax);
+            (void)mv;
+            (void)size;
+            return R::Xmm1;
+        }
+        R reg = static_cast<R>(static_cast<int>(R::Xmm0) + next_const_xmm_++);
+        fp_const_cache_.insert(bits, reg);
+        imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
+        Inst& mv = reg2(IOp::MovFpFromGpr, reg, R::Rax);
+        (void)mv;
+        (void)size;
+        return reg;
+    }
+    void invalidate_fp_consts() { fp_const_cache_.clear(); next_const_xmm_ = 14; }
 
     // ---- emit shorthands --------------------------------------------------------
     Inst& emit(IOp op) {
@@ -175,14 +212,16 @@ struct Emitter {
             u64 bits = 0;
             if (size == 8) {
                 std::memcpy(&bits, &nd.fval, sizeof bits);
-                imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
-                reg2(IOp::MovFpFromGpr, r, R::Rax);
             } else {
                 f32 f = static_cast<f32>(nd.fval);
                 u32 b32 = 0;
                 std::memcpy(&b32, &f, sizeof b32);
-                imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(b32));
-                reg2(IOp::MovFpFromGpr32, r, R::Rax);
+                bits = b32;
+            }
+            R creg = fp_const_reg(bits, size);
+            if (creg != r) {
+                Inst& i = reg2(IOp::MovFpFp, r, creg);
+                i.size = size;
             }
             return;
         }
@@ -355,6 +394,8 @@ struct Emitter {
         Inst& i = emit(IOp::FpBin);
         i.bin = static_cast<BinOp>(nd.sub);
         i.size = size;
+        i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0; // dst (accumulates)
+        i.b.k = Operand::K::Reg; i.b.reg = R::Xmm1; // src
         Inst& st = emit(IOp::MovFpS);
         st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
         st.b.k = Operand::K::Slot; st.b.slot = slot(n);
@@ -369,7 +410,10 @@ struct Emitter {
         if (fp_of(an.ty)) {
             load_fp(nd.in[1], R::Xmm0);
             load_fp(nd.in[2], R::Xmm1);
-            emit(IOp::FpCmp).size = sz_of(an.ty);
+            Inst& c = emit(IOp::FpCmp);
+            c.size = sz_of(an.ty);
+            c.a.k = Operand::K::Reg; c.a.reg = R::Xmm0;
+            c.b.k = Operand::K::Reg; c.b.reg = R::Xmm1;
         } else {
             load_value(nd.in[1], R::Rax, size);
             if (g_.node(nd.in[2]).op == Op::Const) {
@@ -397,6 +441,7 @@ struct Emitter {
             load_fp(nd.in[1], R::Xmm0);
             Inst& i = emit(IOp::FpNeg);
             i.size = sz_of(nd.ty);
+            i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0;
             Inst& st = emit(IOp::MovFpS);
             st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
             st.b.k = Operand::K::Slot; st.b.slot = slot(n);
@@ -435,13 +480,28 @@ struct Emitter {
 
         switch (static_cast<CastOp>(nd.sub)) {
             case CastOp::ZExt:
-                load_value(src, R::Rax, src_size);
+                // Const sources are materialized, never stored to their
+                // slot (load_value handles them); extend the constant
+                // directly so negative i32 constants zero-extend correctly.
+                if (sn.op == Op::Const) {
+                    imm_reg(IOp::MovRImm, R::Rax,
+                            static_cast<i64>(static_cast<u32>(static_cast<i32>(sn.ival))));
+                } else {
+                    load_value(src, R::Rax, src_size);
+                }
                 store_result(n, 8);
                 return;
             case CastOp::SExt:
                 if (src_size == 4) {
-                    ld_slot(IOp::MovSR, R::Rax, slot(src), 4);
-                    emit(IOp::SExt32);
+                    if (sn.op == Op::Const) {
+                        // same as above: constants never live in slots; the
+                        // sign-extended 64-bit value IS the constant.
+                        imm_reg(IOp::MovRImm, R::Rax,
+                                static_cast<i64>(static_cast<i32>(sn.ival)));
+                    } else {
+                        ld_slot(IOp::MovSR, R::Rax, slot(src), 4);
+                        emit(IOp::SExt32);
+                    }
                 } else {
                     load_value(src, R::Rax, 8);
                 }
@@ -560,6 +620,7 @@ struct Emitter {
             (void)slot(n); // reserve the slot; address computed via LeaSlot
             return;
         }
+        invalidate_fp_consts(); // malloc clobbers caller-saved XMMs
         const Node& size = g_.node(nd.in[2]);
         imm_reg(IOp::MovRImm, R::Rdi, size.ival);
         Inst& c = emit(IOp::CallSym);
@@ -569,6 +630,7 @@ struct Emitter {
 
     void emit_call(NodeId n) {
         const Node& nd = g_.node(n);
+        invalidate_fp_consts(); // all XMMs are caller-saved across calls
         if (nd.aux == kFnPrint) {
             emit_print(n);
             return;
@@ -739,6 +801,8 @@ struct Emitter {
     FunctionGraph& fg_;
     Graph& g_;
     SymbolTable& syms_;
+    FlatMap<u64, R> fp_const_cache_;
+    int next_const_xmm_ = 14;
 };
 
 } // namespace
@@ -800,6 +864,28 @@ bool x64_post_ra_cleanup(LFunction& lf) {
                 continue;
             }
         }
+        if (cur.op == IOp::MovFpS && i + 1 < lf.code.size()) {
+            const Inst& nxt = lf.code[i + 1];
+            if (nxt.op == IOp::MovFpR && nxt.b.k == Operand::K::Slot &&
+                cur.b.k == Operand::K::Slot && nxt.b.slot == cur.b.slot &&
+                cur.a.k == Operand::K::Reg && nxt.a.k == Operand::K::Reg &&
+                !slot_read_later(lf.code, i + 2, cur.b.slot)) {
+                if (nxt.a.reg == cur.a.reg) {
+                    // store+load back into the same register: nothing at all
+                    ++i;
+                } else {
+                    Inst mv;
+                    mv.op = IOp::MovFpFp;
+                    mv.a.k = Operand::K::Reg; mv.a.reg = nxt.a.reg;
+                    mv.b.k = Operand::K::Reg; mv.b.reg = cur.a.reg;
+                    mv.size = cur.size;
+                    out.push_back(mv);
+                    ++i;
+                }
+                changed = true;
+                continue;
+            }
+        }
         if (cur.op == IOp::MovSImm && i + 1 < lf.code.size()) {
             const Inst& nxt = lf.code[i + 1];
             if (nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
@@ -822,11 +908,492 @@ bool x64_post_ra_cleanup(LFunction& lf) {
     return changed;
 }
 
-// ---- pass 87 -----------------------------------------------------------------------
+// ---- pass 87: fused branches + accumulator folds ------------------------------
+namespace {
+
+// mov/lea-only opcodes: these do not touch the flags register, so a compare
+// can stay live across them until a fused jcc consumes it.
+bool flags_preserving(IOp op) {
+    switch (op) {
+        case IOp::MovRR:
+        case IOp::MovRS:
+        case IOp::MovSR:
+        case IOp::MovRImm:
+        case IOp::MovSImm:
+        case IOp::MovFpS:
+        case IOp::MovFpR:
+        case IOp::MovFpFp:
+        case IOp::LeaSlot:
+        case IOp::LeaSym:
+        case IOp::Nop:
+        case IOp::Comment:
+            return true;
+        default:
+            return false;
+    }
+}
+
+Cond inv_cond(Cond c) {
+    switch (c) {
+        case Cond::E:  return Cond::NE;
+        case Cond::NE: return Cond::E;
+        case Cond::L:  return Cond::GE;
+        case Cond::LE: return Cond::G;
+        case Cond::G:  return Cond::LE;
+        case Cond::GE: return Cond::L;
+        case Cond::B:  return Cond::AE;
+        case Cond::BE: return Cond::A;
+        case Cond::A:  return Cond::BE;
+        case Cond::AE: return Cond::B;
+    }
+    return Cond::E;
+}
+
+bool is_cmp_op(IOp op) {
+    return op == IOp::CmpRR || op == IOp::CmpRImm || op == IOp::FpCmp;
+}
+
+// Is `i` the defining store of the comparison boolean, in either its
+// spill-everywhere form (mov [slot], rax) or post-RA promoted form
+// (mov regC, rax)?
+bool is_bool_store(const Inst& i) {
+    if (i.op == IOp::MovRS && i.a.k == Operand::K::Reg && i.a.reg == R::Rax)
+        return true;
+    if (i.op == IOp::MovRR && i.a.k == Operand::K::Reg && i.b.k == Operand::K::Reg &&
+        i.b.reg == R::Rax)
+        return true;
+    return false;
+}
+
+// Slot-reference counts (defs/uses) across the whole function.
+struct SlotCounts {
+    FlatMap<i32, u32> defs;
+    FlatMap<i32, u32> uses;
+};
+
+SlotCounts count_slot_refs(const std::vector<Inst>& code) {
+    SlotCounts c;
+    for (const Inst& i : code) {
+        if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot)
+            c.defs.insert(i.b.slot, c.defs.contains(i.b.slot) ? *c.defs.find(i.b.slot) + 1 : 1);
+        else if (i.op == IOp::MovSImm && i.a.k == Operand::K::Slot)
+            c.defs.insert(i.a.slot, c.defs.contains(i.a.slot) ? *c.defs.find(i.a.slot) + 1 : 1);
+        else if ((i.op == IOp::MovSR || i.op == IOp::MovFpR) && i.b.k == Operand::K::Slot)
+            c.uses.insert(i.b.slot, c.uses.contains(i.b.slot) ? *c.uses.find(i.b.slot) + 1 : 1);
+        else if (i.op == IOp::LeaSlot && i.b.k == Operand::K::Slot)
+            c.uses.insert(i.b.slot, c.uses.contains(i.b.slot) ? *c.uses.find(i.b.slot) + 1 : 1);
+    }
+    return c;
+}
+
+} // namespace
+
+// Fused compare-and-branch + post-RA accumulator folds (the assembly-level
+// gap analysis: setcc/movzx/test sequences around branches, and rax
+// round-trips through promoted registers).
+bool x64_branch_fusion(LFunction& lf) {
+    if (lf.code.empty()) return false;
+    bool changed = false;
+    auto& code = lf.code;
+
+    // ---- 1) dead slot stores: a store whose slot is never read --------
+    {
+        SlotCounts sc = count_slot_refs(code);
+        for (Inst& i : code) {
+            if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot) {
+                const u32* u = sc.uses.find(i.b.slot);
+                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
+            } else if (i.op == IOp::MovSImm && i.a.k == Operand::K::Slot) {
+                const u32* u = sc.uses.find(i.a.slot);
+                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
+            }
+        }
+    }
+
+    // ---- 1b) loop-invariant FP constant hoisting --------------------------
+    // The isel constant pool (xmm8-15) materializes each f64/f32 constant at
+    // its FIRST USE — which for loop-carried constants sits inside the loop
+    // body and re-executes every iteration. A materialization pair
+    //     [movq $bits, %rax] [movq %rax, %xmmN]      (N >= 8)
+    // whose target register nothing else writes, inside a loop region with
+    // no calls, moves to immediately before the loop-top label (backedge
+    // jumps land at the label, after the pair — the pair runs once per
+    // loop ENTRY, which is all a write-free register needs).
+    {
+        // label id -> instruction position
+        FlatMap<int, size_t> label_pos;
+        for (size_t i = 0; i < code.size(); ++i)
+            if (code[i].op == IOp::Label) label_pos.insert(code[i].a.label, i);
+        // backedge regions: [top_pos, end_pos]
+        struct Region {
+            size_t top, end; // inclusive bounds
+        };
+        std::vector<Region> regions;
+        for (size_t i = 0; i < code.size(); ++i) {
+            if (code[i].op != IOp::Jcc && code[i].op != IOp::Jmp) continue;
+            const size_t* tp = label_pos.find(code[i].a.label);
+            if (!tp || *tp >= i) continue;
+            regions.push_back(Region{*tp, i});
+        }
+        if (!regions.empty()) {
+            // sort regions outermost-first (larger span first)
+            std::sort(regions.begin(), regions.end(), [](const Region& a, const Region& b) {
+                return (a.end - a.top) > (b.end - b.top);
+            });
+            // candidate materialization pairs
+            struct Pair {
+                size_t imm_idx;
+                R target;
+            };
+            std::vector<Pair> pairs;
+            for (size_t i = 0; i + 1 < code.size(); ++i) {
+                if (code[i].op == IOp::MovRImm && code[i].a.k == Operand::K::Reg &&
+                    code[i].a.reg == R::Rax && code[i + 1].op == IOp::MovFpFromGpr &&
+                    code[i + 1].a.k == Operand::K::Reg &&
+                    reg_is_const_pool_xmm(code[i + 1].a.reg) &&
+                    code[i + 1].b.k == Operand::K::Reg && code[i + 1].b.reg == R::Rax)
+                    pairs.push_back(Pair{i, code[i + 1].a.reg});
+            }
+            // decide a destination (loop-top label position) per pair
+            FlatMap<size_t, i64> remove;      // pair imm_idx -> unused
+            FlatMap<size_t, size_t> dest;     // pair imm_idx -> insert-before pos
+            FlatMap<size_t, u32> dest_count;  // insert pos -> number of pairs
+            for (const Pair& pr : pairs) {
+                for (const Region& rg : regions) {
+                    if (pr.imm_idx <= rg.top || pr.imm_idx >= rg.end) continue;
+                    // constraints on the WHOLE region: no calls, target not
+                    // written by anything except this pair's own movq
+                    bool bad = false;
+                    for (size_t k = rg.top; k <= rg.end && !bad; ++k) {
+                        const Inst& q = code[k];
+                        if (q.op == IOp::CallFn || q.op == IOp::CallSym ||
+                            q.op == IOp::TailCallFn)
+                            { bad = true; break; }
+                        if (k == pr.imm_idx || k == pr.imm_idx + 1) continue;
+                        if ((q.op == IOp::MovFpFp || q.op == IOp::FpBin ||
+                             q.op == IOp::MovFpR || q.op == IOp::FpNeg ||
+                             q.op == IOp::MovFpFromGpr) &&
+                            q.a.k == Operand::K::Reg && q.a.reg == pr.target)
+                            { bad = true; break; }
+                    }
+                    if (bad) continue;
+                    dest.insert(pr.imm_idx, rg.top);
+                    remove.insert(pr.imm_idx, 0);
+                    if (const u32* c = dest_count.find(rg.top))
+                        dest_count.insert(rg.top, *c + 1);
+                    else
+                        dest_count.insert(rg.top, 1);
+                    break; // outermost qualifying region wins
+                }
+            }
+            if (!remove.empty()) {
+                // hoisted instructions per loop-top position, deterministic
+                // (pair imm index ascending)
+                FlatMap<size_t, std::vector<Inst>> hoisted;
+                for (const auto& e : dest.entries()) {
+                    size_t pi = static_cast<size_t>(e.first);
+                    size_t di = e.second;
+                    if (const std::vector<Inst>* v = hoisted.find(di)) {
+                        std::vector<Inst> nv = *v;
+                        nv.push_back(code[pi]);
+                        nv.push_back(code[pi + 1]);
+                        hoisted.insert(di, std::move(nv));
+                    } else {
+                        std::vector<Inst> nv;
+                        nv.push_back(code[pi]);
+                        nv.push_back(code[pi + 1]);
+                        hoisted.insert(di, std::move(nv));
+                    }
+                }
+                std::vector<Inst> out;
+                out.reserve(code.size());
+                for (size_t i = 0; i < code.size(); ++i) {
+                    if (remove.contains(i)) {
+                        ++i; // skip the MovFpFromGpr too
+                        changed = true;
+                        continue;
+                    }
+                    if (const std::vector<Inst>* v = hoisted.find(i)) {
+                        for (const Inst& h : *v) out.push_back(h);
+                        // (the label itself follows below)
+                    }
+                    out.push_back(code[i]);
+                }
+                code = std::move(out);
+            }
+        }
+    }
+
+    // ---- 2) fused compare-and-branch ------------------------------------
+    // Pattern (post-RA forms):
+    //     [CmpXX cond-flags] [Setcc c] [MovZX] [mov slotC/regC, rax]
+    //     ...flags-preserving movs only...
+    //     [mov rax, slotC/regC] [Test rax, rax] [Jcc NE|E label]
+    // The boolean is single-def/single-use; rewrite to [CmpXX] [Jcc(c|inv c)].
+    // Post-RA pair folding (pass 85) often deletes the store+load pair
+    // entirely, leaving the shorter chain
+    //     [Cmp] [Setcc] [MovZX] [Test rax, rax] [Jcc]
+    // which fuses whenever only flags-preserving instructions (or Nops)
+    // sit between the MovZX and the Test and nothing else consumes rax.
+    {
+        SlotCounts sc = count_slot_refs(code);
+        for (size_t t = 1; t + 1 < code.size(); ++t) {
+            if (code[t].op != IOp::Test) continue;
+            if (code[t].a.k != Operand::K::Reg || code[t].a.reg != R::Rax) continue;
+            const Inst& jcc = code[t + 1];
+            if (jcc.op != IOp::Jcc) continue;
+            if (jcc.cond != Cond::NE && jcc.cond != Cond::E) continue;
+
+            // ---- short chain: [Cmp][Setcc][MovZX] (Nop|flags-safe)* [Test] --
+            {
+                size_t m = t;
+                bool clean = true;
+                while (m > 0) {
+                    --m;
+                    if (code[m].op == IOp::Nop) continue;
+                    if (code[m].op != IOp::MovZX) { clean = false; break; }
+                    // only Nops allowed between MovZX and Test (rax consumers)
+                    if (m < 2 || code[m - 1].op != IOp::Setcc ||
+                        !is_cmp_op(code[m - 2].op))
+                        { clean = false; break; }
+                    Cond cmpcond = code[m - 1].cond;
+                    code[m].op = IOp::Nop;      // movzx
+                    code[m - 1].op = IOp::Nop;  // setcc
+                    code[t].op = IOp::Nop;      // test
+                    code[t + 1].cond =
+                        (jcc.cond == Cond::NE) ? cmpcond : inv_cond(cmpcond);
+                    changed = true;
+                    break;
+                }
+                if (clean && code[t].op == IOp::Nop) continue; // fused
+            }
+
+            // the load feeding the test
+            const Inst& load = code[t - 1];
+            bool via_slot = false;
+            i32 slot_c = 0;
+            R reg_c = R::Rax;
+            if (load.op == IOp::MovSR && load.a.k == Operand::K::Reg &&
+                load.a.reg == R::Rax && load.b.k == Operand::K::Slot) {
+                via_slot = true;
+                slot_c = load.b.slot;
+                const u32* d = sc.defs.find(slot_c);
+                const u32* u = sc.uses.find(slot_c);
+                if (!d || *d != 1 || !u || *u != 1) continue; // single-def/single-use
+            } else if (load.op == IOp::MovRR && load.a.k == Operand::K::Reg &&
+                       load.a.reg == R::Rax && load.b.k == Operand::K::Reg &&
+                       load.b.reg != R::Rax) {
+                reg_c = load.b.reg;
+            } else {
+                continue;
+            }
+
+            // walk back over flags-preserving movs to the defining store
+            bool fused = false;
+            for (size_t p = t - 1; p-- > 3;) {
+                if (!flags_preserving(code[p].op)) break; // flags clobbered
+                if (!is_bool_store(code[p])) continue;
+                // value identity: store must write slot_c / reg_c
+                if (via_slot) {
+                    if (code[p].op != IOp::MovRS || code[p].b.k != Operand::K::Slot ||
+                        code[p].b.slot != slot_c || code[p].a.reg != R::Rax)
+                        continue;
+                } else {
+                    if (code[p].op != IOp::MovRR || code[p].a.k != Operand::K::Reg ||
+                        code[p].a.reg != reg_c || code[p].b.k != Operand::K::Reg ||
+                        code[p].b.reg != R::Rax)
+                        continue;
+                    // reg-home values: single def / single use globally
+                    u32 defs = 0, uses = 0;
+                    for (const Inst& q : code) {
+                        if (q.op == IOp::MovRR && q.a.k == Operand::K::Reg &&
+                            q.a.reg == reg_c && q.b.k == Operand::K::Reg && q.b.reg == R::Rax)
+                            ++defs;
+                        if (q.op == IOp::MovRR && q.a.k == Operand::K::Reg &&
+                            q.a.reg == R::Rax && q.b.k == Operand::K::Reg && q.b.reg == reg_c)
+                            ++uses;
+                    }
+                    if (defs != 1 || uses != 1) continue;
+                }
+                if (code[p - 1].op != IOp::MovZX) continue;
+                if (code[p - 2].op != IOp::Setcc) continue;
+                if (!is_cmp_op(code[p - 3].op)) continue;
+
+                Cond cmpcond = code[p - 2].cond;
+                code[p].op = IOp::Nop;      // boolean store
+                code[p - 1].op = IOp::Nop;  // movzx
+                code[p - 2].op = IOp::Nop;  // setcc
+                code[t - 1].op = IOp::Nop;  // boolean load
+                code[t].op = IOp::Nop;      // test
+                code[t + 1].cond =
+                    (jcc.cond == Cond::NE) ? cmpcond : inv_cond(cmpcond);
+                changed = true;
+                fused = true;
+                break;
+            }
+            (void)fused;
+        }
+    }
+
+    // ---- 3) mov+test fold: [mov rax, R] [test rax, rax] -> [test R, R] --
+    //         slot form: [mov rax, [s]] [test] -> [cmpq $0, [s]] (jcc E/NE)
+    {
+        for (size_t t = 1; t < code.size(); ++t) {
+            if (code[t].op != IOp::Test || code[t].a.k != Operand::K::Reg) continue;
+            Inst& mov = code[t - 1];
+            if (mov.op == IOp::MovRR && mov.a.k == Operand::K::Reg &&
+                mov.a.reg == R::Rax && mov.b.k == Operand::K::Reg &&
+                mov.b.reg != R::Rax) {
+                code[t].a.reg = mov.b.reg;
+                mov.op = IOp::Nop;
+                changed = true;
+            } else if (mov.op == IOp::MovSR && mov.a.k == Operand::K::Reg &&
+                       mov.a.reg == R::Rax && mov.b.k == Operand::K::Slot &&
+                       t + 1 < code.size() && code[t + 1].op == IOp::Jcc &&
+                       (code[t + 1].cond == Cond::E || code[t + 1].cond == Cond::NE)) {
+                code[t].op = IOp::CmpRImm;
+                code[t].a.k = Operand::K::Slot;
+                code[t].a.slot = mov.b.slot;
+                code[t].b.k = Operand::K::Imm;
+                code[t].b.imm = 0;
+                code[t].size = 8;
+                mov.op = IOp::Nop;
+                changed = true;
+            }
+        }
+    }
+
+    // ---- 4) accumulator fold: [mov rax, B] [op rax, ...] [mov B, rax] --
+    //         -> [op B, ...] (one 2-operand op through the rax accumulator)
+    {
+        auto mid_ok = [&](const Inst& m) {
+            switch (m.op) {
+                case IOp::ArithRR:
+                case IOp::ArithRImm:
+                case IOp::ShiftImm:
+                case IOp::ShiftCl:
+                case IOp::Neg:
+                case IOp::Not:
+                    return m.a.k == Operand::K::Reg && m.a.reg == R::Rax;
+                default:
+                    return false;
+            }
+        };
+        for (size_t i = 0; i + 2 < code.size(); ++i) {
+            Inst& m1 = code[i];
+            Inst& mid = code[i + 1];
+            Inst& m2 = code[i + 2];
+            if (m1.op != IOp::MovRR || m1.a.k != Operand::K::Reg || m1.a.reg != R::Rax ||
+                m1.b.k != Operand::K::Reg || m1.b.reg == R::Rax)
+                continue;
+            R b = m1.b.reg;
+            if (!mid_ok(mid)) continue;
+            if (m2.op != IOp::MovRR || m2.a.k != Operand::K::Reg || m2.a.reg != b ||
+                m2.b.k != Operand::K::Reg || m2.b.reg != R::Rax)
+                continue;
+            mid.a.reg = b;
+            m1.op = IOp::Nop;
+            m2.op = IOp::Nop;
+            changed = true;
+        }
+    }
+
+    // ---- 5) adjacent mov pair: [mov X, Y] [mov Y, X] -> [mov X, Y] -----
+    //         (both GP MovRR and FP MovFpFp; the second swap is a no-op)
+    {
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& a1 = code[i];
+            Inst& a2 = code[i + 1];
+            if ((a1.op != IOp::MovRR && a1.op != IOp::MovFpFp) || a1.op != a2.op) continue;
+            if (a1.a.k != Operand::K::Reg || a1.b.k != Operand::K::Reg) continue;
+            if (a2.a.k != Operand::K::Reg || a2.b.k != Operand::K::Reg) continue;
+            if (a1.a.reg == a1.b.reg) continue;
+            if (a2.a.reg == a1.b.reg && a2.b.reg == a1.a.reg) {
+                a2.op = IOp::Nop;
+                changed = true;
+            }
+        }
+    }
+
+    // ---- 6) copy chains through isel scratch registers -------------------
+    // Post-RA phi copies lower as [mov A<-B][mov C<-A] with A a scratch
+    // register (rax/xmm0/xmm1 — never allocator-homed). If A is not read
+    // again before its next redefinition, the pair collapses to [mov C<-B].
+    {
+        auto is_scratch = [](R r) {
+            return r == R::Rax || r == R::Xmm0 || r == R::Xmm1;
+        };
+        auto writes_reg = [](const Inst& q, R a) {
+            switch (q.op) {
+                case IOp::MovRR: case IOp::MovFpFp: case IOp::ArithRR:
+                case IOp::ArithRImm: case IOp::FpBin: case IOp::MovFpR:
+                case IOp::FpNeg: case IOp::MovFpFromGpr: case IOp::Neg:
+                case IOp::Not: case IOp::MovRImm: case IOp::ShiftImm:
+                case IOp::ShiftCl: case IOp::SExt32:
+                    return q.a.k == Operand::K::Reg && q.a.reg == a;
+                default: return false;
+            }
+        };
+        auto reads_reg = [](const Inst& q, R a) {
+            if (q.b.k == Operand::K::Reg && q.b.reg == a) return true;
+            switch (q.op) {
+                case IOp::ArithRR: case IOp::CmpRR: case IOp::FpBin:
+                case IOp::FpCmp: case IOp::Cmov:
+                    return q.a.k == Operand::K::Reg && q.a.reg == a;
+                case IOp::Test: case IOp::IDiv: case IOp::UDiv:
+                    return q.a.k == Operand::K::Reg && q.a.reg == a;
+                case IOp::MovFpFp: case IOp::MovRR:
+                    return q.a.k == Operand::K::Reg && q.a.reg == a; // dst read for swaps? conservative
+                default: return false;
+            }
+        };
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& m1 = code[i];
+            Inst& m2 = code[i + 1];
+            if ((m1.op != IOp::MovRR && m1.op != IOp::MovFpFp) || m1.op != m2.op)
+                continue;
+            if (m1.a.k != Operand::K::Reg || m1.b.k != Operand::K::Reg) continue;
+            if (m2.a.k != Operand::K::Reg || m2.b.k != Operand::K::Reg) continue;
+            R a = m1.a.reg, b = m1.b.reg, c = m2.a.reg;
+            if (!is_scratch(a)) continue;      // only isel scratch chains
+            if (m2.b.reg != a) continue;       // must chain
+            if (b == a || c == a) continue;
+            // forward scan: A must be redefined before any read / boundary
+            bool ok = false, abort = false;
+            for (size_t j = i + 2; j < code.size(); ++j) {
+                const Inst& q = code[j];
+                if (q.op == IOp::Label || q.op == IOp::Jcc || q.op == IOp::Jmp ||
+                    q.op == IOp::Ret || q.op == IOp::RetNaked || q.op == IOp::CallFn ||
+                    q.op == IOp::CallSym || q.op == IOp::TailCallFn ||
+                    q.op == IOp::TailCallNaked)
+                    { abort = true; break; }
+                if (writes_reg(q, a)) { ok = true; break; }
+                if (reads_reg(q, a)) { abort = true; break; }
+            }
+            if (!ok || abort) continue;
+            m1.op = IOp::Nop;
+            m2.b.reg = b;
+            changed = true;
+        }
+    }
+
+    // ---- sweep ------------------------------------------------------------
+    std::vector<Inst> out;
+    out.reserve(code.size());
+    for (const Inst& i : code)
+        if (i.op != IOp::Nop) out.push_back(i);
+    if (out.size() != code.size()) {
+        code = std::move(out);
+        changed = true;
+    }
+    return changed;
+}
+
 bool x64_machine_peephole(LFunction& lf) {
     bool changed = false;
     for (Inst& i : lf.code) {
-        if (i.op == IOp::CmpRImm && i.b.k == Operand::K::Imm && i.b.imm == 0) {
+        if (i.op == IOp::CmpRImm && i.b.k == Operand::K::Imm && i.b.imm == 0 &&
+            i.a.k == Operand::K::Reg) {
             i.op = IOp::Test;
             i.b = Operand{};
             changed = true;
@@ -944,7 +1511,12 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::IDiv: os << "\tidivq " << r(i.a.reg) << "\n"; break;
         case IOp::UDiv: os << "\tdivq " << r(i.a.reg) << "\n"; break;
         case IOp::CmpRR: os << "\tcmp" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
-        case IOp::CmpRImm: os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n"; break;
+        case IOp::CmpRImm:
+            if (i.a.k == Operand::K::Slot) // fold-3 form: cmp $imm, off(%rbp)
+                os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << slotstr(i.a) << "\n";
+            else
+                os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n";
+            break;
         case IOp::Test: os << "\ttestq " << r(i.a.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::Setcc: os << "\tset" << cc(i.cond) << " %al\n"; break;
         case IOp::Cmov: os << "\tcmov" << cc(i.cond) << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
@@ -963,13 +1535,13 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
                 case BinOp::Div: mn = "div"; break;
                 default: break;
             }
-            os << "\t" << mn << fpsz(i.size) << " %xmm1, %xmm0\n";
+            os << "\t" << mn << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
             break;
         }
-        case IOp::FpCmp: os << "\tucomi" << fpsz(i.size) << " %xmm1, %xmm0\n"; break;
+        case IOp::FpCmp: os << "\tucomi" << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::FpNeg:
-            if (i.size == 8) os << "\txorpd .Lnegmask64(%rip), %xmm0\n";
-            else os << "\txorps .Lnegmask32(%rip), %xmm0\n";
+            if (i.size == 8) os << "\txorpd .Lnegmask64(%rip), " << r(i.a.reg) << "\n";
+            else os << "\txorps .Lnegmask32(%rip), " << r(i.a.reg) << "\n";
             break;
         case IOp::SExt32: os << "\tmovslq %eax, %rax\n"; break;
         case IOp::CvtToFp:
@@ -986,6 +1558,17 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::Not: os << "\tnotq " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFromGpr: os << "\tmovq " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFromGpr32: os << "\tmovd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
+        case IOp::MovFpFp:
+            os << "\tmov" << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        case IOp::PushCal: os << "\tpushq " << r(i.a.reg) << "\n"; break;
+        case IOp::PopCal: os << "\tpopq " << r(i.a.reg) << "\n"; break;
+        case IOp::RetNaked: os << "\tret\n"; break;
+        case IOp::TailCallNaked: os << "\tjmp .L" << i.a.label << "_E\n"; break;
+        case IOp::RestoreCal:
+            os << "\tmovq " << (i.b.imm < 0 ? "-" : "") << (i.b.imm < 0 ? -i.b.imm : i.b.imm)
+               << "(%rbp), " << r(i.a.reg) << "\n";
+            break;
         case IOp::Comment: break;
     }
 }

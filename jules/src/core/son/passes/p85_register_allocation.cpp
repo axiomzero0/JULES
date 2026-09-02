@@ -1,10 +1,14 @@
 // Pass 85 — RegisterAllocation (Phase 8)
 //
-// MVP policy: spill-everywhere — every virtual value gets a dedicated frame
-// slot; the emitter loads operands into scratch registers per operation.
-// This is correctness-first (deterministic, trivially correct); the
-// linear-scan allocator (JIT) / graph coloring (AOT quality) upgrade path is
-// documented in docs/architecture.md and slots into this same pass boundary.
+// Level-dispatched allocator (spec §8):
+//   -O0/-Og  "simple": spill-everywhere frame layout (every value in a
+//            dedicated frame slot — deterministic, debug-friendly).
+//   -O1+     linear scan over slot live ranges with callee-saved /
+//            caller-saved / XMM pools (x64_ra.cpp). Values that find no
+//            register keep their memory operands, so spilling degenerates
+//            to the spill-everywhere behavior for that value.
+// The budgeted-IRC grade (graph coloring with move coalescing) is the
+// documented upgrade path; linear scan is the honest current mechanism.
 #include "core/codegen/linear.h"
 #include "core/son/passes/pass_utils.h"
 
@@ -18,10 +22,14 @@ public:
     Stage stage() const override { return Stage::Linear; }
     bool run(PassContext& ctx) override {
         if (!ctx.lin) return false;
+        LevelBudgets b = level_budgets(ctx.opts.level);
         bool changed = false;
         for (LFunction& lf : ctx.lin->fns) {
-            if (lf.slot_count > 0) changed = true;
-            x64_allocate_frame(lf);
+            const FunctionGraph* fg = ctx.mod.find_fn(lf.fid);
+            changed |= x64_allocate_registers(lf, fg ? &fg->g : nullptr,
+                                              b.ra_registers,
+                                              ctx.opts.level == OptLevel::O3,
+                                              b.size_biased);
         }
         return changed;
     }

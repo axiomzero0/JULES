@@ -12,6 +12,7 @@
 
 #include "core/diagnostics/diag.h"
 #include "core/son/analysis/analysis.h"
+#include "core/son/passes/opt_levels.h"
 
 namespace jules {
 
@@ -28,6 +29,12 @@ enum class Stage : u8 { Son, Linear };
 
 struct PassOptions {
     CompileMode mode = CompileMode::AOT;
+    OptLevel level = OptLevel::O2;      // default release preset (spec §6)
+    OptLevel requested_level = OptLevel::O2; // pre-JIT-budget cap (reporting)
+    FpMode fp = FpMode::Strict;         // --fp=strict|fast
+    PgoMode pgo = PgoMode::Off;         // --pgo=...
+    LtoMode lto = LtoMode::Full;        // single-module compiler: whole-program
+    JitBudget jit_budget = JitBudget::Balanced; // --jit-budget (JIT modes)
     bool verify_each = false;   // run the graph verifier after every pass
     bool emit_ir = false;       // dump IR after every pass
     bool post_inline_cleanup = true;

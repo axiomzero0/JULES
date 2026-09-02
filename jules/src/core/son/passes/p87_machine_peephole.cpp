@@ -18,8 +18,10 @@ public:
     bool run(PassContext& ctx) override {
         if (!ctx.lin) return false;
         bool changed = false;
-        for (LFunction& lf : ctx.lin->fns)
+        for (LFunction& lf : ctx.lin->fns) {
+            changed |= x64_branch_fusion(lf);   // fused cmp+branch, rax folds
             changed |= x64_machine_peephole(lf);
+        }
         return changed;
     }
 };

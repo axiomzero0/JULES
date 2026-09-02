@@ -31,7 +31,8 @@ ALL_KERNELS = ["fib", "tak", "primes", "mandel", "flops", "inthash"]
 
 # label -> (compiler kind, extra args)
 CONFIGS = [
-    ("julesc-aot",            "jules", ["--mode", "aot"]),
+    ("julesc-aot",            "jules", ["--mode", "aot"]),            # default = -O2
+    ("julesc-aot-O3",         "jules", ["--mode", "aot", "-O3"]),
     ("julesc-jit-baseline",   "jules", ["--mode", "jit-baseline"]),
     ("julesc-jit-optimizing", "jules", ["--mode", "jit-optimizing"]),
     ("gcc-O0", "gcc", ["-O0"]),

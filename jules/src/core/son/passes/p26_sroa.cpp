@@ -36,18 +36,39 @@ private:
     bool promotable(NodeId alloc) {
         for (NodeId u : g_.uses_of(alloc)) {
             const Node& un = g_.node(u);
+            if (un.op == Op::Dead) continue; // killed nodes can't escape anything
             switch (un.op) {
                 case Op::Load:
                 case Op::Store:
                     if (un.in[2] == alloc || un.in[1] == alloc) continue;
+                    if (getenv("JULES_DEBUG_SROA"))
+                        fprintf(stderr, "[sroa] n%u non-promotable: %s n%u uses it as value\n",
+                                alloc, op_name(un.op), u);
                     return false; // used as a VALUE (e.g. stored pointer)
                 case Op::Call:
                     if (un.in[1] == alloc) continue; // memory-chain use only
+                    if (getenv("JULES_DEBUG_SROA"))
+                        fprintf(stderr, "[sroa] n%u non-promotable: Call n%u passes it\n", alloc, u);
                     return false;                    // passed as an argument: escapes
+                case Op::Phi:
+                    // memory phi carrying the allocation as a memory version
+                    // (loop backedge chains are full of these). A data phi
+                    // flowing the POINTER as a value is an escape; a <mem>
+                    // phi input is exactly the Call in[1] case above.
+                    if (un.ty == ty_mem()) continue;
+                    if (getenv("JULES_DEBUG_SROA"))
+                        fprintf(stderr, "[sroa] n%u non-promotable: data Phi n%u flows it\n",
+                                alloc, u);
+                    return false;
                 case Op::Alloc:
                     if (un.in[1] == alloc) continue; // chained allocation (mem use)
+                    if (getenv("JULES_DEBUG_SROA"))
+                        fprintf(stderr, "[sroa] n%u non-promotable: Alloc n%u uses it\n", alloc, u);
                     return false;
                 default:
+                    if (getenv("JULES_DEBUG_SROA"))
+                        fprintf(stderr, "[sroa] n%u non-promotable: %s n%u (op %d)\n", alloc,
+                                op_name(un.op), u, (int)un.op);
                     return false;                    // any other data use escapes
             }
         }
@@ -76,7 +97,12 @@ private:
             if (val == kNoNode || val == u) { all_ok = false; break; }
             repls.push_back({u, val});
         }
-        if (!all_ok || poison_) return;
+        if (!all_ok || poison_) {
+            if (getenv("JULES_DEBUG_SROA"))
+                fprintf(stderr, "[sroa] abort n%u (all_ok=%d poison=%d)\n", alloc,
+                        (int)all_ok, (int)poison_);
+            return;
+        }
         for (const Replacement& r : repls) {
             g_.replace_all_uses(r.load, r.value);
             g_.kill(r.load);
