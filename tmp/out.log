@@ -1,0 +1,36 @@
+; ---- after pass 1 (DeadNodeElimination) fn main ----
+graph 7 live / 7 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n5: Cast op=sext : i64 in=[n0, n4]
+n6: Return in=[n0, n3, n5]
+; ---- after pass 2 (IdentityCollapse) fn main ----
+graph 7 live / 7 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n5: Cast op=sext : i64 in=[n0, n4]
+n6: Return in=[n0, n3, n5]
+; ---- after pass 3 (ConstantFolding) fn main ----
+graph 7 live / 8 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n6: Return in=[n0, n3, n7]
+n7: Const value=0 : i64 in=[n0]
+; ---- after pass 4 (TypeCanonicalization) fn main ----
+graph 7 live / 8 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n6: Return in=[n0, n3, n7]
+n7: Const value=0 : i64 in=[n0]

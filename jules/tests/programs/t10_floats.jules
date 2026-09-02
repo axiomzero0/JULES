@@ -1,0 +1,14 @@
+// floats: fp arithmetic, casts, comparisons
+fn main() -> i64 {
+    let a: f64 = 3.5;
+    let b: f64 = 2.0;
+    print(a + b);
+    print(a * b);
+    print(a / b);
+    if a > b { print(1); } else { print(0); }
+    let c: i64 = a as i64;
+    print(c);
+    let d: f64 = (7 as i64) as f64;
+    print(d);
+    return 0 as i64;
+}

@@ -1,0 +1,15 @@
+// SROA: loop-carried local promoted to a phi; no allocs survive
+fn sum_to(n: i64) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    print(sum_to(100 as i64));
+    return 0 as i64;
+}

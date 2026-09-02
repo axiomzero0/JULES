@@ -1,0 +1,10 @@
+// inlining: small helper folded into callers
+fn add3(a: i64, b: i64, c: i64) -> i64 {
+    return a + b + c;
+}
+
+fn main() -> i64 {
+    print(add3(1 as i64, 2 as i64, 3 as i64));
+    print(add3(add3(1 as i64, 1 as i64, 1 as i64), 10 as i64, 20 as i64));
+    return 0 as i64;
+}

@@ -1,0 +1,19 @@
+// comptime + arithmetic + casts
+const BASE: i64 = comptime {
+    var n: i64 = 1;
+    n = n * 3;
+    n = n + 7;
+    return n;
+};
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i64 {
+    print(BASE);
+    print(fib(20 as i64));
+    print((2 as i64) * 21);
+    return 0 as i64;
+}

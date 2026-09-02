@@ -1,0 +1,26 @@
+// pointers: alloc/store/load; SROA + heap-to-stack; escape keeps heap
+fn heap_cell() -> i64 {
+    let p: *mut i64 = alloc(i64);
+    *p = 11;
+    let a: i64 = *p;
+    let b: i64 = *p;      // redundant load eliminated
+    *p = a + b;
+    let c: i64 = *p;
+    free(p);
+    return c;
+}
+
+fn keep() -> i64 {
+    var t: i64 = 5;
+    let q: *mut i64 = alloc(i64);
+    *q = t;
+    t = *q * 3;
+    free(q);
+    return t;
+}
+
+fn main() -> i64 {
+    print(heap_cell());
+    print(keep());
+    return 0 as i64;
+}

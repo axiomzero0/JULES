@@ -1,0 +1,715 @@
+; ---- after pass 1 (DeadNodeElimination) fn main ----
+graph 7 live / 7 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n5: Cast op=sext : i64 in=[n0, n4]
+n6: Return in=[n0, n3, n5]
+; ---- after pass 2 (IdentityCollapse) fn main ----
+graph 7 live / 7 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n5: Cast op=sext : i64 in=[n0, n4]
+n6: Return in=[n0, n3, n5]
+; ---- after pass 3 (ConstantFolding) fn main ----
+graph 7 live / 8 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n6: Return in=[n0, n3, n7]
+n7: Const value=0 : i64 in=[n0]
+; ---- after pass 4 (TypeCanonicalization) fn main ----
+graph 7 live / 8 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n2: Const value=42 : i32 in=[n0]
+n3: Call fn=print : void in=[n0, n0, n2]
+n4: Const value=0 : i32 in=[n0]
+n6: Return in=[n0, n3, n7]
+n7: Const value=0 : i64 in=[n0]
+; ---- after pass 5 (ComptimeResidueFold) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 6 (AssertElision) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 7 (PhiSimplification) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 8 (SparseConditionalConstantPropagation) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 9 (GlobalValueNumbering) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 10 (RedundantPhiElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 11 (CopyPropagation) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 12 (AlgebraicSimplification) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 13 (Reassociation) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 14 (SignExtensionElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 15 (NarrowingTransform) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 16 (BitwiseOptimization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 17 (SelectOptimization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 18 (OverflowCheckElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 19 (AliasAnalysisInitialization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 20 (MemoryDependenceAnalysis) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 21 (RedundantLoadElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 22 (StoreToLoadForwarding) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 23 (DeadStoreElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 24 (StoreMerging) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 25 (LoadHoisting) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 26 (ScalarReplacementOfAggregates) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 27 (BitfieldLowering) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 28 (StackSlotColoring) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 29 (HeapToStackPromotion) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 30 (MemorySSARepair) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 31 (PointsToAnalysis) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 32 (EscapeAnalysis) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 36 (LockElision) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 37 (LoopDetection) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 38 (InductionVariableRecognition) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 39 (LoopClassification) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 40 (LoopInvariantCodeMotion) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 41 (LoadLICM) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 42 (LoopUnrolling) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 43 (ProfileGuidedUnrolling) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 44 (LoopPeeling) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 45 (LoopInterchange) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 46 (LoopFusion) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 47 (LoopFission) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 48 (Predication) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 49 (IfConversion) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 50 (TailRecursionElimination) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 51 (BranchProbabilityInference) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 52 (HotPathStraightening) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 53 (IdiomRecognition) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 54 (SLPVectorizer) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 55 (SuperwordPacker) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 56 (LoopVectorizer) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 57 (OuterLoopVectorizer) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 58 (InterleavedAccessRecognition) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 59 (ReductionRecognizer) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 60 (VectorLegalization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 61 (MaskGeneration) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 62 (ShuffleOptimization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 63 (AutoSOATransform) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 64 (VectorCostModelEvaluation) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 65 (SIMDIntrinsicMatching) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 66 (VectorWidthSelection) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 67 (ClassHierarchyAnalysis) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 68 (StaticDevirtualization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 75 (AssumptionTracking) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 76 (InliningCostModel) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 77 (AlwaysInlineEnforcement) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 78 (CostBasedInlining) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 79 (RecursiveInliningBounding) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 80 (ArgumentSpecialization) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 81 (ClosureInlining) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 82 (LTOSummaryGeneration) fn main ----
+graph 7 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n9: Const value=0 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 1 (DeadNodeElimination) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 2 (IdentityCollapse) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 3 (ConstantFolding) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 7 (PhiSimplification) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 9 (GlobalValueNumbering) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- after pass 26 (ScalarReplacementOfAggregates) fn main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+; ---- final IR: main ----
+graph 6 live / 11 nodes
+n0: Start in=[]
+n1: Stop in=[n6]
+n3: Call fn=print : void in=[n0, n0, n8]
+n6: Return in=[n0, n3, n10]
+n8: Const value=42 : i32 in=[n0]
+n10: Const value=0 : i64 in=[n0]
+/home/z/my-project/tmp/t0.s: Assembler messages:
+/home/z/my-project/tmp/t0.s:27: Warning: unterminated string; newline inserted

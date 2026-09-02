@@ -1,0 +1,13 @@
+// GVN: a*b computed twice, a+b folded
+fn work(x: i64, y: i64) -> i64 {
+    let a: i64 = x * y;
+    let b: i64 = x * y;
+    let c: i64 = x + y;
+    return a + b + c;
+}
+
+fn main() -> i64 {
+    print(work(3 as i64, 4 as i64));
+    print(work(10 as i64, 20 as i64));
+    return 0 as i64;
+}

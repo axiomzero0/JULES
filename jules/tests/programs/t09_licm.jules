@@ -1,0 +1,15 @@
+// LICM: invariant x*17 hoisted out of the loop
+fn loop(n: i64, x: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + (x * 17) + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    print(loop(10 as i64, 2 as i64));
+    return 0 as i64;
+}

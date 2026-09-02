@@ -1,0 +1,2071 @@
+You are absolutely correct. A systems language targeting C/C++ performance with explicit memory control, raw pointers, and no mandatory safety system does not have a garbage collector. References to GC, write barriers, read barriers, stack maps for managed references, and TLABs were inappropriate carryover from the B-2 Java specification and have no place in JULES.
+
+Below is the **corrected, uncompressed** specification with all GC/managed-runtime assumptions removed. Every rule has been audited for static-systems-language fidelity.
+
+---
+
+# JULES Compiler Laws & Architecture Specification
+
+**Status:** Stable
+**Owner:** JULES Core Team
+**Last Updated:** 2026-09-02
+**Target Language:** JULES (static systems language, AOT-first, optional JIT)
+**Implementation Language:** C++26
+**Related Sections:** `ir_spec.md`, `effect_system.md`, `abi.md`, `type_system.md`, `trait_semantics.md`, `memory_model.md`
+
+This document is the authoritative, uncompressed transcription of the laws that govern the **JULES** compiler and runtime. **Every commit to `compiler/`, `runtime/`, `tools/`, and `tests/` must comply. CI verifies them. There are no exceptions.**
+
+---
+
+## Part I: Architectural Overview
+
+The JULES execution model consists of exactly **two modes**. There are no tiers, no baseline JIT, no interpreter fallback, no OSR, and **no garbage collector**.
+
+1.  **AOT Mode**
+
+    Compile-time optimization with full static analysis. Produces native binaries with zero runtime speculation overhead where proofs hold. Guarded code emitted only where static proof is incomplete but PGO or heuristic confidence justifies speculation. Deoptimization transitions to a pre-compiled safe fallback variant of the same function. Memory management is entirely manual or via user-defined abstractions (`Box`, `Unique`, `Rc`, `Arc`). The compiler performs escape analysis and allocation elision as *optimizations*, not as part of a runtime memory management system.
+
+2.  **JIT Mode**
+
+    Runtime compilation using the **identical optimizer pipeline** as AOT. Input includes runtime profiles, live type feedback, and allocation-site data. Emits guarded speculative code. On guard failure, deoptimizes to the AOT-equivalent safe fallback or recompiles without the violated assumption. No OSR. No tiered execution. No interpreter. No runtime memory manager beyond what the user explicitly links.
+
+Both modes share the same Sea-of-Nodes IR, the same 89 named optimization passes, the same verifier, and the same deoptimization infrastructure. The only differences are input data sources (static proofs vs. runtime profiles) and budget parameters.
+
+**Memory Model Foundation:** JULES has no runtime-owned heap. All allocation is explicit (`alloc`, `malloc`, user allocator). All deallocation is explicit (`free`, `drop`, destructor). The compiler may *optimize away* allocations via escape analysis, SROA, and PEA, but this is a compile-time transformation, not a runtime service. Raw pointers (`*const T`, `*mut T`) have no runtime tracking. Smart pointers are library types with no special compiler support beyond generic specialization and inlining.
+
+---
+
+## Part II: The Unified Pipeline & Speculation Laws
+
+**Rule 1 — One Pipeline, Two Input Modes**
+
+The IR, pass interfaces, verifier constraints, and correctness constraints are **unified** across AOT and JIT. Modes differ only by available proofs, profile data, budgets, and telemetry.
+
+-   **AOT Input:** Static IR + static proofs + optional offline PGO.
+-   **JIT Input:** Static IR + runtime profiles + live type/allocation feedback.
+
+There is no “JIT-only” or “AOT-only” pass. Every pass handles both modes via a unified interface. Mode-specific behavior is gated on `CompileMode`, not separate implementations.
+
+---
+
+**Rule 2 — Profiles Are a Force Multiplier, Not New Logic**
+
+Profile data does not change *what* the compiler does; it changes *how aggressively* it does it.
+
+Example: Pass 69 (Speculative Devirtualization) runs in both modes. In AOT, it requires static type propagation proof or offline PGO above threshold. In JIT, it accepts live type profiles above confidence threshold and inserts a guard. The pass logic is identical; the evidence source differs.
+
+---
+
+**Rule 3 — Every Profile-Driven Decision Requires a Guard**
+
+If a pass makes a decision based on profiles (JIT) or uncertain static heuristics (AOT), it **must** emit a validated guard.
+
+Examples of JULES assumptions requiring guards:
+
+-   A trait method call resolves to a specific impl
+-   A generic specialization is valid for the observed types
+-   A pointer is non-null / aligned / in-bounds
+-   An array/slice length satisfies a bound
+-   A branch is always/nearly-always taken
+-   A value is constant within a region
+-   An allocation does not escape on the hot path (for elision)
+-   A SIMD width is supported at runtime
+
+Guard mechanisms: runtime checks, version checks, trap-on-fail, dependency invalidation. Guard success → optimized path. Guard failure → deopt to safe fallback or recompile.
+
+---
+
+**Rule 4 — Deoptimization Reconstructs Safe Fallback State**
+
+When a guard fails, the runtime must deoptimize to a **pre-compiled safe fallback variant** of the same function. This fallback is semantically equivalent to the optimized version but without the failed speculation.
+
+Deopt must reconstruct:
+
+-   All live local variables and temporaries
+-   Pointer values (raw and smart)
+-   Current source location (for diagnostics and stack traces)
+-   Pending panic/error state if applicable
+-   Memory state consistent with JULES memory model
+
+There is **no OSR**. Deopt always lands at a function entry or explicit safepoint in the fallback variant. No mid-loop state transfer. No interpreter.
+
+Speculative side effects must not be committed before the last protecting guard. If effects are reordered, they must be proven non-observable, deferred, or compensated. **Memory writes are never rolled back.** If a speculative store has occurred, deopt must account for it; the store cannot be undone.
+
+---
+
+**Rule 5 — FrameState Is Mandatory for All Guards**
+
+Every node introducing a speculative assumption must have a `FrameState` attachment describing how to reconstruct fallback-compatible state at that point.
+
+---
+
+## Part III: Compilation Pipeline & Memory Laws
+
+**Rule 6 — NO EXCEPTIONS ON THE HOT PATH**
+
+Native C++ exceptions are forbidden on compiler/runtime hot paths. Both AOT and JIT compilers **MUST** be compiled with `-fno-exceptions`.
+
+Zero `throw` statements in compilation or runtime specialization paths. All fallible operations use `std::expected<T, Diagnostic>` or `Result<T, Error>`.
+
+JULES panics/errors are runtime values modeled explicitly in IR. Compiler failures return `Error`, triggering fallback compilation or safe default codegen. No stack unwinding. No catch blocks.
+
+---
+
+**Rule 7 — Zero-Allocation Hot Path**
+
+Both AOT and JIT compilers must use `std::pmr::monotonic_buffer_resource` or arena allocation for IR. Bulk-free after compilation. No `malloc`/`free` in compiler hot path.
+
+“Hot path”: pass execution, guard execution, inline-cache fast paths, allocation fast paths (user allocator wrappers), safepoint polling, deopt entry trampolines.
+
+Deopt materialization may allocate through controlled runtime paths with explicit budgets. This allocation uses the user’s allocator or a dedicated deopt arena, never a GC heap.
+
+---
+
+**Rule 8 — No RTTI**
+
+Both pipelines compiled with `-fno-rtti`. Use `enum class NodeKind` for type switching. RTTI forbidden in IR and backend.
+
+---
+
+**Rule 9 — No `std::shared_ptr` / `std::function` in Hot IR Code**
+
+Use raw pointers plus stable `NodeId`s. Ownership explicit and arena-scoped.
+
+---
+
+**Rule 10 — Every Pass Must Be Idempotent and Monotonic**
+
+Running the same pass twice produces identical IR. A pass reduces node count or moves IR toward normal form.
+
+Passes that grow IR (unrolling, SLP, speculative cloning, PEA materialization) must run inside guarded fixpoint with strict budget.
+
+---
+
+**Rule 11 — Mutator Threads Never Block on JIT**
+
+JIT compilation runs asynchronously on background threads. Mutators continue executing existing compiled code. Installation is atomic. Old code remains valid until quiescence.
+
+---
+
+**Rule 12 — User-Controlled Allocation Only**
+
+JULES has no runtime allocator owned by the language. All allocation goes through user-provided allocators or explicit `malloc`/`free`. The compiler may emit calls to user allocators but never introduces its own heap management. Thread-local allocation buffers (TLABs) are a user-library concern, not a compiler/runtime feature.
+
+---
+
+**Rule 13 — Compiler Threads Never Block on Mutator State**
+
+Compiler works on frozen snapshot. Mutator updates picked up by next compilation. Dependency changes during compilation → discard result, don’t patch inconsistent state.
+
+---
+
+**Rule 14 — Epoch-Based Reclamation for Code Only**
+
+Old JIT code, deopt metadata, and IR nodes are reclaimed via epoch-based reclamation or RCU. Generated code is not reclaimed until no thread can execute it or depend on its metadata. **This applies only to compiler-generated artifacts, not user memory.** User memory lifetime is entirely outside compiler/runtime jurisdiction.
+
+---
+
+## Part IV: Data Structures & IR Design
+
+**Rule 15 — Index-Based Graph (No Raw Pointers in IR)**
+
+All node references use 32-bit integer index:
+
+```cpp
+using NodeId = uint32_t;
+```
+
+This cuts memory footprint, improves cache capacity, makes the IR trivially serializable, and avoids pointer invalidation during arena reallocation.
+
+---
+
+**Rule 16 — Interned Symbols (No Strings in Hot Path)**
+
+Never pass, compare, or store `std::string` or `std::string_view` in the IR or passes.
+
+All identifiers, including type names, function names, field names, module names, and trait names, must be interned into a global or scoped `SymbolTable` at the frontend. The IR must only use a `SymbolId`:
+
+```cpp
+using SymbolId = uint32_t;
+```
+
+---
+
+**Rule 17 — Cache-Friendly Hash Maps (Ban `std::unordered_map`)**
+
+`std::unordered_map` and `std::map` are forbidden in the compiler hot path.
+
+For Global Value Numbering, hash-consing, dependency lookup, inline-cache metadata, and any pass requiring a hash table, use a cache-friendly, open-addressing hash map such as SwissTable, `flat_hash_map`, or a custom Robin Hood / quadratic-probing table.
+
+---
+
+**Rule 18 — Sparse Sets and BitVectors for Pass Data**
+
+Ban `std::set`, `std::unordered_set`, and `std::vector<bool>` for dataflow analysis.
+
+Passes tracking sets of `NodeId`s, such as liveness, dominance, visited sets, effect sets, and loop membership, must use sparse sets for small dense sets or bitvectors for large sparse sets.
+
+---
+
+**Rule 19 — Small Buffer Optimization (SBO) for Variable-Length Data**
+
+Ban `std::vector` for data that usually has 1 to 4 elements.
+
+For use-def chains, instruction operands, basic-block predecessors/successors, guard dependency lists, and small edge lists, use `SmallVector<T, N>` where `N` is usually 2, 3, or 4.
+
+---
+
+**Rule 20 — Structure of Arrays (SoA) for Bulk Pass Processing**
+
+When a pass needs to process a specific field of millions of nodes, do not iterate over full `Node` structs in AoS layout.
+
+Extract that attribute into a contiguous `std::pmr::vector` or equivalent SoA layout to allow prefetching and SIMD-friendly compiler passes where applicable.
+
+---
+
+**Rule 21 — Orthogonal Boolean State Representation**
+
+Any set of independent boolean properties on a hot-path data structure, such as `NodeFlags`, `EffectTags`, `GuardKinds`, should be represented efficiently.
+
+Type-safe `Flags<E>` wrappers over raw integers are the preferred pattern for API safety. However, raw integers (`uint32_t`, `uint64_t`) are permitted and often necessary in the hottest inner loops, serialization formats, and FFI boundaries where wrapper overhead is measurable and unjustifiable.
+
+When raw integers are used for flag-like state, the bit layout MUST be documented at the point of definition, and all manipulation MUST use named `constexpr` masks or approved helper functions. Magic numbers in flag manipulation are forbidden regardless of whether a wrapper type is used.
+
+---
+
+## Part V: Performance & Hardware
+
+**Rule 22 — Exploit C++26 Compiler Hints**
+
+Use `[[likely]]` and `[[unlikely]]` on PGO-driven branches and deoptimization traps.
+
+Use C++26 or supported C++23/26 assumptions, such as `[[assume(condition)]]` or an approved `std::assume`-like helper, to tell the compiler about invariants. Example:
+
+```cpp
+[[assume(node_id < graph.size())]];
+```
+
+These hints must never replace runtime correctness checks on non-internal boundaries. They may eliminate internal bounds checks only when the invariant is already proven or debug-verified.
+
+---
+
+**Rule 23 — Zero-Cost Error Propagation**
+
+Do not use verbose `if (err)` chains that ruin branch prediction and readability.
+
+Use `std::expected<T, Error>` and monadic operations such as `and_then`, `transform`, and `or_else`, or approved inline helpers. If an approved `JULES_TRY` macro is used, it must be the only sanctioned control-flow macro, must be audited, and must compile down to a single branch.
+
+---
+
+**Rule 24 — No Hard-Coded Constants in Optimization Logic**
+
+Magic numbers are forbidden.
+
+Every threshold, budget, limit, and heuristic constant used in any optimization pass MUST be defined as a named, documented `constexpr` constant or configuration parameter.
+
+CI static analysis fails if numeric literals greater than 2 appear in pass logic without a named constant reference.
+
+---
+
+**Rule 25 — No Target-Specific Hacks in Generic Passes**
+
+Mid-level and research passes such as GVN, LICM, SLP, range-check elimination, alias analysis, and effect reordering MUST NOT contain `#ifdef X86`, `#ifdef AARCH64`, or other target-specific conditionals.
+
+All target knowledge must be abstracted behind the `Target` interface and queried via cost models or capability flags.
+
+---
+
+**Rule 26 — No Heuristics Without Empirical Validation**
+
+Every heuristic MUST be backed by benchmark data showing measurable improvement, a mechanism to override/tune it, and documentation explaining why the value was chosen.
+
+---
+
+**Rule 27 — No Silent Fallbacks Without Telemetry**
+
+When the JIT falls back to safe fallback code, when a speculative guard fails, when a compilation budget is exceeded, or when register allocation spills excessively, the event MUST be recorded in telemetry/profile data.
+
+Silent fallbacks hide performance problems.
+
+---
+
+**Rule 28 — No Assumption of Stable Hardware**
+
+No pass may assume fixed cache-line sizes, SIMD widths, branch costs, or memory-latency ratios.
+
+All hardware parameters MUST be queried at runtime for JIT or build-time for AOT via the `Target` interface.
+
+---
+
+**Rule 29 — No Optimization Without Measurable Win**
+
+Every optimization pass added to the pipeline MUST demonstrate a ≥1% geometric mean improvement across the benchmark suite, OR enable a correctness/safety property that cannot be achieved otherwise.
+
+Underperforming passes are removed.
+
+---
+
+## Part VI: Correctness & JULES Semantics
+
+**Rule 30 — No FFI Optimization Without ABI Proof**
+
+FFI and native optimizations must prove calling-convention correctness, stack alignment, register clobbering, error state handling, and memory ownership transfer.
+
+FFI transitions may involve pending panics, callbacks, allocation, and type layout observation. None of these may be ignored.
+
+---
+
+**Rule 31 — No Vectorization Without Dependence Proof**
+
+Vectorization, whether SLP or loop-based, must prove no harmful aliasing or use versioned checks, bounds safety, alignment, correct overflow semantics, and a correct scalar fallback.
+
+Raw pointer accesses require bounds checks unless elimination is proven. Unsafe-style accesses and FFI writes must be treated as potential aliasing hazards unless proven otherwise.
+
+---
+
+**Rule 32 — No Persistent State Without Versioning**
+
+Profile caches, code caches, and AOT artifacts must be versioned.
+
+A change in IR format, pass order, dependency schema, type layout, or runtime ABI invalidates the cache.
+
+---
+
+**Rule 33 — No Implicit Conversions or Coercions in IR**
+
+The JULES IR MUST NOT perform implicit type conversions, integer promotions, or pointer coercions.
+
+All conversions must be explicit nodes, including but not limited to:
+
+-   `SignExtend`
+-   `ZeroExtend`
+-   `Truncate`
+-   `BitCast`
+-   `IntToPtr`
+-   `PtrToInt`
+
+The frontend lowering pass inserts these explicitly.
+
+---
+
+## Part VII: Testing & Verification
+
+**Rule 34 — Five Regression Tests Per Bug Fix**
+
+Every bug fix must include at least five regression tests:
+
+1.  Minimal reproducer.
+2.  Variant trigger with a different code pattern but the same root cause.
+3.  Boundary/negative test ensuring the fix does not over-correct.
+4.  Integration/contextual test placing the bug in realistic surrounding code.
+5.  Deopt/state reconstruction test verifying that if the JIT speculates wrongly, deopt to safe fallback produces the exact same JULES-visible state.
+
+CI fails if a PR labeled `bugfix` has fewer than five new test cases.
+
+---
+
+**Rule 35 — Golden Tests for Every Pass**
+
+Every optimization pass must have at least ten golden IR tests.
+
+Checked-in `.in.jules` / `.expected.ir` file pairs are required. Tests must run in both AOT Mode and JIT Mode.
+
+---
+
+**Rule 36 — Differential Testing is Mandatory in CI**
+
+AOT and JIT comparisons run on every PR.
+
+Outputs must be observationally equivalent according to the JULES semantic oracle. Any permitted differences must be explicitly listed, versioned, and tested.
+
+Memory layout is tested separately only where it is a supported guarantee. ASLR and allocator nondeterminism must not create false positives unless a guarantee is documented.
+
+Divergence blocks merge.
+
+---
+
+**Rule 37 — Deopt Paths Must Be Fuzzed Weekly**
+
+Scheduled CI job. Results triaged within 24 hours. Untriaged deopt fuzz failures block releases.
+
+---
+
+**Rule 38 — Replay Logs Retained for All CI Failures**
+
+Failed test runs automatically save full compile replay artifacts:
+
+-   IR snapshot;
+-   PGO profile;
+-   Compiler options;
+-   Target description;
+-   RNG seed;
+-   Dependency versions;
+-   Failure location.
+
+Debugging starts from replay, not reproduction.
+
+---
+
+**Rule 39 — Performance Regressions Require Explicit Waiver**
+
+If a benchmark regresses more than 5%, the PR must include root-cause analysis, justification, a tracking issue, and approval.
+
+No silent performance degradation.
+
+---
+
+**Rule 40 — Graph Verifier Runs in Debug Builds After Every Pass**
+
+The verifier checks:
+
+-   No dangling `NodeId`s;
+-   Effect-chain continuity;
+-   Control dominance;
+-   Use-def consistency;
+-   Valid region/memory edges;
+-   Valid exception/panic edges;
+-   `FrameState` attached to every profile-driven guard;
+-   Valid dependency metadata.
+
+---
+
+**Rule 41 — Test Names Encode the Bug/Feature They Cover**
+
+Bad:
+
+```text
+test_pea_3
+```
+
+Good:
+
+```text
+pea_non_escaping_struct_with_deopt_materializes_correctly
+```
+
+Test names must be searchable and self-documenting.
+
+---
+
+## Part VIII: Speculation & Guarding
+
+**Rule 42 — No Assumption Without Invalidation**
+
+Every profile-driven assumption must have:
+
+-   A registry entry, the Watchdog;
+-   An invalidation path, the Trip;
+-   A fallback to static proof or safe fallback code.
+
+---
+
+**Rule 43 — No Specialization Without Fallback**
+
+Every specialized clone, such as a bounds-check-eliminated array loop or a devirtualized trait call, must have:
+
+-   A generic fallback;
+-   A deopt path;
+-   A budget limit.
+
+---
+
+**Rule 44 — No Profile Data Without Confidence**
+
+Profile data must include:
+
+-   Sample count;
+-   Stability;
+-   Age;
+-   Decay;
+-   Variance;
+-   Deopt correlation.
+
+Low-confidence data must not trigger aggressive speculation.
+
+---
+
+**Rule 45 — No Aggressive Pass Without a Cost Model**
+
+Inlining, cloning, unrolling, SLP vectorization, escape-analysis-based allocation elision, and range-check elimination must all use a strict cost model.
+
+The cost model is based on target hardware latencies, allocation/deallocation costs, safepoint costs, and deopt probability.
+
+---
+
+## Part IX: Code Quality & Developer Velocity Laws
+
+These rules are designed to be maximally strict on correctness and maintainability while actively protecting developer speed.
+
+**Rule 46 — Local Pre-Commit Checks Must Complete in < 2 Seconds**
+
+Strictness must not impede velocity.
+
+The local pre-commit hook, including formatting, basic linting, and copyright headers, must execute in under two seconds. Heavy checks such as full test suites and differential testing are deferred to asynchronous CI.
+
+---
+
+**Rule 47 — Actionable Compiler Diagnostics**
+
+The compiler must never output opaque errors such as:
+
+```text
+Error: something went wrong
+```
+
+All `Diagnostic` objects must include:
+
+-   Exact source location where available;
+-   Module/function/type location where applicable;
+-   A clear human-readable message;
+-   Expected versus actual state;
+-   A suggested fix or recovery action.
+
+Use `std::source_location` where appropriate.
+
+---
+
+**Rule 48 — `[[nodiscard]]` on All Result Types**
+
+All functions returning `std::expected`, `Result`, or `Error` must be marked `[[nodiscard]]`.
+
+Ignoring an error is a compilation failure. This forces developers to handle edge cases explicitly without requiring verbose performance-killing `if` chains.
+
+---
+
+**Rule 49 — No `#define` Macros for Logic**
+
+C-style macros for control flow or logic are forbidden.
+
+Use `constexpr` functions, `inline` functions, templates, or C++26 facilities. Macros are exempt only for:
+
+-   Header guards;
+-   Trivial token pasting;
+-   One approved error-propagation macro, if explicitly registered and audited.
+
+This ensures debugger visibility and compiler optimization quality.
+
+---
+
+**Rule 50 — Fast Incremental Builds via Modular CMake**
+
+The build system must allow sub-second incremental builds for single-file changes where practical.
+
+Heavy dependencies, such as testing frameworks or optional backend components, must be isolated. Developers must not wait minutes to test a single IR pass modification.
+
+---
+
+**Rule 51 — Automated Refactoring Tools Over Manual Edits**
+
+When a structural change is required, such as renaming a `NodeKind` or adding a field to `FrameState`, a scripted refactoring tool must be provided and run as part of the PR.
+
+Manual, error-prone find-and-replace across many files is forbidden.
+
+---
+
+**Rule 52 — Self-Contained, Reproducible Test Cases**
+
+Every test must be fully self-contained.
+
+It must not rely on external network calls, specific local directory structures, or non-deterministic system state. Tests must run identically on a developer laptop, a Linux CI runner, or another supported workstation.
+
+---
+
+## Part X: Anti-Slop & Robustness Laws
+
+**Rule 53 — No “Small Bug” or “Minor Edge Case” Rationalization**
+
+The phrases “small bug,” “minor edge case,” “rarely happens,” “only affects cold paths,” and “good enough for now” are banned.
+
+In a systems compiler/runtime, small bugs cause silent data corruption, security holes, or catastrophic performance cliffs. All bugs must be triaged with explicit severity.
+
+---
+
+**Rule 54 — No Workarounds for Compiler/Runtime Bugs**
+
+Adding code to work around a bug in the compiler, runtime, or standard library is forbidden. The underlying defect MUST be fixed.
+
+Temporary mitigations require:
+
+-   A tracking issue;
+-   A removal deadline of two weeks or less;
+-   Explicit approval from the tech lead.
+
+---
+
+**Rule 55 — No Implicit Knowledge Transfer**
+
+All design decisions, trade-offs, historical context, and operational knowledge MUST be captured in persistent, searchable documentation.
+
+Valid documentation includes code comments, ADRs, specs, and design docs. Oral tradition and chat messages are not valid knowledge stores.
+
+---
+
+**Rule 56 — No Premature Simplification**
+
+Do not simplify, abstract, or generalize code until the full problem space is understood and at least two concrete use cases exist.
+
+Premature simplification creates leaky abstractions that fail under real-world conditions.
+
+---
+
+**Rule 57 — No Copy-Paste Code or Structural Duplication**
+
+If two code blocks share structure, extract a helper, template, or data-driven approach.
+
+ABI definitions, register lists, opcode tables, pass boilerplate must use generators, `constexpr` helpers, or declarative tables.
+
+---
+
+**Rule 58 — No Silent Fallbacks or Default Returns**
+
+Switch statements on closed enums must be exhaustive.
+
+Non-exhaustive switches require `[[assume(false)]]` plus `JULES_UNREACHABLE()` or equivalent. Functions must not return arbitrary default values such as `return 0;` or `return nullptr;` when input is invalid.
+
+---
+
+**Rule 59 — No Lazy Data Structures or Algorithms**
+
+Use the right tool, not the convenient tool.
+
+Linear search is forbidden where O(1) lookup is feasible. String comparison is forbidden where symbol IDs suffice.
+
+---
+
+**Rule 60 — No Untested or Unverified Code Paths**
+
+Every branch, edge case, and error path must have explicit test coverage.
+
+“It compiles” is not verification. Only automated, reproducible tests count.
+
+---
+
+**Rule 61 — No Performance-Agnostic Implementation**
+
+Hot-path code must avoid allocations, exceptions, RTTI, virtual dispatch, and cache-unfriendly patterns.
+
+Performance is a feature. Ignoring it in implementation guarantees degradation.
+
+---
+
+**Rule 62 — No Deletion-by-Avoidance (“Too Hard” Is Not a Valid Reason)**
+
+Deleting, disabling, commenting out, or stubbing functionality because it is “too hard” or “too complex” is strictly forbidden.
+
+When encountering difficult problems: decompose, research, prototype, document, and escalate.
+
+---
+
+**Rule 63 — No Fragile Implementations**
+
+All implementations MUST be resilient to malformed input, concurrent access, resource exhaustion, and platform/hardware variation.
+
+Fragile patterns are forbidden, including implicit ordering dependencies, global mutable state, and unchecked pointer arithmetic.
+
+---
+
+**Rule 64 — No Documentation Debt**
+
+Every public API, internal helper, IR node, pass, configuration knob, and non-obvious algorithm MUST have documentation at the point of definition covering:
+
+-   Purpose;
+-   Invariants;
+-   Rationale;
+-   Edge cases;
+-   Cross-references.
+
+Stale documentation is treated as a bug with the same severity as stale code.
+
+---
+
+**Rule 65 — No Easy Fixes — Only Correctness-Preserving Performance Fixes**
+
+When fixing a bug, you must implement the fix that simultaneously preserves performance and correctness.
+
+“Easy” fixes that sacrifice either property are forbidden unless explicitly documented as temporary mitigations with tracking issues and removal deadlines.
+
+---
+
+**Rule 66 — Slop Detection Checklist (For Code Review)**
+
+Every PR reviewer must verify:
+
+-   [ ] No unnamed numeric constants in logic.
+-   [ ] No duplicated code blocks or copy-paste patterns.
+-   [ ] No silent fallbacks or unsafe default returns.
+-   [ ] No prohibited containers such as `std::unordered_map` or heap-backed `std::vector` for small collections in hot paths.
+-   [ ] All invariants documented and validated.
+-   [ ] No premature abstractions without at least two consumers.
+-   [ ] No untracked workarounds or `HACK` comments.
+-   [ ] No target-specific logic outside `backend/`.
+-   [ ] All new code paths have test coverage.
+-   [ ] Hot-path changes justified with profiling/benchmarks.
+-   [ ] Every new guard has a `FrameState` attachment.
+-   [ ] Every speculative node carries metadata: speculation kind, profile/static source, confidence, guard plan, deopt target, invalidation dependency.
+-   [ ] Every deopt point is reachable and has complete deopt metadata.
+-   [ ] No `getenv()` or mutex-locking calls in dispatch loops or hot paths.
+-   [ ] No atomic RMW in per-instruction or per-backedge hot paths unless explicitly justified.
+-   [ ] W^X is maintained: no page is simultaneously writable and executable.
+-   [ ] Code publication is atomic with release semantics; consumers acquire.
+-   [ ] Pending panics/errors are not silently dropped across runtime or FFI transitions.
+-   [ ] No references to GC, write barriers, read barriers, stack maps for managed references, TLABs, or any runtime memory management. JULES has no GC.
+
+Failure on any item blocks merge. No exceptions. No “small slop.” No “we’ll fix it later.” Slop is banned.
+
+---
+
+## Part XI: JULES Semantic Fidelity Laws
+
+**Rule 67 — JULES Language Spec Is the Semantic Oracle**
+
+All executable behavior must match the JULES language specification. Observable behavior includes:
+
+-   Program output;
+-   Panics and error traces;
+-   Side effects;
+-   Memory mutation (via explicit pointers and user allocators);
+-   Trait dispatch behavior;
+-   Generic specialization behavior;
+-   Comptime evaluation results;
+-   SIMD behavior;
+-   FFI/native interaction behavior;
+-   Debugging and profiling events;
+-   Deterministic destruction and `defer` execution.
+
+Any unapproved divergence is a correctness bug.
+
+Enforcement: compatibility suite, differential AOT/JIT runs, JULES-specific semantic tests.
+
+---
+
+**Rule 68 — Observable Effects Must Not Be Reordered, Duplicated, or Deleted**
+
+No optimization may delete, duplicate, hoist, sink, merge, or reorder JULES-visible effects unless the effect system proves semantic equivalence.
+
+JULES-visible effects include:
+
+-   Memory reads/writes through raw and smart pointers;
+-   Volatile/atomic reads/writes;
+-   Fence effects;
+-   FFI/native side effects;
+-   Panic raises;
+-   Allocation and deallocation calls (user allocator);
+-   Constructor and destructor invocations;
+-   `defer` block execution;
+-   I/O effects;
+-   Thread start/interrupt effects;
+-   Monitoring, profiling, and debugging events.
+
+Enforcement: effect-chain verifier, golden IR tests, differential semantic tests.
+
+---
+
+**Rule 69 — Only Provably Pure Expressions May Be Constant-Folded**
+
+Constant folding may only apply to expressions whose result is independent of:
+
+-   Runtime state;
+-   Global mutable state;
+-   FFI state;
+-   Environment variables;
+-   Time;
+-   Randomness;
+-   Locale;
+-   Filesystem state;
+-   Thread state;
+-   Allocator state.
+
+No call with possible side effects may be constant-folded. `comptime` functions are pure by definition; runtime functions require explicit purity annotation or proof.
+
+Enforcement: verifier rule, pure-node annotations, negative tests.
+
+---
+
+**Rule 70 — Static Typing Enables Proof, Not Assumption**
+
+Static types justify optimization only when mechanically verified. Generic code, trait dispatch, and raw pointer operations require explicit proof or guards. Unclosed-world assumptions require guards even in AOT mode.
+
+Enforcement: static-mode verifier, negative mutation tests.
+
+---
+
+**Rule 71 — Specialization Requires Versioned, Invalidatable Dependencies**
+
+Every specialization assumption must record a dependency on a versioned entity.
+
+Examples:
+
+-   Type identity/version;
+-   Type layout version;
+-   Trait impl version;
+-   Function version;
+-   Module version;
+-   Profile version.
+
+If any dependency changes, all dependent compiled code must be invalidated or guarded.
+
+Enforcement: dependency graph tests, invalidation fuzzing, inline-cache tests.
+
+---
+
+**Rule 72 — Numeric Semantics Must Be Preserved Exactly**
+
+Numeric specializations must preserve JULES semantics, including:
+
+-   Two’s-complement integer overflow wrapping where specified;
+-   Exact division-by-zero panics for integer division/modulo;
+-   Floating-point IEEE behavior required by the language specification;
+-   NaN behavior;
+-   Negative zero;
+-   Float/double conversion rules;
+-   Primitive widening/narrowing rules;
+-   No fast-math-style optimization unless explicitly scoped, proven safe, and disabled by default.
+
+Enforcement: numeric differential tests, overflow tests, NaN tests.
+
+---
+
+**Rule 73 — Escape Analysis Must Not Eliminate Observable Allocations**
+
+Allocations may be elided or promoted to stack only if they cannot be observed by:
+
+-   Pointer identity comparison where observable;
+-   FFI escape;
+-   Debugging;
+-   Serialization;
+-   Shared synchronization;
+-   User-defined allocator hooks or callbacks;
+-   Explicit address-taken operations.
+
+If any escape path exists, the allocation must remain. Escape analysis is an *optimization*, not a memory safety mechanism.
+
+Enforcement: escape-analysis verifier, materialization tests, deopt tests.
+
+---
+
+**Rule 74 — Panics/Errors Are Control-Flow Values, Not Native Exceptions**
+
+JULES panics must be represented as runtime object values and control-flow edges.
+
+Native C++ exceptions must not be used to implement panic propagation.
+
+The compiler must preserve:
+
+-   Panic type;
+-   Panic message;
+-   Cause chain;
+-   Stack trace;
+-   Line numbers;
+-   Frame association.
+
+Enforcement: panic semantic tests, stack-trace golden tests.
+
+---
+
+**Rule 75 — Frames Must Be Reconstructible on Demand**
+
+If the compiler inlines, merges, elides, or optimizes frames, it must be able to materialize a semantically correct JULES frame when required by:
+
+-   Stack traces;
+-   Panics;
+-   Debuggers;
+-   Profilers;
+-   Deoptimization.
+
+`FrameState` must be sufficient to reconstruct:
+
+-   Source location;
+-   Local variables;
+-   Temporaries;
+-   Pointer values (raw and smart);
+-   Pending panic state.
+
+Enforcement: frame materialization tests, deopt tests, debugger tests.
+
+---
+
+**Rule 76 — FFI/Native Is Opaque Unless Proven**
+
+Calls into FFI or native code are opaque barriers unless a formal ABI/effect proof exists.
+
+Assume native calls may:
+
+-   Mutate arbitrary memory;
+-   Call back into JULES;
+-   Allocate/free memory;
+-   Raise panics;
+-   Change type layouts;
+-   Invalidate specialization assumptions;
+-   Observe memory layout;
+-   Corrupt assumptions if misused.
+
+Optimizations across FFI boundaries require explicit proof and invalidation rules.
+
+Enforcement: FFI barrier tests, native callback mutation tests.
+
+---
+
+## Part XII: Deoptimization & Memory Model Integration
+
+**Rule 77 — Deoptimization Metadata Is a Required Compilation Output**
+
+A compilation is not complete until it has produced:
+
+-   Deopt points;
+-   `FrameState` snapshots;
+-   Live-range information;
+-   Materialization plan (for PEA-elided allocations);
+-   Safe fallback re-entry information;
+-   Dependency list;
+-   Guard metadata;
+-   Panic-state reconstruction info.
+
+If deopt metadata cannot be generated, the compilation must fail and fall back to safe fallback codegen.
+
+Enforcement: compiler verifier, missing-deopt compile-fail tests.
+
+---
+
+**Rule 78 — FrameState Must Be Complete and Machine-Checkable**
+
+`FrameState` must describe enough information to reconstruct the exact safe fallback state.
+
+It must include:
+
+-   Source location;
+-   Register-to-variable mapping;
+-   Local variable state;
+-   Temporary state;
+-   Pointer values;
+-   Primitive values;
+-   Constants;
+-   Pending panic;
+-   Materialized allocation state (for PEA).
+
+The verifier must reject incomplete `FrameState`.
+
+Enforcement: `FrameState` verifier, forced-deopt tests.
+
+---
+
+**Rule 79 — Guard Failure Must Produce Exact Safe Fallback State**
+
+When a guard fails, the runtime must resume in a state observationally indistinguishable from the state the safe fallback variant would have reached at that point.
+
+This includes:
+
+-   Local variables;
+-   Temporaries;
+-   Panic state;
+-   Side effects already committed (including memory writes);
+-   Frame visibility;
+-   Source location.
+
+If exact reconstruction is impossible, the speculation must be rejected at compile time. **Memory writes that have already occurred cannot be undone.** Deopt must account for committed stores, not attempt to roll them back.
+
+Enforcement: differential deopt tests, forced-guard-failure fuzzing.
+
+---
+
+**Rule 80 — Deopt Loops Must Be Detected and Throttled**
+
+Repeated deoptimization at the same site is a performance and correctness hazard.
+
+The runtime must track:
+
+-   Deopt count per site;
+-   Deopt count per function;
+-   Deopt reason;
+-   Time window;
+-   Compilation history.
+
+If thresholds are exceeded, the system must:
+
+-   Disable the failing speculation;
+-   Recompile with weaker assumptions;
+-   Blacklist the function temporarily or permanently;
+-   Emit telemetry.
+
+Enforcement: deopt-loop regression tests, telemetry validation.
+
+---
+
+**Rule 81 — Speculative Side Effects Must Be Accounted For**
+
+Speculative optimization must not commit irreversible JULES-visible side effects before the speculation is proven, OR must have a compensation strategy.
+
+If an effect cannot be proven safe:
+
+-   Defer it;
+-   Guard before it;
+-   Materialize fallback state that accounts for the effect;
+-   Or do not perform the optimization.
+
+Memory stores, FFI effects, panic publication, allocation/deallocation calls, and destructor invocations are not freely rollback-able. Deopt after a speculative store must produce state consistent with that store having occurred.
+
+Enforcement: effect-system audit, speculative-store tests.
+
+---
+
+**Rule 82 — No Runtime Reference Tracking**
+
+Generated code holds raw pointers with no runtime tracking. There are no stack maps for managed references, no GC reference enumeration, no write barriers, no read barriers. Pointer validity is the programmer’s responsibility. The compiler may prove pointer safety statically for optimization purposes but emits no runtime enforcement.
+
+Enforcement: codegen audit, absence-of-GC-artifacts verifier.
+
+---
+
+**Rule 83 — No Read or Write Barriers**
+
+JULES has no GC. Generated code contains no read barriers, write barriers, forwarding checks, or card marks. Any barrier-like construct in generated code is a bug.
+
+Enforcement: barrier-absence verifier, codegen audit.
+
+---
+
+**Rule 84 — Generated Code Must Poll Safepoints (For JIT Only)**
+
+JIT-compiled code must include safepoint polls at:
+
+-   Loop backedges;
+-   Function calls;
+-   Invalidation points where required.
+
+Safepoints exist solely for JIT code invalidation and deoptimization, not for GC. AOT code has no safepoints unless explicitly requested for debugging/profiling.
+
+Safepoint latency must be bounded.
+
+Enforcement: safepoint stress tests, invalidation tests.
+
+---
+
+**Rule 85 — All Compiled Frames Must Be Walkable**
+
+Every compiled frame must be walkable by:
+
+-   Deoptimizer;
+-   Profiler;
+-   Debugger;
+-   Panic unwinder;
+-   Stack-overflow checks;
+-   Diagnostic tools.
+
+Frame metadata must include:
+
+-   Frame size;
+-   Return address location;
+-   Saved registers;
+-   Callee-saved register locations.
+
+**No GC stack maps.** Frame walking is for debugging, profiling, panics, and deopt only.
+
+Enforcement: stack-walking tests, deopt/profiler integration tests.
+
+---
+
+**Rule 86 — Stack Overflow and Recursion Limits Must Be Checked**
+
+Compiled code must respect stack limits.
+
+Checks must occur:
+
+-   Before entering compiled frames;
+-   Before inlined calls;
+-   Before recursive calls;
+-   Before FFI transitions where stack usage changes.
+
+Failure must produce the correct JULES panic, not a crash.
+
+Enforcement: recursion-limit tests, stack-overflow tests.
+
+---
+
+**Rule 87 — Allocation Failure Is User-Defined Behavior**
+
+Allocation calls go to user-provided allocators. The compiler does not inject OOM handling. If the user’s allocator panics, aborts, or returns null, that is the user’s semantic choice. The compiler preserves whatever behavior the allocator exhibits.
+
+Enforcement: allocator-behavior preservation tests.
+
+---
+
+**Rule 88 — Runtime Call Transitions Must Preserve ABI and Runtime State**
+
+Calls from compiled code into runtime helpers must preserve:
+
+-   Calling convention;
+-   Stack alignment;
+-   Callee-saved registers;
+-   Pending panic state;
+-   Thread state;
+-   Floating-point/vector register state as required.
+
+Runtime helpers must not assume compiled register contents beyond ABI.
+
+Enforcement: ABI tests, register-clobber tests.
+
+---
+
+## Part XIII: Code Cache, Patching, and Security Laws
+
+**Rule 89 — Executable Memory Must Be W^X**
+
+JIT memory pages must never be simultaneously writable and executable.
+
+Code generation and patching must use one of:
+
+-   Write-then-execute with protection changes;
+-   Separate staging and executable pages;
+-   Atomic patching of existing executable locations where safe;
+-   Platform-approved JIT memory mechanisms.
+
+Enforcement: memory-protection tests, OS-specific audits.
+
+---
+
+**Rule 90 — Code Publication Must Be Atomic**
+
+Function entry points, trampolines, and metadata pointers must be published atomically.
+
+No thread may observe:
+
+-   Partially initialized code;
+-   Uninitialized metadata;
+-   Missing deopt info;
+-   Half-patched jump tables.
+
+Publication must use release semantics; consumers must use acquire semantics.
+
+Enforcement: TSAN tests, concurrent-install stress tests.
+
+---
+
+**Rule 91 — Runtime Patching Must Be Safe Against Concurrent Execution**
+
+Patching running code must be safe.
+
+Requirements:
+
+-   Patch sites must be aligned and architecturally safe;
+-   Instruction sequences must not create invalid intermediate instructions;
+-   Instruction-cache coherence must be handled where required;
+-   Concurrent threads must never execute corrupted instructions;
+-   Patching must either use safepoints or architecture-safe atomic sequences.
+
+Enforcement: patch-under-load tests, architecture-specific tests.
+
+---
+
+**Rule 92 — Old Code May Be Freed Only After Quiescence**
+
+Old compiled code, deopt metadata, and dependency records must not be reclaimed until no thread can be executing or depending on them.
+
+Use:
+
+-   Epoch-based reclamation;
+-   RCU-like quiescence;
+-   Safepoint-based retirement;
+-   Reference counting for code objects where appropriate.
+
+Code reclamation must be distinct from IR node reclamation. **This applies only to compiler artifacts, not user memory.**
+
+Enforcement: concurrent code retirement tests.
+
+---
+
+**Rule 93 — Every Compiled Artifact Must Record Dependencies**
+
+Every compiled function must record dependencies sufficient for invalidation.
+
+Dependency examples:
+
+-   Function identity/version;
+-   Type identity/version;
+-   Type layout version;
+-   Trait impl version;
+-   Module version;
+-   Profile version;
+-   IR version;
+-   Compiler version;
+-   Target feature set;
+-   ABI version;
+-   Runtime configuration.
+
+Enforcement: dependency graph verifier.
+
+---
+
+**Rule 94 — Generated Code Must Be Constrained**
+
+Generated code must only call approved runtime entrypoints and must not directly:
+
+-   Perform arbitrary syscalls unless mediated by the runtime;
+-   Write outside its own frame/runtime-approved memory;
+-   Execute arbitrary user-provided machine code;
+-   Load arbitrary dynamic libraries unless approved;
+-   Bypass sandbox/security policy.
+
+Enforcement: codegen allowlist, backend audit, security tests.
+
+---
+
+**Rule 95 — Platform Exploit Mitigations Must Be Enabled Where Available**
+
+JIT must integrate with platform security features where available:
+
+-   Non-executable stack;
+-   Non-executable heap;
+-   CFI;
+-   Shadow stacks;
+-   PAC/BTI on ARM64;
+-   Pointer authentication where supported;
+-   CET where supported;
+-   ASLR-safe code generation;
+-   Code signing where required;
+-   Sandbox compatibility.
+
+If a mitigation is unavailable, the risk must be documented and configurable.
+
+Enforcement: platform security matrix.
+
+---
+
+**Rule 96 — JIT Spraying Defenses Are Required**
+
+The JIT must not turn attacker-controlled data into executable instruction streams without mitigation.
+
+Mitigations may include:
+
+-   Constant blinding;
+-   Avoiding embedding uncontrolled immediate sequences;
+-   Separating executable code from embedded data;
+-   Limiting executable constant islands;
+-   Code-cache entropy/randomization where appropriate;
+-   Validating inputs that influence codegen.
+
+Enforcement: security review, exploit PoC tests.
+
+---
+
+**Rule 97 — Profiles and AOT Artifacts Are Untrusted**
+
+Profile data, serialized IR, and AOT artifacts must be validated before use.
+
+Malformed inputs must not cause:
+
+-   Undefined behavior;
+-   Memory corruption;
+-   Arbitrary code execution;
+-   Crashes;
+-   Silent miscompilation.
+
+Invalid artifacts must be rejected or ignored with telemetry.
+
+Enforcement: artifact fuzzing, schema validation.
+
+---
+
+**Rule 98 — Code Cache Pressure Must Be Managed**
+
+The code cache must have explicit budgets and eviction policies.
+
+The system must monitor:
+
+-   Total code size;
+-   Metadata size;
+-   Dependency graph size;
+-   Number of live compiled functions;
+-   Number of invalidated functions;
+-   Patchpoint count;
+-   Deopt metadata size.
+
+When pressure exceeds budgets, the system must throttle compilation, evict cold code, or fall back.
+
+Enforcement: code-cache stress tests.
+
+---
+
+**Rule 99 — AOT Artifacts Must Include a Compatibility Manifest**
+
+AOT artifacts must include:
+
+-   Language version;
+-   IR version/hash;
+-   Compiler version;
+-   Pass pipeline hash;
+-   Target architecture;
+-   Target feature set;
+-   ABI hash;
+-   Runtime configuration hash;
+-   Dependency fingerprints;
+-   Security policy version;
+-   Creation metadata.
+
+Enforcement: manifest validation tests.
+
+---
+
+**Rule 100 — AOT Artifacts Must Be Verified Before Loading**
+
+AOT loading must verify:
+
+-   Manifest compatibility;
+-   Integrity checksum/signature where required;
+-   Dependency validity;
+-   Target feature support;
+-   ABI compatibility;
+-   Security policy compatibility.
+
+On mismatch, the artifact must be rejected. Silent loading of incompatible artifacts is forbidden.
+
+Enforcement: stale/corrupt AOT artifact tests.
+
+---
+
+## Part XIV: Concurrency, Compilation Scheduling, and Mode Selection Laws
+
+**Rule 101 — Compiler, Runtime Shared State Must Be Race-Free**
+
+All shared state accessed by mutator threads, compiler threads, and background services must be synchronized using documented atomic/locking protocols.
+
+TSAN-clean is mandatory for supported concurrent tests.
+
+Enforcement: TSAN CI, concurrency stress tests.
+
+---
+
+**Rule 102 — Function Pointer Swaps Must Be Safe and Reversible**
+
+Installing new code must:
+
+-   Use atomic publication;
+-   Preserve old code until safe;
+-   Avoid torn calls;
+-   Avoid invalidating metadata still needed by running threads;
+-   Support rollback where possible.
+
+Function installation must be testable independently of compilation.
+
+Enforcement: concurrent install/uninstall tests.
+
+---
+
+**Rule 103 — Safepoint Latency Must Be Bounded**
+
+Threads must be able to reach a safepoint within a documented bounded time.
+
+Long-running generated loops must contain polls. Native helpers that run for long durations must cooperate with suspension protocols.
+
+Enforcement: safepoint latency tests.
+
+---
+
+**Rule 104 — Compilation Latency and Memory Budgets Must Be Defined**
+
+Each mode must have explicit budgets:
+
+-   JIT compile latency;
+-   JIT memory usage;
+-   AOT compile time where relevant;
+-   IR memory usage;
+-   Pass fixpoint iteration limits;
+-   Code size limits;
+-   Deopt metadata limits.
+
+Budget violations must trigger fallback or cancellation, not mutator stalls.
+
+Enforcement: compile-budget benchmarks.
+
+---
+
+**Rule 105 — Compilations Must Be Cancellable**
+
+If a function is invalidated while compiling, the compiler must be able to cancel or discard the result without leaking memory or installing stale code.
+
+Enforcement: invalidation-during-compilation tests.
+
+---
+
+**Rule 106 — Hotness Counters Must Be Robust**
+
+Profiling counters must be:
+
+-   Thread-safe or explicitly racy-with-bounded-error;
+-   Saturating or overflow-safe;
+-   Decaying where appropriate;
+-   Resistant to pathological overflow;
+-   Correlated with deopt feedback.
+
+Undefined behavior from counter overflow is forbidden.
+
+Enforcement: counter fuzzing, long-run soak tests.
+
+---
+
+**Rule 107 — Recompilation Must Be Throttled**
+
+Repeated compilation of the same function must be limited by:
+
+-   Maximum recompiles per function;
+-   Exponential backoff;
+-   Deopt-history awareness;
+-   Code-cache pressure awareness;
+-   Budget awareness.
+
+No function may cause unbounded compile churn.
+
+Enforcement: recompile-thrash tests.
+
+---
+
+**Rule 108 — Invalidation Must Be Ordered and Visible**
+
+Invalidation of dependencies must be visible before new assumptions are relied upon.
+
+The system must avoid:
+
+-   Executing stale code after invalidation beyond allowed grace;
+-   Installing code based on already-invalid dependencies;
+-   Racing invalidation with installation.
+
+Enforcement: invalidation race tests.
+
+---
+
+**Rule 109 — No Global Locks on Hot Runtime Paths**
+
+Global locks are forbidden in hot runtime paths unless explicitly approved and budgeted.
+
+Hot paths include:
+
+-   Inline-cache updates;
+-   Guard checks;
+-   Function entry dispatch;
+-   Safepoint polls;
+-   Basic memory access.
+
+Enforcement: lock profiling, scalability tests.
+
+---
+
+**Rule 110 — Mode Transitions Must Be Observable**
+
+All mode transitions must be recorded:
+
+-   AOT → JIT activation;
+-   JIT guard failure → safe fallback;
+-   JIT → recompile;
+-   Code invalidation;
+-   Blacklist events;
+-   Fallback events.
+
+Telemetry must include reasons and counters.
+
+Enforcement: telemetry schema tests.
+
+---
+
+**Rule 111 — Compiler Bugs Must Not Crash User Programs**
+
+A compiler failure should degrade performance, not terminate the application.
+
+Compiler/runtime JIT bugs should result in:
+
+-   Fallback to safe code;
+-   Disabled optimization;
+-   Diagnostic log;
+-   Telemetry;
+-   Replay artifact where possible.
+
+Process aborts are only acceptable for unrecoverable runtime corruption and must be treated as P0 bugs.
+
+Enforcement: fault-injection tests.
+
+---
+
+## Part XV: IR, Passes, and Backend Laws
+
+**Rule 112 — The IR Must Have an Explicit Effect Model**
+
+The IR must explicitly represent effects and ordering.
+
+Effect classes should include at least:
+
+-   Pure computation;
+-   Allocation (user allocator call);
+-   Deallocation (user free/drop call);
+-   Memory read/write (raw pointer);
+-   Volatile/atomic/fence effects;
+-   Panic effects;
+-   FFI/native effects;
+-   Constructor/destructor effects;
+-   `defer` effects;
+-   Deopt/guard effects.
+
+Passes must not reorder effects without proof.
+
+Enforcement: effect-chain verifier.
+
+---
+
+**Rule 113 — Speculative Nodes Must Carry Metadata**
+
+Every speculative node must record:
+
+-   Speculation kind;
+-   Profile/static source;
+-   Confidence;
+-   Guard plan;
+-   `FrameState`;
+-   Deopt target;
+-   Cost;
+-   Invalidation dependency;
+-   Rollback/deferred-effect plan.
+
+No implicit speculation is allowed.
+
+Enforcement: IR verifier.
+
+---
+
+**Rule 114 — Passes Must Declare Contracts**
+
+Each pass must declare:
+
+-   Required IR properties;
+-   Produced IR properties;
+-   Invalidated analyses;
+-   Supported modes;
+-   Budget;
+-   Determinism requirements;
+-   Target dependencies;
+-   Required verifier checks;
+-   Telemetry hooks.
+
+Passes that cannot satisfy their contract must fail safely.
+
+Enforcement: pass registry, contract tests.
+
+---
+
+**Rule 115 — Compilation Must Be Deterministic and Replayable**
+
+Given the same source, compiler version, flags, profile snapshot, target description, RNG seed, and feature configuration, compilation must produce deterministic IR and code selection, except for explicitly documented nondeterminism.
+
+Nondeterminism sources must be logged.
+
+Enforcement: deterministic replay tests.
+
+---
+
+**Rule 116 — Passes Must Not Use Hidden Global Mutable State**
+
+Hot-path passes must not depend on hidden global mutable state.
+
+Allowed global state:
+
+-   Immutable configuration;
+-   Interned symbol tables with proper synchronization;
+-   Read-only target descriptions;
+-   Versioned caches with explicit invalidation.
+
+Hidden singletons in pass logic are forbidden.
+
+Enforcement: static analysis, code review checklist.
+
+---
+
+**Rule 117 — The Verifier Must Check Deopt Metadata**
+
+The graph verifier must check not only IR consistency but also:
+
+-   Every guard has `FrameState`;
+-   Every deopt point is reachable;
+-   Every effect chain is continuous;
+-   Every speculative node has invalidation info;
+-   Every materialized allocation graph is acyclic or properly handled;
+-   No GC artifacts (stack maps, barriers) are present.
+
+Enforcement: debug verifier runs after every pass.
+
+---
+
+**Rule 118 — Backend Lowering Must Preserve IR Semantics**
+
+Lowering from high/mid IR to machine code must preserve:
+
+-   Effect order;
+-   Panic semantics;
+-   Numeric semantics;
+-   Overflow behavior;
+-   Atomic/fence semantics;
+-   Safepoint placement;
+-   Deopt point mapping;
+-   Stack layout constraints;
+-   Destructor/defer ordering.
+
+Backend optimizations may not silently change IR semantics.
+
+Enforcement: backend golden tests, differential tests.
+
+---
+
+**Rule 119 — Register Allocation Has No GC Constraints**
+
+The register allocator operates without GC reference tracking. There are no stack maps, no reference spills, no GC-safe points. Registers hold raw values with no runtime interpretation.
+
+Enforcement: regalloc audit, absence-of-GC-metadata verifier.
+
+---
+
+**Rule 120 — Target Features Must Be Gated and Recorded**
+
+Use of CPU features must be:
+
+-   Runtime-detected for JIT;
+-   Build-time validated for AOT;
+-   Recorded in code metadata;
+-   Protected by feature guards where needed.
+
+Generated code must not execute unsupported instructions.
+
+Enforcement: target-feature mismatch tests.
+
+---
+
+**Rule 121 — Every IR Node and Trampoline Must Have a Specification**
+
+No IR node, runtime stub, or trampoline may exist without documentation covering:
+
+-   Semantics;
+-   Effects;
+-   Mode behavior;
+-   Lowering;
+-   Verifier constraints;
+-   Deopt behavior;
+-   Tests.
+
+Enforcement: documentation lint, IR node registry.
+
+---
+
+**Rule 122 — Static Proofs Must Be Mechanically Checked**
+
+AOT static optimizations may not rely on human-only proof.
+
+Static proofs must be represented as machine-checkable artifacts or verifier constraints. If proof cannot be checked automatically, the optimization must use guards or be disabled.
+
+Enforcement: proof-verifier tests.
+
+---
+
+**Rule 123 — Every Optimization Must Have a Kill Switch**
+
+Every nontrivial optimization should be disableable by:
+
+-   Compiler flag;
+-   Environment variable;
+-   Configuration knob;
+-   Per-function annotation where appropriate.
+
+This enables bisection and incident response.
+
+Enforcement: feature-flag matrix.
+
+---
+
+## Part XVI: The 89 Named Optimization Passes (Normative)
+
+The following 89 passes constitute the **complete, exhaustive optimization suite**. All operate on Sea-of-Nodes IR. All support both AOT and JIT modes via unified interface. Each is a separately schedulable, independently testable, individually measurable unit.
+
+### Phase 0: Frontend Residue Cleanup (1–7)
+1.  DeadNodeElimination
+2.  IdentityCollapse
+3.  ConstantFolding
+4.  TypeCanonicalization
+5.  ComptimeResidueFold
+6.  AssertElision
+7.  PhiSimplification
+
+### Phase 1: Value & Scalar Optimization (8–18)
+8.  SparseConditionalConstantPropagation
+9.  GlobalValueNumbering
+10. RedundantPhiElimination
+11. CopyPropagation
+12. AlgebraicSimplification
+13. Reassociation
+14. SignExtensionElimination
+15. NarrowingTransform
+16. BitwiseOptimization
+17. SelectOptimization
+18. OverflowCheckElimination
+
+### Phase 2: Memory Optimization (19–30)
+19. AliasAnalysisInitialization
+20. MemoryDependenceAnalysis
+21. RedundantLoadElimination
+22. StoreToLoadForwarding
+23. DeadStoreElimination
+24. StoreMerging
+25. LoadHoisting
+26. ScalarReplacementOfAggregates
+27. BitfieldLowering
+28. StackSlotColoring
+29. HeapToStackPromotion *(allocation elision, not GC)*
+30. MemorySSARepair
+
+### Phase 3: Escape & Allocation Analysis (31–36)
+31. PointsToAnalysis
+32. EscapeAnalysis
+33. PartialEscapeAnalysis
+34. AllocationSiteProfiling
+35. MaterializationPointInsertion
+36. LockElision *(if JULES has synchronized primitives)*
+
+### Phase 4: Loop Analysis & Transforms (37–52)
+37. LoopDetection
+38. InductionVariableRecognition
+39. LoopClassification
+40. LoopInvariantCodeMotion
+41. LoadLICM
+42. LoopUnrolling
+43. ProfileGuidedUnrolling
+44. LoopPeeling
+45. LoopInterchange
+46. LoopFusion
+47. LoopFission
+48. Predication
+49. IfConversion
+50. TailRecursionElimination
+51. BranchProbabilityInference
+52. HotPathStraightening
+
+### Phase 5: Vectorization & Superword Parallelism (53–66)
+53. IdiomRecognition
+54. SLPVectorizer
+55. SuperwordPacker
+56. LoopVectorizer
+57. OuterLoopVectorizer
+58. InterleavedAccessRecognition
+59. ReductionRecognizer
+60. VectorLegalization
+61. MaskGeneration
+62. ShuffleOptimization
+63. AutoSOATransform
+64. VectorCostModelEvaluation
+65. SIMDIntrinsicMatching
+66. VectorWidthSelection
+
+### Phase 6: Devirtualization & Speculation (67–75)
+67. TraitImplHierarchyAnalysis
+68. StaticDevirtualization
+69. SpeculativeDevirtualization
+70. InlineCacheInsertion
+71. GuardInsertion
+72. GuardHoisting
+73. GuardWeakening
+74. GuardMerging
+75. AssumptionTracking
+
+### Phase 7: Inlining & Interprocedural (76–82)
+76. InliningCostModel
+77. AlwaysInlineEnforcement
+78. CostBasedInlining
+79. RecursiveInliningBounding
+80. ArgumentSpecialization
+81. ClosureInlining
+82. LTOSummaryGeneration
+
+### Phase 8: Lowering & Machine Optimization (83–89)
+83. CFGLinearization
+84. InstructionSelection
+85. RegisterAllocation
+86. PostRACleanup
+87. MachinePeephole
+88. MachineLICM
+89. DeoptMetadataEmission
+
+Each pass must satisfy Rules 10, 24, 25, 26, 29, 35, 40, 114, 113, 115, 123. Adding a 90th pass requires amending this specification.
+
+---
+
+## Part XVII: Testing, Observability, Governance
+
+**Rule 124 — Differential Oracle Testing Must Run Continuously**
+
+CI must compare behavior across AOT and JIT modes. Tests must include normal programs, panics, FFI interactions, SIMD, comptime, generics, traits, raw pointer manipulation, allocation/deallocation patterns, debugging/profiling enabled, numeric edge cases including NaN, negative zero, overflow, and division by zero.
+
+Enforcement: CI differential matrix.
+
+---
+
+**Rule 125 — Fuzzing Must Cover IR, Profiles, and Artifacts**
+
+Fuzzing must target IR inputs, serialized profiles, AOT artifacts, code-cache metadata, patching sequences, deopt metadata, and FFI boundaries. Untriaged fuzz failures block release.
+
+Enforcement: scheduled fuzz jobs.
+
+---
+
+**Rule 126 — Sanitizer Matrix Is Mandatory**
+
+CI must run supported configurations with ASan, UBSan, TSan where concurrency exists, MSan where supported, debug asserts, release builds, AOT mode, and JIT-enabled mode.
+
+Enforcement: CI matrix.
+
+---
+
+**Rule 127 — Deopt Stress Tests Must Be First-Class**
+
+Dedicated stress modes must force guard failure, force deopt at every supported point, force code invalidation under load, and force allocation-elision edge cases.
+
+Enforcement: nightly stress, release gating.
+
+---
+
+**Rule 128 — Code Installation and Patching Must Be Concurrency-Tested**
+
+CI must test installing code while executing old code, invalidating code while running, patching under load, retiring code under load, and deopt during patching.
+
+Enforcement: concurrency stress tests.
+
+---
+
+**Rule 129 — Performance Gates Must Measure More Than Throughput**
+
+Performance CI must measure startup time, warmup time, peak throughput, tail latency, compile latency p50/p99, deopt rate, guard overhead, code size, memory usage, compile CPU cost, and mode-transition counts. A regression in any critical dimension requires waiver.
+
+Enforcement: benchmark suite with thresholds.
+
+---
+
+**Rule 130 — Telemetry Must Be Structured, Stable, and Privacy-Safe**
+
+Telemetry must record compile attempts, compile failures, fallback reasons, guard failures, deopt reasons, invalidations, code-cache pressure, budget violations, blacklist events, and performance counters. Telemetry must not include source code, user data, or secrets unless explicitly opted in.
+
+Enforcement: schema validation, privacy review.
+
+---
+
+**Rule 131 — Replay Artifacts Must Be Sufficient for Debugging**
+
+A failed compilation or deopt event should be replayable from source hash, IR snapshot, pass pipeline state, profile snapshot, compiler flags, target description, RNG seed, runtime config, dependency versions, and failure location. Debugging should start from replay, not anecdote.
+
+Enforcement: replay artifact tests.
+
+---
+
+**Rule 132 — FFI/ABI Must Have Dedicated Tests**
+
+Dedicated tests must cover JULES→native calls, native→JULES callbacks, register clobbering, stack alignment, panic propagation through FFI, memory ownership transfer, varargs conventions, and error return conventions.
+
+Enforcement: FFI/ABI test suite.
+
+---
+
+**Rule 133 — Security Tests Must Be Part of CI**
+
+Security checks should include W^X scans, executable memory accounting, JIT spraying PoCs, malformed artifact loading, code-cache exhaustion, patch race attempts, and sandbox escape tests where applicable.
+
+Enforcement: security CI lane.
+
+---
+
+**Rule 134 — Language Compatibility Must Be Tracked Explicitly**
+
+The project must maintain supported language version range, known divergences, unsupported features, compatibility-suite pass requirements, and allowed failure list with owners and expiry dates.
+
+Enforcement: compatibility dashboard.
+
+---
+
+**Rule 135 — All Major Optimizations Must Be Feature-Gated**
+
+Every major optimization must be capable of being disabled independently for bisection and emergency response. Examples: inlining, partial escape analysis, scalar replacement, SLP, LICM, GVN, effect reordering, inline-cache specialization, type specialization, range-check elimination, unrolling, JIT compilation, AOT loading.
+
+Enforcement: flag matrix test.
+
+---
+
+**Rule 136 — Exceptions to Rules Require an Exception Register**
+
+No rule may be silently bypassed. Exceptions must include rule ID, reason, owner, risk assessment, mitigation, telemetry, expiry date, and tech lead approval. Expired exceptions automatically become release blockers.
+
+Enforcement: exception register.
+
+---
+
+**Rule 137 — Every Rule Must Have Enforcement Metadata**
+
+Each rule in this document must specify enforcement mechanism, owner, severity, test coverage, and waiver policy. Rules without enforcement should be moved to guidelines or given an enforcement plan.
+
+Enforcement: rule metadata lint.
+
+---
+
+**Rule 138 — Maintain a Compliance Matrix**
+
+The repository must maintain a mapping from each rule to CI check, test suite, verifier, review checklist, documentation, and owner. This matrix must be reviewed each release.
+
+Enforcement: release checklist.
+
+---
+
+**Rule 139 — Architectural Decisions Require ADRs**
+
+Any significant compiler/runtime decision must have an Architecture Decision Record covering context, options considered, decision, consequences, performance impact, correctness impact, security impact, and rollback plan.
+
+Enforcement: PR template requirement.
+
+---
+
+**Rule 140 — Builds Must Be Hermetic and Dependencies Must Be Pinned**
+
+Compiler/runtime builds must be reproducible. Requirements: pinned dependencies, locked toolchains where practical, no network access during tests, reproducible artifact hashes, supply-chain review for new dependencies.
+
+Enforcement: build reproducibility tests.
+
+---
+
+**Rule 141 — Stale Documentation Is a Defect**
+
+Documentation must be updated in the same PR as behavior changes. This includes rules doc, IR spec, effect system spec, ABI spec, pass documentation, runtime documentation, telemetry schema, and compatibility matrix. Stale docs are treated like stale code.
+
+Enforcement: docs lint, PR checklist.
+
+---
+
+## Part XVIII: Definitions
+
+**Hot path:** Compiler pass execution, guard execution, inline-cache fast paths, allocation fast paths (user allocator wrappers), deopt entry trampolines, and dispatch loops. Not deopt materialization, which may allocate under budget.
+
+**Guard:** A runtime mechanism that validates a speculative assumption. May be a hardware branch, type/version check, patchpoint, trap, dependency invalidation, or hardware check.
+
+**FrameState:** A snapshot attached to a speculative node that allows the deoptimizer to reconstruct the exact safe fallback JULES execution state.
+
+**Deopt:** The process of transferring execution from optimized code to safe fallback code while preserving observable JULES program state. No OSR. No interpreter.
+
+**Safepoint:** A point in JIT-generated code where the thread can safely pause for code invalidation or deoptimization. Not used for GC. Must have bounded latency.
+
+**Observable behavior:** Program output, panics, stack traces, side effects, memory mutation, trait dispatch, generic specialization, comptime results, SIMD behavior, FFI behavior, debugging/profiling events, deterministic destruction.
+
+**Effect:** A JULES-visible operation that cannot be freely reordered, deleted, or duplicated without semantic proof.
+
+**Dependency:** A versioned entity that a specialization relies on. If the dependency changes, the specialization must be invalidated or guarded.
+
+**Code installation:** The atomic publication of a compiled function’s entry point, metadata, deopt info, and dependency records.
+
+**Quiescence:** A state where no thread is executing old code or depending on old metadata, allowing safe reclamation of compiler artifacts.
+
+**Speculation:** An optimization that assumes a runtime property holds, guarded by a mechanism that triggers deopt on failure.
+
+**Static proof:** A mechanically-checked artifact demonstrating that a property holds without runtime guards.
+
+**Profile confidence:** A metric combining sample count, stability, age, decay, variance, and deopt correlation. Low-confidence data must not trigger aggressive speculation.
+
+**Mode transition:** A change between AOT and JIT execution, including guard failure → safe fallback, recompilation, invalidation. Must be observable and recorded.
+
+**Fallback:** Graceful degradation to safe fallback code when compilation or speculation fails.
+
+**Kill switch:** A mechanism to disable a specific optimization for bisection and incident response.
+
+---
+
+## Part XIX: Normative References
+
+-   JULES Language Specification
+-   `docs/ir_spec.md`
+-   `docs/effect_system.md`
+-   `docs/abi.md`
+-   `docs/type_system.md`
+-   `docs/trait_semantics.md`
+-   `docs/memory_model.md`
+-   `docs/deopt_backend.md`
+-   Target platform ABI documents (SysV x86-64, AAPCS64)
+-   Security policy document
+
+---
+
+## Part XX: Rule Severity and Waiver Process
+
+**Severity levels:**
+
+-   **P0 (Blocker):** Silent data corruption, security vulnerabilities, crashes on valid input. Blocks release.
+-   **P1 (Critical):** Wrong results, missing deopt metadata, memory unsafety. Blocks merge to main.
+-   **P2 (Major):** Performance regressions greater than 5%, missing tests, documentation debt. Requires waiver with expiry.
+-   **P3 (Minor):** Style, naming, minor optimizations. Tracked but non-blocking.
+
+**Waiver process:**
+
+1.  File an exception in the exception register per Rule 136.
+2.  Include rule ID, reason, owner, risk assessment, mitigation, telemetry, expiry date, and tech lead approval.
+3.  Waivers auto-expire. Expired waivers become release blockers.
+4.  No rule may be silently bypassed. Silent bypass is itself a Rule 136 violation.
+
+---
+
+## Part XXI: Compliance Matrix
+
+The full compliance matrix, mapping Rule → CI check, test suite, and owner, is maintained in `docs/compliance_matrix.md` and reviewed each release.
+
+Example entries:
+
+| Rule | Enforcement | Test Suite | Owner | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| 3 | IR verifier | guard_tests | compiler team | Every profile-driven decision needs a guard |
+| 67 | differential CI | jules_compat | language team | JULES spec is the oracle |
+| 82 | codegen audit | no_gc_artifacts | compiler team | No runtime reference tracking |
+| 83 | barrier-absence verifier | no_gc_artifacts | compiler team | No read/write barriers |
+| 89 | OS memory tests | security_ci | security team | W^X mandatory |
+| 117 | graph verifier | ir_verifier | compiler team | No GC metadata in IR |
+
+---
+
+## Part XXII: Special Pass Laws
+
+These laws govern key first-class passes. They bind both AOT and JIT modes. They are enforced like all other laws: violations follow the severity model in Part XX and the exception process in Rule 136.
+
+---
+
+**SWLP Rule:**
+
+The Superword-Level Parallelism pass (Pass 55) must not vectorize any operation unless:
+
+1.  Dependencies are proven safe, or
+2.  Versioned runtime checks are emitted, or
+3.  A scalar fallback is guaranteed.
+
+SWLP must preserve JULES numeric semantics exactly. Fast-math is forbidden. Vectorization must not reorder JULES-visible effects.
+
+SWLP must prove or guard: no harmful aliasing; known array/slice types; known element sizes; safe or guarded bounds; safe or handled alignment; safe loop bounds; preserved floating-point semantics; preserved integer overflow semantics; existence of a scalar fallback; handled tail iterations; and masked or scalarized partial vectors.
+
+SWLP must preserve integer division-by-zero behavior, arithmetic panic behavior, IEEE float/double behavior, NaN behavior, negative zero behavior, and exact primitive conversion rules.
+
+SWLP must run after inlining, GVN/CSE, range analysis, alias analysis, loop normalization, and type specialization.
+
+SWLP must have a cost model, a kill switch, golden tests, a fallback path, and telemetry.
+
+---
+
+**PEA Rule:**
+
+Partial Escape Analysis (Pass 33) may elide or scalar-replace an allocation only if every escape point is either:
+
+1.  Proven non-observable,
+2.  Guarded,
+3.  Materialized, or
+4.  Rejected.
+
+PEA must not eliminate allocations observable by pointer identity, FFI escape, debugging, serialization, shared synchronization, user allocator hooks, or explicit address-taken operations.
+
+PEA must produce scalar replacement nodes, materialization plans, FrameState-compatible reconstruction, deopt materialization metadata, and correct handling of user allocator calls.
+
+PEA must materialize the allocation at: calls that may observe it; deopt points; panic edges; stores to escaping locations; FFI transitions; and any point where the user allocator’s observable behavior would differ.
+
+PEA is an *optimization*, not a memory safety mechanism. It does not introduce runtime memory management.
+
+PEA must have a budget, a kill switch, golden tests, deopt materialization tests, and FFI/allocator negative tests.
+
+---
+
+*End of JULES Compiler Laws & Architecture Specification.*
+*Compliance is not optional. It is the foundation of JULES.*

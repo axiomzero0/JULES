@@ -1,0 +1,12 @@
+// SCCP: constant branch kills the else path
+fn main() -> i64 {
+    let mode: i64 = 3;
+    var r: i64 = 0;
+    if mode < 10 {
+        r = 100;
+    } else {
+        r = 200;
+    }
+    print(r);
+    return 0 as i64;
+}
