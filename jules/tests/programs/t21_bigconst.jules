@@ -1,0 +1,31 @@
+// compile-vs-assembler hazards fixed by the emit_cmp immediate work:
+//   * compares against constants that do NOT fit a sign-extended imm32
+//     (cmpq has no imm64 form — the old emitter produced `cmpq $big, %rax`
+//     and the assembler rejected the file outright)
+//   * large unsigned boundaries near 2^63 (u64 wrap-around hash probe)
+//   * constants on the LEFT operand of a compare (the swapped form now
+//     folds to cmp reg, $imm instead of re-materializing per iteration)
+fn chk(x: i64) -> i64 {
+    if 4611686018427387905 < x { return 1 as i64; }
+    if x < 4611686018427387905 { return 2 as i64; }
+    return 3 as i64;
+}
+
+fn probe(u: u64) -> u64 {
+    var h: u64 = 1469598103934665603;
+    var i: u64 = 0;
+    while i < 1000000 as u64 {
+        h = h * 1099511628211 as u64 + (i >> 3);
+        i = i + 1 as u64;
+    }
+    return h ^ u;
+}
+
+fn main() -> i64 {
+    print(chk(5 as i64));
+    print(chk(4611686018427387906 as i64));
+    print(chk(4611686018427387905 as i64));
+    print(probe(0 as u64) as i64);
+    print(probe(18446744073709551615 as u64) as i64);
+    return 0 as i64;
+}

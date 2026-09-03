@@ -1,0 +1,26 @@
+// recursion unrolling via accumulator introduction (pass 50):
+//   * fibrec: the canonical f(n) = f(n-1) + f(n-2) shape — one recursive
+//     call per level after the transform, threaded through a loop phi
+//   * pairsum: same shape with a different stride (g2 = x-3), proving the
+//     transform is not fib-specific
+//   * guarded: base uses a computed B (n*10), not the raw parameter
+fn fibrec(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fibrec(n - 1) + fibrec(n - 2);
+}
+
+fn pairsum(n: i64) -> i64 {
+    if n < 3 { return n * 10; }
+    return pairsum(n - 1) + pairsum(n - 3);
+}
+
+fn main() -> i64 {
+    print(fibrec(19 as i64));
+    print(fibrec(0 as i64));
+    print(fibrec(1 as i64));
+    print(fibrec(2 as i64));
+    print(pairsum(17 as i64));
+    print(pairsum(2 as i64));
+    print(pairsum(3 as i64));
+    return 0 as i64;
+}

@@ -176,8 +176,45 @@ public:
         if (!ctx.lin) return false;
         ctx.lin->fns.clear();
         bool ok = true;
+        // Module-level dead-function elimination: after inlining, functions
+        // with no remaining callers from main are unreachable in a closed
+        // module (no shared-library exports, comptime fns excluded already).
+        // Reachability = fixpoint over live Call nodes' FnIds from main.
+        FlatMap<FnId, bool> reachable;
+        std::vector<FnId> work;
+        bool have_root = false;
+        for (FunctionGraph& fg : ctx.mod.fns) {
+            if (fg.is_comptime) continue;
+            if (ctx.syms.name(fg.name) == "main") {
+                reachable.insert(fg.fid, true);
+                work.push_back(fg.fid);
+                have_root = true;
+                break;
+            }
+        }
+        if (!work.empty()) {
+            FlatMap<FnId, FunctionGraph*> by_fid;
+            for (FunctionGraph& fg : ctx.mod.fns) by_fid.insert(fg.fid, &fg);
+            while (!work.empty()) {
+                FnId f = work.back();
+                work.pop_back();
+                FunctionGraph** fgp = by_fid.find(f);
+                if (!fgp) continue;
+                for (NodeId n = 0; n < (*fgp)->g.size(); ++n) {
+                    const Node& nd = (*fgp)->g.node(n);
+                    if (nd.op != Op::Call) continue; // killed nodes are Dead
+                    if (nd.aux == kFnPrint || nd.aux == kFnFree) continue; // external
+                    const bool* seen = reachable.find(static_cast<FnId>(nd.aux));
+                    if (!seen) {
+                        reachable.insert(static_cast<FnId>(nd.aux), true);
+                        work.push_back(static_cast<FnId>(nd.aux));
+                    }
+                }
+            }
+        }
         for (FunctionGraph& fg : ctx.mod.fns) {
             if (fg.is_comptime) continue; // comptime fns never execute at runtime
+            if (have_root && !reachable.contains(fg.fid)) continue; // dead fn
             LFunction lf;
             Linearizer l(fg, ctx.analysis.doms(fg));
             ok &= l.run(lf);

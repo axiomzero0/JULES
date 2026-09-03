@@ -229,9 +229,68 @@ struct Allocator {
             }
             return false;
         };
+        // Fused short-circuit guards leave [store s, X] ... [load X, s]
+        // — the reload is separated from its store by the guard chain
+        // (operand loads, compares, branches). A same-register pair folds
+        // across such a gap by pure deletion: every gap instruction is
+        // read-only or loads into a DIFFERENT register, nothing references
+        // the slot, so X simply stays live across the branches.
+        auto gap_ok = [](const Inst& c, i32 s, R x) {
+            switch (c.op) {
+                case IOp::Nop:
+                case IOp::CmpRR:
+                case IOp::CmpRImm:
+                case IOp::Test:
+                case IOp::FpCmp:
+                case IOp::Jcc:
+                    return true; // flags/control only: touch no regs or slots
+                case IOp::MovSR: // load: writes a, reads b(slot)
+                case IOp::MovFpR:
+                    return c.a.k == Operand::K::Reg && c.a.reg != x &&
+                           c.b.k == Operand::K::Slot && c.b.slot != s;
+                case IOp::MovRImm: // constant materialization: writes a
+                    return c.a.k == Operand::K::Reg && c.a.reg != x;
+                case IOp::MovRR:  // copy: writes a, reads b (reading x is fine)
+                case IOp::MovFpFp:
+                    return c.a.k == Operand::K::Reg && c.a.reg != x;
+                default:
+                    return false;
+            }
+        };
+        auto same_reg_reload_across_gap = [&](size_t store_pos, i32 s, R x) {
+            size_t k = store_pos + 1;
+            while (k < lf.code.size() && gap_ok(lf.code[k], s, x)) ++k;
+            if (k >= lf.code.size()) return SIZE_MAX;
+            const Inst& ld = lf.code[k];
+            if ((ld.op == IOp::MovFpR || ld.op == IOp::MovSR) &&
+                ld.a.k == Operand::K::Reg && ld.a.reg == x &&
+                ld.b.k == Operand::K::Slot && ld.b.slot == s &&
+                !slot_read_after(k + 1, s))
+                return k;
+            return SIZE_MAX;
+        };
         for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
             Inst& cur = lf.code[i];
             Inst& nxt = lf.code[i + 1];
+            // same-register store -> (flag-only gap) -> reload: delete both
+            if (cur.op == IOp::MovFpS && cur.b.k == Operand::K::Slot &&
+                cur.a.k == Operand::K::Reg) {
+                size_t ld = same_reg_reload_across_gap(i, cur.b.slot, cur.a.reg);
+                if (ld != SIZE_MAX) {
+                    cur.op = IOp::Nop;
+                    lf.code[ld].op = IOp::Nop;
+                    continue;
+                }
+            }
+            if (cur.op == IOp::MovRS && cur.b.k == Operand::K::Slot &&
+                cur.a.k == Operand::K::Reg) {
+                size_t ld = same_reg_reload_across_gap(i, cur.b.slot, cur.a.reg);
+                if (ld != SIZE_MAX) {
+                    cur.op = IOp::Nop;
+                    lf.code[ld].op = IOp::Nop;
+                    continue;
+                }
+            }
             if (cur.op == IOp::MovFpS && cur.b.k == Operand::K::Slot &&
                 nxt.op == IOp::MovFpR && nxt.b.k == Operand::K::Slot &&
                 nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&

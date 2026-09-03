@@ -108,6 +108,7 @@ assert_pass_active t08_tco TailRecursionElimination
 assert_pass_active t09_licm LoopInvariantCodeMotion
 assert_pass_active t18_unroll LoopUnrolling
 assert_pass_active t19_predication Predication
+assert_pass_active t20_accumulator TailRecursionElimination
 
 echo
 echo "results: $pass passed, $fail failed"

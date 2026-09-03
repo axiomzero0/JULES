@@ -126,6 +126,8 @@ enum class IOp : u16 {
     RetNaked,       // ret — no leave (frame elided)
     TailCallNaked,  // jmp fn — tail call without a frame (frame elided)
     Comment,        // emission-time annotation (MIR comments, disabled in release)
+    LeaRR,          // lea: dst(a.reg) = base(b.reg)*scale + disp(b.imm); scale in
+                    // `size` (1/2/4/8); pass-87 formation from [mov][add/sub/shl]
 };
 
 struct Operand {

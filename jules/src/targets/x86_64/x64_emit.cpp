@@ -77,6 +77,25 @@ Cond cmp_cond(CmpOp op, bool is_signed) {
     return Cond::E;
 }
 
+// Operand-order mirror: cond(a, b) === mirror(cond)(b, a).
+Cond mirror_cond(Cond c) {
+    switch (c) {
+        case Cond::L:  return Cond::G;
+        case Cond::LE: return Cond::GE;
+        case Cond::G:  return Cond::L;
+        case Cond::GE: return Cond::LE;
+        case Cond::B:  return Cond::A;
+        case Cond::BE: return Cond::AE;
+        case Cond::A:  return Cond::B;
+        case Cond::AE: return Cond::BE;
+        case Cond::E:
+        case Cond::NE: return c;
+    }
+    return c;
+}
+
+Cond inv_cond(Cond c); // defined below (same anonymous namespace)
+
 const R kArgGpRegs[] = {R::Rdi, R::Rsi, R::Rdx, R::Rcx, R::R8, R::R9};
 constexpr u8 kArgGpCount = 6;
 const R kArgXmmRegs[] = {R::Xmm0, R::Xmm1, R::Xmm2, R::Xmm3, R::Xmm4, R::Xmm5,
@@ -274,12 +293,18 @@ struct Emitter {
 
         for (LBlock& b : lf_.blocks) {
             label(kBlockLabelBase + b.index);
-            for (NodeId n : b.nodes) emit_node(n);
+            sc_begin_block(b); // fused short-circuit: suppress chain nodes
+            for (NodeId n : b.nodes) {
+                const bool* sup = suppress_.find(n);
+                if (sup && *sup) continue;
+                emit_node(n);
+            }
             for (int ci : b.phi_copy_indices) {
                 const LPhiCopy& cp = lf_.phi_copies[static_cast<size_t>(ci)];
                 emit_phi_copy(cp);
             }
             emit_terminator(b);
+            sc_active_ = false;
         }
 
         label(epilogue_label_);
@@ -414,7 +439,11 @@ struct Emitter {
         st.size = size;
     }
 
-    void emit_cmp(NodeId n) {
+    // Emits the bare compare for Cmp node `n` (flags only — no setcc, no
+    // result store). Returns the condition the flags encode for
+    // (in[1] OP in[2]); shared by emit_cmp and the fused short-circuit
+    // branch lowering, which branches directly off the compare flags.
+    Cond emit_cmp_flags(NodeId n) {
         const Node& nd = g_.node(n);
         const Node& an = g_.node(nd.in[1]);
         u8 size = sz_of(an.ty);
@@ -426,20 +455,58 @@ struct Emitter {
             c.size = sz_of(an.ty);
             c.a.k = Operand::K::Reg; c.a.reg = R::Xmm0;
             c.b.k = Operand::K::Reg; c.b.reg = R::Xmm1;
-        } else {
-            load_value(nd.in[1], R::Rax, size);
-            if (g_.node(nd.in[2]).op == Op::Const) {
-                ConstVal c;
-                const_of(g_, nd.in[2], c);
+            return cond;
+        }
+        // Can `v` be a CmpRImm immediate? cmpq has no imm64 form: the
+        // sign-extended imm32 must reproduce the full constant (fixes
+        // assembler errors on large i64 constants). 32-bit compares take
+        // imm32 as-is, so any 32-bit constant is encodable.
+        auto imm_ok = [&](i64 v) {
+            if (size == 4) return true;
+            return static_cast<i64>(static_cast<i32>(v)) == v;
+        };
+        // Swapped-operand form: cmp has a register-immediate form for the
+        // B side only, and GVN/branch inversion leaves constants on the
+        // left operand of loop guards ([mov rax,$c][cmp rax,rX] — the
+        // constant re-materialized every iteration). Emit the value into
+        // rax and compare it with the immediate directly; the condition
+        // mirrors (a < c  <=>  c > a).
+        if (an.op == Op::Const && g_.node(nd.in[2]).op != Op::Const) {
+            ConstVal c;
+            const_of(g_, nd.in[1], c);
+            if (imm_ok(c.iv)) {
+                load_value(nd.in[2], R::Rax, size);
+                Inst& i = emit(IOp::CmpRImm);
+                i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+                i.b.k = Operand::K::Imm; i.b.imm = c.iv;
+                i.size = size;
+                return mirror_cond(cond);
+            }
+        }
+        load_value(nd.in[1], R::Rax, size);
+        if (g_.node(nd.in[2]).op == Op::Const) {
+            ConstVal c;
+            const_of(g_, nd.in[2], c);
+            if (imm_ok(c.iv)) {
                 Inst& i = emit(IOp::CmpRImm);
                 i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
                 i.b.k = Operand::K::Imm; i.b.imm = c.iv;
                 i.size = size;
             } else {
+                // not imm32-encodable: materialize like a register
+                // operand (cmp has no imm64 encoding)
                 load_value(nd.in[2], R::Rcx, size);
                 reg2(IOp::CmpRR, R::Rax, R::Rcx, size);
             }
+        } else {
+            load_value(nd.in[2], R::Rcx, size);
+            reg2(IOp::CmpRR, R::Rax, R::Rcx, size);
         }
+        return cond;
+    }
+
+    void emit_cmp(NodeId n) {
+        Cond cond = emit_cmp_flags(n);
         Inst& sc = emit(IOp::Setcc);
         sc.cond = cond;
         Inst& zx = emit(IOp::MovZX);
@@ -754,6 +821,150 @@ struct Emitter {
         st_slot(IOp::MovRS, R::Rax, slot(cp.dst), sz_of(dst.ty));
     }
 
+    // ---- fused short-circuit branches ----------------------------------
+    // A branch whose condition is a bool And/Or chain over compares (the
+    // p48 predication shape, and the classic `while a && b` guard) lowers
+    // as a chain of compare+branch pairs — exactly what the control-flow
+    // form would emit, with zero setcc/movzx/and round trips. Each Cmp
+    // leaf is single-use (consumed only by the chain) and scheduled in the
+    // branch block, so suppressing its standalone emission and branching
+    // straight off its flags preserves semantics: short-circuit evaluation
+    // skips the remaining leaves on the first decisive result.
+    struct ScLeaf {
+        NodeId node;
+        bool is_cmp;
+    };
+    void sc_begin_block(LBlock& b) {
+        sc_active_ = false;
+        suppress_.clear();
+        sc_leaves_.clear();
+        if (b.terminator_if == kNoNode) return;
+        NodeId cond = g_.node(b.terminator_if).in[1];
+        if (cond == kNoNode) return;
+        const Node& cn = g_.node(cond);
+        if (cn.op != Op::Bin) return;
+        if (cn.sub != static_cast<u32>(BinOp::And) &&
+            cn.sub != static_cast<u32>(BinOp::Or))
+            return;
+        if (cn.ty != ty_i1()) return; // integer bitwise & / |: NOT a short-circuit
+        sc_and_ = (cn.sub == static_cast<u32>(BinOp::And));
+        FlatMap<NodeId, bool> in_blk;
+        for (NodeId n : b.nodes) in_blk.insert(n, true);
+        if (!sc_flatten(cond, in_blk)) {
+            sc_active_ = false;
+            suppress_.clear();
+            sc_leaves_.clear();
+            return;
+        }
+        bool any_cmp = false;
+        for (const ScLeaf& l : sc_leaves_) any_cmp = any_cmp || l.is_cmp;
+        if (!any_cmp) { // pure test chain: materialization is already fine
+            suppress_.clear();
+            sc_leaves_.clear();
+            return;
+        }
+        sc_active_ = true;
+    }
+    // killed nodes stay in the lazy use lists (see SROA's dead-user fix):
+    // count only live users when proving single-use.
+    u32 live_uses(NodeId n) {
+        u32 c = 0;
+        for (NodeId u : g_.uses_of(n))
+            if (g_.node(u).op != Op::Dead) ++c;
+        return c;
+    }
+    bool sc_flatten(NodeId n, const FlatMap<NodeId, bool>& in_blk) {
+        const Node& nd = g_.node(n);
+        if (nd.op == Op::Bin && nd.ty == ty_i1() &&
+            (nd.sub == static_cast<u32>(BinOp::And) ||
+             nd.sub == static_cast<u32>(BinOp::Or))) {
+            // mixed && / || nesting keeps the materialized form (bail)
+            if (nd.sub != (sc_and_ ? static_cast<u32>(BinOp::And)
+                                   : static_cast<u32>(BinOp::Or)))
+                return false;
+            // the chain node must feed exactly one consumer (its parent or
+            // the If) — otherwise its value is observed elsewhere
+            if (live_uses(n) != 1) return false;
+            if (!suppress_.contains(n)) suppress_.insert(n, true);
+            return sc_flatten(nd.in[1], in_blk) && sc_flatten(nd.in[2], in_blk);
+        }
+        if (nd.op == Op::Cmp) {
+            if (live_uses(n) != 1) return false;   // value read elsewhere
+            if (!in_blk.contains(n)) return false; // emitted in an earlier block
+            suppress_.insert(n, true);
+            sc_leaves_.push_back(ScLeaf{n, true});
+            return true;
+        }
+        // other operand: allowed as a materialized bool (test leaf)
+        if (nd.ty != ty_i1()) return false;
+        sc_leaves_.push_back(ScLeaf{n, false});
+        return true;
+    }
+    void emit_sc_branch(LBlock& b) {
+        // resolve the two successor labels exactly like the plain path
+        int true_label = kBlockLabelBase, false_label = kBlockLabelBase;
+        bool have_true = false, have_false = false;
+        for (int s : b.succs) {
+            if (s < 0 || static_cast<size_t>(s) >= lf_.blocks.size()) continue;
+            Op so = g_.node(lf_.blocks[static_cast<size_t>(s)].head).op;
+            if (so == Op::IfTrue) { true_label = kBlockLabelBase + s; have_true = true; }
+            if (so == Op::IfFalse) { false_label = kBlockLabelBase + s; have_false = true; }
+        }
+        if (!have_true || !have_false) {
+            if (!b.succs.empty()) {
+                true_label = kBlockLabelBase + b.succs[0];
+                have_true = true;
+            }
+            if (b.succs.size() > 1) {
+                false_label = kBlockLabelBase + b.succs[1];
+                have_false = true;
+            }
+        }
+        if (!have_true && !have_false) return;
+        bool ft_true = false, ft_false = false;
+        int next = b.index + 1;
+        if (static_cast<size_t>(next) < lf_.blocks.size()) {
+            int nb = kBlockLabelBase + next;
+            if (nb == true_label) ft_true = true;
+            if (nb == false_label) ft_false = true;
+        }
+        size_t k = sc_leaves_.size();
+        for (size_t i = 0; i < k; ++i) {
+            const ScLeaf& leaf = sc_leaves_[i];
+            bool last = (i + 1 == k);
+            Cond pass; // condition under which THIS leaf votes "true"
+            if (leaf.is_cmp) {
+                pass = emit_cmp_flags(leaf.node); // flags only: no setcc round trip
+            } else {
+                load_value(leaf.node, R::Rax, 8);
+                Inst& t = emit(IOp::Test);
+                t.a.k = Operand::K::Reg; t.a.reg = R::Rax;
+                pass = Cond::NE;
+            }
+            if (sc_and_) {
+                // any false leaf decides FALSE; all-true falls out TRUE
+                if (last && ft_false) {
+                    jcc(pass, true_label);        // fail falls into the false side
+                } else {
+                    jcc(inv_cond(pass), false_label); // fail short-circuits out
+                }
+            } else {
+                // any true leaf decides TRUE; all-false falls out FALSE
+                if (last && ft_true) {
+                    jcc(inv_cond(pass), false_label); // pass falls into the true side
+                } else {
+                    jcc(pass, true_label);            // pass short-circuits out
+                }
+            }
+        }
+        // chain fallout: And -> all passed -> TRUE; Or -> all failed -> FALSE
+        if (!ft_true && !ft_false) jump(sc_and_ ? true_label : false_label);
+    }
+    bool sc_active_ = false;
+    bool sc_and_ = false;
+    std::vector<ScLeaf> sc_leaves_;
+    FlatMap<NodeId, bool> suppress_;
+
     void emit_terminator(LBlock& b) {
         if (b.terminator_return != kNoNode) {
             const Node& r = g_.node(b.terminator_return);
@@ -765,6 +976,10 @@ struct Emitter {
             return;
         }
         if (b.terminator_if != kNoNode) {
+            if (sc_active_) {
+                emit_sc_branch(b);
+                return;
+            }
             const Node& ifn = g_.node(b.terminator_if);
             load_value(ifn.in[1], R::Rax, 8);
             Inst& t = emit(IOp::Test);
@@ -939,6 +1154,7 @@ bool flags_preserving(IOp op) {
         case IOp::MovFpFp:
         case IOp::LeaSlot:
         case IOp::LeaSym:
+        case IOp::LeaRR:
         case IOp::Nop:
         case IOp::Comment:
             return true;
@@ -1036,6 +1252,7 @@ bool x64_loop_rotate(LFunction& lf) {
         bool found = false;
         size_t best_span = SIZE_MAX;
         size_t L = 0, guard_pos = 0, body_pos = 0, latch_pos = 0;
+        bool form_b = false; // Form B: guard jcc targets the EXIT, body = fallthrough
 
         for (size_t p = 0; p < lf.code.size(); ++p) {
             if (lf.code[p].op != IOp::Jmp) continue;
@@ -1047,56 +1264,126 @@ bool x64_loop_rotate(LFunction& lf) {
 
             // head must be a single basic block ending in the guard jcc:
             // walk through ordinary instructions; a Label or Jmp means the
-            // head is multi-block (skip — e.g. short-circuit && guards)
+            // head is multi-block (skip). Multiple Jcc's are allowed — the
+            // fused short-circuit guards emit [cmp][jcc exit][cmp][jcc
+            // body] chains in one block; the LAST jcc is the backedge
+            // candidate and the earlier ones jump into the exit segment.
             size_t j = l + 1;
-            bool head_ok = false;
+            size_t last_jcc = SIZE_MAX;
             while (j < p) {
                 const Inst& c = lf.code[j];
                 if (c.op == IOp::Nop) { ++j; continue; }
-                if (c.op == IOp::Jcc) { head_ok = true; break; }
+                if (c.op == IOp::Jcc) { last_jcc = j; ++j; continue; }
                 if (c.op == IOp::Label || c.op == IOp::Jmp) break;
                 ++j; // ordinary head instruction (loads, cmp, arith, ...)
             }
-            if (!head_ok) continue;
-            size_t gp = j;
+            if (last_jcc == SIZE_MAX) continue;
+            size_t gp = last_jcc;
             // guard target must be the body label inside the region
             if (lf.code[gp].a.k != Operand::K::Label) continue;
             const size_t* bp = label_pos.find(lf.code[gp].a.label);
-            if (!bp || *bp <= gp || *bp >= p) continue;
-            size_t bpos = *bp;
-            // exit segment must be nonempty and end in a full terminator
-            size_t e_end = bpos;
-            while (e_end > gp + 1 && lf.code[e_end - 1].op == IOp::Nop) --e_end;
-            if (e_end == gp + 1) continue;
-            IOp last = lf.code[e_end - 1].op;
-            if (last != IOp::Jmp && last != IOp::Ret && last != IOp::RetNaked &&
-                last != IOp::TailCallFn && last != IOp::TailCallNaked)
-                continue;
+            size_t bpos = 0;
+            bool this_form_b = false;
+            if (bp && *bp > gp && *bp < p) {
+                // Form A: jcc jumps INTO the body when the condition holds;
+                // the exit code sits between the guard and the body label.
+                bpos = *bp;
+                // exit segment must be nonempty and end in a full terminator
+                size_t e_end = bpos;
+                while (e_end > gp + 1 && lf.code[e_end - 1].op == IOp::Nop) --e_end;
+                if (e_end == gp + 1) continue;
+                IOp last = lf.code[e_end - 1].op;
+                if (last != IOp::Jmp && last != IOp::Ret && last != IOp::RetNaked &&
+                    last != IOp::TailCallFn && last != IOp::TailCallNaked)
+                    continue;
+            } else {
+                // Form B: guard jcc targets the EXIT (jump out on failure);
+                // the body is the guard's fallthrough. Inlined/unrolled loops
+                // linearize in this polarity. The body's first instruction
+                // must carry a Label (every LBlock emits one) so the rotated
+                // backedge jcc can target it.
+                if (!bp || *bp == l) continue;      // exit label unresolved / self
+                if (bp && *bp > l && *bp < p) continue; // target inside region: not B
+                if (gp + 1 >= p) continue;          // empty body
+                if (lf.code[gp + 1].op != IOp::Label) continue;
+                if (lf.code[gp + 1].a.k != Operand::K::Label) continue;
+                // the body region must be full-terminated at its end: the
+                // latch (at p) is the jmp being deleted, so the last body
+                // instruction is at p-1 — any instruction is fine, the latch
+                // WAS the terminator; nothing falls out of the body.
+                bpos = gp + 1;
+                this_form_b = true;
+            }
 
             found = true;
             best_span = span;
             L = l; guard_pos = gp; body_pos = bpos; latch_pos = p;
+            form_b = this_form_b;
         }
         if (!found) break;
 
         int check_label = lf.label_counter++;
         std::vector<Inst> out;
         out.reserve(lf.code.size() + 2);
-        for (size_t i = 0; i <= L; ++i) out.push_back(lf.code[i]);          // entry label
-        Inst shim;
-        shim.op = IOp::Jmp;
-        shim.a.k = Operand::K::Label;
-        shim.a.label = check_label;
-        out.push_back(shim);                                                 // [L: jmp check]
-        for (size_t i = body_pos; i < latch_pos; ++i) out.push_back(lf.code[i]); // body
-        Inst cl;
-        cl.op = IOp::Label;
-        cl.a.k = Operand::K::Label;
-        cl.a.label = check_label;
-        out.push_back(cl);                                                   // check:
-        for (size_t i = L + 1; i <= guard_pos; ++i) out.push_back(lf.code[i]);   // cond + guard jcc
-        for (size_t i = guard_pos + 1; i < body_pos; ++i) out.push_back(lf.code[i]); // exit
-        for (size_t i = latch_pos + 1; i < lf.code.size(); ++i) out.push_back(lf.code[i]);
+        if (!form_b) {
+            for (size_t i = 0; i <= L; ++i) out.push_back(lf.code[i]);          // entry label
+            Inst shim;
+            shim.op = IOp::Jmp;
+            shim.a.k = Operand::K::Label;
+            shim.a.label = check_label;
+            out.push_back(shim);                                                 // [L: jmp check]
+            for (size_t i = body_pos; i < latch_pos; ++i) out.push_back(lf.code[i]); // body
+            Inst cl;
+            cl.op = IOp::Label;
+            cl.a.k = Operand::K::Label;
+            cl.a.label = check_label;
+            out.push_back(cl);                                                   // check:
+            for (size_t i = L + 1; i <= guard_pos; ++i) out.push_back(lf.code[i]);   // cond + guard jcc
+            for (size_t i = guard_pos + 1; i < body_pos; ++i) out.push_back(lf.code[i]); // exit
+            for (size_t i = latch_pos + 1; i < lf.code.size(); ++i) out.push_back(lf.code[i]);
+        } else {
+            // Form B rotation:
+            //   [L: head; jcc EXIT][body ...][jmp L][exit ...]
+            // becomes
+            //   [L: jmp check][body ...][check: head; jcc(inv) body][exit ...]
+            // The inverted jcc takes the backedge when the condition HOLDS;
+            // fallthrough (condition fails) continues into the exit code,
+            // which sits right where it was — after the latch position. When
+            // the exit block is NOT the instruction after the latch, an
+            // explicit jmp keeps the not-taken path correct.
+            int body_label = lf.code[body_pos].a.label;
+            for (size_t i = 0; i <= L; ++i) out.push_back(lf.code[i]);          // entry label
+            Inst shim;
+            shim.op = IOp::Jmp;
+            shim.a.k = Operand::K::Label;
+            shim.a.label = check_label;
+            out.push_back(shim);                                                 // [L: jmp check]
+            for (size_t i = body_pos; i < latch_pos; ++i) out.push_back(lf.code[i]); // body
+            Inst cl;
+            cl.op = IOp::Label;
+            cl.a.k = Operand::K::Label;
+            cl.a.label = check_label;
+            out.push_back(cl);                                                   // check:
+            for (size_t i = L + 1; i < guard_pos; ++i) out.push_back(lf.code[i]);   // head instrs (no jcc)
+            Inst j2 = lf.code[guard_pos];                                        // the guard jcc
+            j2.cond = inv_cond(j2.cond);
+            j2.a.label = body_label;
+            out.push_back(j2);                                                   // jcc(inv) → body
+            // not-taken fallthrough must reach the original exit: it reached
+            // it via the jcc's target label. If the code following the latch
+            // is not that label, jump there explicitly.
+            bool exit_follows = latch_pos + 1 < lf.code.size() &&
+                                lf.code[latch_pos + 1].op == IOp::Label &&
+                                lf.code[latch_pos + 1].a.label == lf.code[guard_pos].a.label;
+            if (!exit_follows) {
+                Inst ex;
+                ex.op = IOp::Jmp;
+                ex.a.k = Operand::K::Label;
+                ex.a.label = lf.code[guard_pos].a.label;
+                out.push_back(ex);                                               // jmp EXIT
+            }
+            for (size_t i = latch_pos + 1; i < lf.code.size(); ++i) out.push_back(lf.code[i]);
+        }
         lf.code = std::move(out);
         any = true;
     }
@@ -1517,6 +1804,56 @@ bool x64_branch_fusion(LFunction& lf) {
         }
     }
 
+    // ---- 7) lea formation --------------------------------------------------
+    // Post-RA IV updates and address arithmetic lower as two-instruction
+    // pairs around a copy: [mov R2, R1][add/sub $k, R2] and [mov R2,
+    // R1][shl $k, R2]. The lea computes both in one instruction with the
+    // same register reads/writes, so the rewrite is semantics-preserving.
+    {
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& m = code[i];
+            if (m.op != IOp::MovRR || m.a.k != Operand::K::Reg ||
+                m.b.k != Operand::K::Reg)
+                continue;
+            if (m.a.reg == m.b.reg) continue;        // no-op copy, other rules
+            if (m.size != 8) continue;               // 64-bit lea only
+            size_t u = i + 1;
+            while (u < code.size() && code[u].op == IOp::Nop) ++u;
+            if (u >= code.size()) continue;
+            Inst& ar = code[u];
+            R dst = m.a.reg, src = m.b.reg;
+            if (ar.bin == BinOp::Add || ar.bin == BinOp::Sub) {
+                if (ar.op != IOp::ArithRImm) continue;
+                if (ar.a.k != Operand::K::Reg || ar.a.reg != dst) continue;
+                if (ar.b.k != Operand::K::Imm) continue;
+                i64 disp = (ar.bin == BinOp::Add) ? ar.b.imm : -ar.b.imm;
+                if (static_cast<i64>(static_cast<i32>(disp)) != disp) continue;
+                m.op = IOp::Nop;                     // the mov
+                ar.op = IOp::LeaRR;
+                ar.a.k = Operand::K::Reg; ar.a.reg = dst;
+                ar.b.k = Operand::K::Reg; ar.b.reg = src;
+                ar.b.imm = disp;
+                ar.size = 1;                         // scale 1
+                changed = true;
+            } else if (ar.op == IOp::ShiftImm && ar.bin == BinOp::Shl) {
+                if (ar.a.k != Operand::K::Reg || ar.a.reg != dst) continue;
+                if (ar.b.k != Operand::K::Imm) continue;
+                i64 k = ar.b.imm;
+                if (k < 0 || k > 3) continue;        // scale 2/4/8 only
+                // [mov R2, R1][shl $k, R2] === [lea R2, (,R1, 2^k)]: the
+                // copy makes R2 == R1, and shifting is multiplying by 2^k
+                // (k <= 3 = lea scale range). Same reads (R1) and writes (R2).
+                m.op = IOp::Nop;                     // the mov
+                ar.op = IOp::LeaRR;
+                ar.a.k = Operand::K::Reg; ar.a.reg = dst;
+                ar.b.k = Operand::K::Reg; ar.b.reg = src;
+                ar.b.imm = 0;
+                ar.size = static_cast<u8>(k == 0 ? 1 : (1 << k));
+                changed = true;
+            }
+        }
+    }
+
     // ---- sweep ------------------------------------------------------------
     std::vector<Inst> out;
     out.reserve(code.size());
@@ -1861,7 +2198,13 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::MovFpFromGpr: os << "\tmovq " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFromGpr32: os << "\tmovd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFp:
-            os << "\tmov" << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            // Reg-reg FP moves emit the full-width form (movapd/movaps):
+            // the merge-encoded movsd leaves the upper lane stale and is NOT
+            // move-eliminable on Intel, adding a cycle to every FP dep chain
+            // that threads a copy. Full-width moves rename away. The upper
+            // bits are never read: this backend produces only scalar lanes.
+            os << (i.size == 8 ? "\tmovapd " : "\tmovaps ") << r(i.b.reg) << ", "
+               << r(i.a.reg) << "\n";
             break;
         case IOp::FpZero:
             os << (i.size == 8 ? "\txorpd " : "\txorps ") << r(i.a.reg) << ", "
@@ -1871,6 +2214,13 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::PopCal: os << "\tpopq " << r(i.a.reg) << "\n"; break;
         case IOp::RetNaked: os << "\tret\n"; break;
         case IOp::TailCallNaked: os << "\tjmp .L" << i.a.label << "_E\n"; break;
+        case IOp::LeaRR: {
+            // dst = base*scale + disp (AT&T: leaq disp(,base,scale), dst)
+            int scale = (i.size == 2 || i.size == 4 || i.size == 8) ? i.size : 1;
+            os << "\tleaq " << i.b.imm << "(," << r(i.b.reg) << "," << scale << "), "
+               << r(i.a.reg) << "\n";
+            break;
+        }
         case IOp::RestoreCal:
             os << "\tmovq " << (i.b.imm < 0 ? "-" : "") << (i.b.imm < 0 ? -i.b.imm : i.b.imm)
                << "(%rbp), " << r(i.a.reg) << "\n";

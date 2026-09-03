@@ -50,11 +50,34 @@ public:
         j_exit_ = (exit_blk == g_.start()) ? j_entry_
                                            : c_.g.make(Op::Jump, ty_ctrl(), {exit_ctrl});
 
-        // Rewire the caller.
-        // 1) memory users of the call -> callee exit memory
-        c_.g.replace_uses_as_memory(call, exit_mem);
-        // 2) value users -> callee exit value
-        if (exit_val != kNoNode) c_.g.replace_all_uses(call, exit_val);
+        // Rewire the caller. The call is BOTH a value and a memory version,
+        // and its users split by slot kind: effect nodes (and Returns/Loads)
+        // read it in slot 1 as MEMORY, memory phis read it in any value
+        // slot, everything else reads its VALUE. Rewriting with
+        // replace_all_uses or replace_uses_as_memory alone clobbers the
+        // other kind — Cast/Un/Bin keep their FIRST DATA OPERAND in slot 1,
+        // the same index effect nodes use for memory. A blind slot-1
+        // rewrite mapped a `Cast(trunc, call)`'s value read onto the
+        // callee's exit ALLOC (printed the heap pointer instead of the
+        // computed result; u64 `as i64` of a call result).
+        {
+            const SmallVec<NodeId, 4> users = c_.g.uses_of(call);
+            for (NodeId u : users) {
+                Node& un = c_.g.node(u);
+                bool is_mem_phi = (un.op == Op::Phi && un.ty == ty_mem());
+                bool mem_slot1_user = (un.op == Op::Call || un.op == Op::Store ||
+                                       un.op == Op::Load || un.op == Op::Alloc ||
+                                       un.op == Op::Return);
+                for (u8 i = 0; i < un.n_in; ++i) {
+                    if (un.in[i] != call) continue;
+                    bool as_memory = is_mem_phi || (i == 1 && mem_slot1_user);
+                    if (!as_memory && exit_val == kNoNode) continue; // void call
+                    un.in[i] = as_memory ? exit_mem : exit_val;
+                }
+            }
+            c_.g.mark_uses_dirty();
+            c_.g.touch();
+        }
         // 3) repin nodes pinned at B that execute AFTER the inlined body to
         //    the resume block.
         //

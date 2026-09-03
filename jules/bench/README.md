@@ -44,29 +44,39 @@ in the harness if that path is gone.
 
 | julesc-aot (-O2) vs | geometric mean |
 |---|---|
-| gcc -O3 | 1.90x |
-| clang -O3 | 1.74x |
-| gcc -O0 | 0.81x (faster) |
+| gcc -O3 | 1.48x |
+| clang -O3 | 1.38x |
+| gcc -O0 | 0.67x (faster) |
 
-Per-kernel vs gcc -O3: primes **1.00x (parity)**, inthash 1.22x, flops
-**1.39x** (was 2.69x; loop rotation + in-place accumulator fusion + a
-single taken branch per iteration — the loop is now the same 9-instruction
-do-while shape gcc emits), mandel 2.44x (short-circuit conditions are
-flattened to `and`/`or` with one branch, and the loop is rotated; the
-remaining gap is bool materialization — setcc/movzx/mov/and against gcc's
-direct-flags `comisd; jb` — plus the FP dependency chain), tak 3.36x, fib
-3.41x. Compile-time geometric mean: julesc 21 ms vs gcc -O3 48 ms vs
-clang -O3 69 ms.
+Per-kernel vs gcc -O3: primes **1.00x (parity)**, flops **1.02x**, mandel
+**1.19x** (was 2.44x; the `&&` guard now lowers as fused compare-and-branch
+pairs straight off the flags — the exact `cmp; jle` + `ucomisd; jbe` shape
+gcc emits, zero setcc/movzx/and round trips — with the loop rotated to
+do-while form and the guard's x*x+y*y value kept in a register across the
+branches), inthash 1.22x (lea-formed IV updates, rotated, direct
+compare-immediate bounds), fib **2.15x** (was 3.41x; pass 50 now performs
+recursion unrolling via accumulator introduction — the transform gcc
+applies — halving the dynamic call count), tak 3.31x. Compile-time
+geometric mean: julesc 21 ms vs gcc -O3 ~50 ms vs clang -O3 68 ms.
 
 History: 4.53x (first full run) -> 2.79x (opt levels + RA) -> 2.14x
 (two-operand fusion/coalescing) -> 1.90x (loop rotation, pure-short-circuit
-predication, fixpoint operand folds, single-use forwarding).
+predication, fixpoint operand folds, single-use forwarding) -> 1.48x (fused
+short-circuit branches off compare flags, Form-B loop rotation, full-width
+FP moves, compare-immediate folding, lea formation, dead-function
+elimination after inlining, accumulator recursion unrolling).
 
-Remaining gap analysis (from disassembly): fib/tak are bound by the
-non-inlined recursive call protocol (gcc keeps args in registers across the
-whole frame and 32-bit encodings); flops' residual is the a-recurrence's
-mul+add latency (gcc -O3 without -march has the same 8-cycle chain; its
-remaining edge is one fewer loop-carried mov); mandel needs direct-flags
-compare-and-branch for `&&` (setcc-free guard) and FP dependency-chain
-breaking; no live-range splitting yet: spilling degenerates to memory
-operands for that value.
+Remaining gap analysis (from disassembly): tak is bound by the recursive
+call protocol (nine argument-setup moves per call against gcc's
+partial-application register placement; argument-register coalescing at
+call sites is the identified lever). mandel/inthash carry one register move
+per unrolled pair — the allocator's coalescing hints are pairwise, so
+two-step phi cycles through unrolled copies keep one copy where gcc keeps
+zero (component-based coalescing is the fix). primes trails only clang's
+vectorized sieve (1.62x) — the SIMD passes remain documented scaffolds.
+Two correctness holes found and fixed this round: compares against
+non-imm32-encodable i64 constants emitted un-assemblable `cmpq $big, reg`
+(t21), and the inliner's call-result rewrite confused value-slot and
+memory-slot users — a `Cast(call)`'s operand landed on the callee's exit
+allocation and printed a heap pointer (fixed with slot-kind-aware
+rewiring; 12 lifetime miscompiles total, all regression-locked).
