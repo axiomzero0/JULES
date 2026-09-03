@@ -119,6 +119,7 @@ enum class IOp : u16 {
     MovFpFromGpr,   // movq %rax, %xmmN (bit pattern move)
     MovFpFromGpr32, // movd %eax, %xmmN
     MovFpFp,        // movsd/movss %xmmN, %xmmM (allocator reg-reg fp move)
+    FpZero,         // xorpd/xorps %xmmN, %xmmN (fast +0.0 materialization)
     PushCal,        // pushq %reg — callee-saved spill area reservation (pass 85)
     RestoreCal,     // movq OFF(%rbp), %reg — callee-saved restore (pass 85)
     PopCal,         // popq %reg — frame-elided callee restore (pass 85)
@@ -169,6 +170,11 @@ struct LFunction {
     FlatMap<i32, R> slot_reg;           // pass 85: slot -> assigned register
     u32 ra_promoted = 0;                // pass 85 telemetry: promoted slots
     u32 ra_spilled = 0;                 // pass 85 telemetry: memory slots
+    u32 ra_fused = 0;                   // pass 85 telemetry: fused accumulator chains
+    u32 ra_coalesced = 0;               // pass 85 telemetry: hint-unified register pairs
+    int fp_const_min_xmm = 14;          // isel FP const pool: lowest xmm index
+                                        // ever taken (pool spans 15 down to this;
+                                        // allocator stops below it)
     i32 frame_size = 0;
     std::vector<StringConst> strings;   // printf formats owned by this fn
     int label_counter = 0;

@@ -54,6 +54,17 @@ struct LiveRange {
                                  // iteration; never a spill victim
     bool promoted = false;
     R assigned = R::Rax;
+    bool starts_at_def = false;  // first activity is a def (allows a
+                                 // predecessor range to expire AT this
+                                 // position: its final use is the same
+                                 // instruction that starts this range)
+    // Generation sub-intervals (exact liveness): multi-def slots — loop
+    // and merge phis — get one [start, end] per linear redefinition. The
+    // hull [first_live, last_live] over-approximates (it merges the old
+    // value's tail with the new value's head across the backedge); the
+    // gens are what makes hint coalescing sound: two slots may share a
+    // register iff their gens never overlap, even when their hulls do.
+    std::vector<std::pair<size_t, size_t>> gens;
 
     // Dead def (stored, never read): its stores are removable by the RA.
     bool dead_def() const { return defined && !has_reads && !addr_taken; }
@@ -102,6 +113,13 @@ bool slot_use_inst(const Inst& i, i32& slot, bool& fp, bool& addr) {
     return false;
 }
 
+// Does this instruction (a raw pre-RA one) define `slot`?
+bool slot_def_at(const Inst& i) {
+    i32 s = 0;
+    bool f = false;
+    return slot_def_inst(i, s, f);
+}
+
 struct RegPool {
     std::vector<R> regs;
     std::vector<bool> used;
@@ -146,6 +164,359 @@ struct Allocator {
     }
 
     LiveRange& range(i32 slot) { return ranges[static_cast<size_t>(slot)]; }
+
+    // ------------------------------------------------------------------
+    // Generation sub-intervals: collect def/use positions per slot, then
+    // split at each redefinition. A def kills the running generation; the
+    // next generation starts there. Single-def slots collapse to one gen
+    // == the hull. Re-run after any range EXTENSION (fuse extraction moves
+    // a result's birth to the chain's load position; coalescing decisions
+    // made on pre-extension gens would miss the extension's interference
+    // and could place a live B-operand on the register the fused leading
+    // move is about to clobber).
+    // ------------------------------------------------------------------
+    void compute_gens() {
+        std::vector<std::vector<size_t>> defs(
+            static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0));
+        std::vector<std::vector<size_t>> uses(defs.size());
+        for (size_t i = 0; i < lf.code.size(); ++i) {
+            i32 s = 0;
+            bool f = false, a = false;
+            if (slot_def_inst(lf.code[i], s, f))
+                defs[static_cast<size_t>(s)].push_back(i);
+            else if (slot_use_inst(lf.code[i], s, f, a))
+                uses[static_cast<size_t>(s)].push_back(i);
+        }
+        for (size_t s = 0; s < defs.size(); ++s) {
+            LiveRange& r = ranges[s];
+            const std::vector<size_t>& dv = defs[s];
+            if (dv.size() <= 1) {
+                r.gens.clear();
+                if (r.first_live != SIZE_MAX)
+                    r.gens.push_back({r.first_live, r.last_live});
+                continue;
+            }
+            r.gens.clear();
+            for (size_t j = 0; j < dv.size(); ++j) {
+                size_t start = dv[j];
+                size_t end = start;
+                size_t bound = j + 1 < dv.size() ? dv[j + 1]
+                                                 : lf.code.size();
+                for (size_t u : uses[s])
+                    if (u > start && u < bound && u > end) end = u;
+                r.gens.push_back({start, end});
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Store-load pair folding (the pass-86 patterns, applied BEFORE the
+    // liveness analysis: an adjacent same-register store+load pair costs
+    // ZERO instructions when folded, but ONE move when promoted — for
+    // single-use values the fold strictly dominates promotion. This also
+    // feeds the frame-elision decision (post-fold stream).
+    //     [mov [s], reg][mov reg', [s]] -> [mov reg', reg] when s is not read later
+    //     [movq $imm, [s]][mov reg', [s]] -> [movq $imm, reg'] likewise
+    //     same-register pair -> nothing at all
+    // ------------------------------------------------------------------
+    void pair_fold() {
+        auto slot_read_after = [&](size_t from, i32 s) {
+            for (size_t j = from; j < lf.code.size(); ++j) {
+                const Inst& c = lf.code[j];
+                if ((c.op == IOp::MovSR || c.op == IOp::MovFpR) &&
+                    c.b.k == Operand::K::Slot && c.b.slot == s)
+                    return true;
+            }
+            return false;
+        };
+        for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
+            Inst& cur = lf.code[i];
+            Inst& nxt = lf.code[i + 1];
+            if (cur.op == IOp::MovFpS && cur.b.k == Operand::K::Slot &&
+                nxt.op == IOp::MovFpR && nxt.b.k == Operand::K::Slot &&
+                nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
+                nxt.a.k == Operand::K::Reg &&
+                !slot_read_after(i + 2, cur.b.slot)) {
+                if (nxt.a.reg != cur.a.reg) {
+                    cur.op = IOp::MovFpFp;
+                    cur.a.reg = nxt.a.reg; // dst
+                    cur.b.k = Operand::K::Reg;
+                } else {
+                    cur.op = IOp::Nop;
+                }
+                nxt.op = IOp::Nop;
+                continue;
+            }
+            if (cur.op == IOp::MovRS && cur.b.k == Operand::K::Slot &&
+                nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
+                nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
+                nxt.a.k == Operand::K::Reg &&
+                !slot_read_after(i + 2, cur.b.slot)) {
+                if (nxt.a.reg != cur.a.reg) {
+                    cur.op = IOp::MovRR;
+                    cur.a.reg = nxt.a.reg; // dst
+                    cur.b.k = Operand::K::Reg;
+                    cur.size = 8;
+                } else {
+                    cur.op = IOp::Nop;
+                }
+                nxt.op = IOp::Nop;
+                continue;
+            }
+            if (cur.op == IOp::MovSImm && cur.a.k == Operand::K::Slot &&
+                nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
+                nxt.b.slot == cur.a.slot && nxt.a.k == Operand::K::Reg &&
+                !slot_read_after(i + 2, cur.a.slot)) {
+                cur.op = IOp::MovRImm;
+                cur.a.k = Operand::K::Reg;
+                cur.a.reg = nxt.a.reg;
+                nxt.op = IOp::Nop;
+                continue;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Accumulator-chain fusion extraction (pre-assignment).
+    //
+    // The isel contract threads every computation through fixed scratch
+    // registers (rax for GP, xmm0 for FP):
+    //     [load sA -> acc] [load sB -> rcx/xmm1] [op acc, src] [store sZ <- acc]
+    // Two-operand x86 lets the whole chain compute directly in sZ's
+    // register:  [mov Z, A] [op Z, src]  — and when Z and A share a
+    // register (hint coalescing), the leading mov disappears too and the
+    // op runs in place — loop-carried updates become `addq $1, %r15` /
+    // `addsd %xmm4, %xmm3` exactly like a production compiler.
+    //
+    // Extraction registers each chain as a Fuse and adds a hint (sZ <-
+    // sA) plus a range extension (sZ's live range must start at the load
+    // position, where the fused [mov Z, A] now writes the register).
+    // ------------------------------------------------------------------
+    struct Fuse {
+        size_t load_pos = 0;   // [slot-load of sA into acc]
+        size_t store_pos = 0;  // [slot-store of sZ from acc]
+        i32 a_slot = 0;
+        i32 z_slot = 0;
+        bool fp = false;
+        u32 ops = 0;           // chain-op count (0 = pure phi copy)
+        bool inplace_ok = false; // the load is sA's generation's last use
+        SmallVec<i32, 8> gap_slots; // memory-resident operand loads in the
+                                    // window; their registers must not end
+                                    // up equal to Z (coalescing can do that
+                                    // — the leading move would clobber the
+                                    // operand before the op reads it)
+    };
+    std::vector<Fuse> fuses_;
+    std::vector<std::pair<i32, i32>> hints_; // (z, a): z wants a's register
+
+    bool is_acc(R r, bool fp) const { return fp ? r == R::Xmm0 : r == R::Rax; }
+
+    bool is_chain_op(const Inst& i, bool fp) const {
+        if (i.a.k != Operand::K::Reg) return false;
+        if (fp) {
+            if (i.a.reg != R::Xmm0) return false;
+            return i.op == IOp::FpBin || i.op == IOp::FpNeg;
+        }
+        if (i.a.reg != R::Rax) return false;
+        switch (i.op) {
+            case IOp::ArithRR:
+            case IOp::ArithRImm:
+            case IOp::ShiftImm:
+            case IOp::ShiftCl:
+            case IOp::Neg:
+            case IOp::Not:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // A "gap" instruction between chain ops: loads the next op's B
+    // operand into the fixed source scratch, never touches the
+    // accumulator.
+    bool is_gap_ok(const Inst& i, bool fp) const {
+        if (i.op == IOp::Nop) return true;
+        if (i.a.k != Operand::K::Reg) return false;
+        R acc = fp ? R::Xmm0 : R::Rax;
+        if (i.a.reg == acc) return false;
+        if (i.b.k == Operand::K::Reg && i.b.reg == acc) return false;
+        switch (i.op) {
+            case IOp::MovRR:  // B-operand load (GP): mov rcx, X
+            case IOp::MovSR:  // B-operand load (GP, memory): mov rcx, [s]
+            case IOp::MovFpFp: // B-operand load (FP): movsd xmm1, X
+            case IOp::MovFpR: // B-operand load (FP, memory)
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void extract_fuses() {
+#ifdef JULES_DEBUG_RA3
+        {
+            int f = 0;
+            for (const Inst& c : lf.code) {
+                if (c.op == IOp::Label || c.op == IOp::Jmp || c.op == IOp::Jcc) ++f;
+                std::fprintf(stderr, "[ra3] %s%d: op=%d a=(%d,%d,%d) b=(%d,%d,%d)\n",
+                             f ? "B" : "P", f ? f : 0, (int)c.op, (int)c.a.k, (int)c.a.reg,
+                             (int)c.a.slot, (int)c.b.k, (int)c.b.reg, (int)c.b.slot);
+            }
+        }
+#endif
+        for (size_t i = 0; i < lf.code.size(); ++i) {
+            const Inst& ld = lf.code[i];
+            // slot-load into the accumulator: [MovSR rax, [sA]] or [MovFpR xmm0, [sA]]
+            bool fp = ld.op == IOp::MovFpR;
+            if (ld.op != IOp::MovSR && ld.op != IOp::MovFpR) continue;
+            if (ld.b.k != Operand::K::Slot) continue;
+            if (!is_acc(ld.a.reg, fp)) continue;
+            i32 a_slot = ld.b.slot;
+
+            // walk the chain: gap instructions and accumulator ops. Gaps
+            // (B-operand loads into the fixed source scratch) are legal
+            // before the first op too — the isel emits [load A][load B]
+            // [op] [store], so the operand load precedes the chain.
+            size_t j = i + 1;
+            u32 ops = 0;
+            SmallVec<i32, 8> gap_slots;
+            while (j < lf.code.size()) {
+                const Inst& c = lf.code[j];
+                if (c.op == IOp::Nop) { ++j; continue; }
+                if (is_chain_op(c, fp)) { ++ops; ++j; continue; }
+                if (is_gap_ok(c, fp)) {
+                    // remember memory-resident operand loads: if the chain
+                    // reads the RESULT slot as an operand (`x = y + x`),
+                    // the fused leading move would clobber it before the op
+                    if (c.b.k == Operand::K::Slot) gap_slots.push_back(c.b.slot);
+                    ++j;
+                    continue;
+                }
+                break;
+            }
+            if (j >= lf.code.size()) continue;
+            // terminal: slot-store from the same accumulator
+            const Inst& stt = lf.code[j];
+            bool sfp = stt.op == IOp::MovFpS;
+            if (stt.op != IOp::MovRS && stt.op != IOp::MovFpS) continue;
+            if (stt.b.k != Operand::K::Slot) continue;
+            if (sfp != fp) continue;                     // class must match
+            if (!is_acc(stt.a.reg, fp)) continue;
+            i32 z_slot = stt.b.slot;
+            if (z_slot == a_slot) continue;             // pair-fold territory
+            // the result slot must not feed the chain as an operand
+            for (i32 g : gap_slots)
+                if (g == z_slot) { z_slot = -1; break; }
+            if (z_slot < 0) continue;
+
+            // In-place validity: the load must be sA's generation's LAST
+            // use — after the fused op clobbers the register, sA's old
+            // value must have no remaining readers (a later activity of
+            // sA is always a redefinition, which is safe).
+            const LiveRange& ar = range(a_slot);
+            bool last_of_gen = false;
+            for (const auto& g : ar.gens)
+                if (g.second == static_cast<size_t>(i)) last_of_gen = true;
+
+            Fuse fz;
+            fz.load_pos = i;
+            fz.store_pos = j;
+            fz.a_slot = a_slot;
+            fz.z_slot = z_slot;
+            fz.fp = fp;
+            fz.ops = ops;
+            fz.inplace_ok = last_of_gen;
+            fz.gap_slots = gap_slots;
+            fuses_.push_back(fz);
+            // Coalescing hints: a phi copy (ops == 0) closes the loop cycle
+            // — Z IS the phi's next value, so sharing A's register is
+            // dynamically sound even for loop-carried A. An accumulator
+            // fuse may only hint when A is not loop-carried: a value live
+            // across a backedge is re-read on every dynamic iteration, and
+            // an in-place op would clobber it before those re-reads (the
+            // static "last use" lies — the use itself re-executes).
+            if (ops == 0 || !range(a_slot).spans_backedge)
+                hints_.push_back({z_slot, a_slot});
+            // range extension: the fused [mov Z, A] writes Z's register at
+            // the load position, so Z's live range must start there
+            LiveRange& zr = range(z_slot);
+            if (zr.first_live > i) {
+                zr.first_live = i;
+                zr.starts_at_def = true;
+            }
+        }
+        // ranges were extended: regenerate exact sub-intervals so the
+        // retarget's coalescing decisions see the extended birth positions
+        compute_gens();
+    }
+
+    // ------------------------------------------------------------------
+    // Hint retarget (post-assignment coalescing repair).
+    //
+    // The linear scan assigns hulls, so a loop phi (hull wraps the whole
+    // loop) never lands on the same register as its source value (hull
+    // nested inside). The exact liveness (gens) says they can share: the
+    // phi's old generation ends exactly where the source's begins. Move
+    // one partner onto the other's register when the pair is gen-disjoint
+    // and no third range claims the register in between.
+    // ------------------------------------------------------------------
+    bool try_retarget(i32 move, i32 onto) {
+        LiveRange& m = range(move);
+        LiveRange& o = range(onto);
+        R reg = o.assigned;
+        if (m.fp != o.fp) return false;
+        if (m.crosses_call && !reg_is_callee_saved_gpr(reg)) return false;
+        // exact liveness of the pair must be disjoint — with one exception:
+        // a TOUCHING boundary (one gen's end == the other's start) is a
+        // value handover in a single instruction ([mov Z, X] reads the old
+        // and writes the new; a coalesced two-operand op does the same),
+        // not an interference.
+        auto touch = [](const std::pair<size_t, size_t>& a,
+                        const std::pair<size_t, size_t>& b) {
+            return a.first <= b.second && b.first <= a.second;
+        };
+        for (const auto& g1 : m.gens)
+            for (const auto& g2 : o.gens) {
+                if (!touch(g1, g2)) continue;
+                if (g1.second == g2.first || g2.second == g1.first) continue;
+                return false; // genuine overlap
+            }
+        // no third range on the register may overlap the mover's hull
+        for (LiveRange& u : ranges) {
+            if (&u == &m || &u == &o) continue;
+            if (!u.promoted || u.assigned != reg) continue;
+            if (u.last_live >= m.first_live && u.first_live <= m.last_live)
+                return false;
+        }
+        m.assigned = reg;
+        return true;
+    }
+
+    void retarget() {
+#ifdef JULES_DEBUG_RA3
+        for (const Fuse& f : fuses_)
+            std::fprintf(stderr, "[ra3] fuse load@%zu store@%zu a=s%d z=s%d fp=%d ops=%u inpl=%d\n",
+                         f.load_pos, f.store_pos, f.a_slot, f.z_slot, (int)f.fp, f.ops,
+                         (int)f.inplace_ok);
+#endif
+        for (auto& h : hints_) {
+            if (h.first == h.second) continue;
+            LiveRange& z = range(h.first);
+            LiveRange& a = range(h.second);
+            if (!z.defined || !a.defined) continue;
+            if (!z.promoted || !a.promoted) continue;
+            if (z.assigned == a.assigned) continue;
+            bool r1 = try_retarget(h.first, h.second);
+            bool r2 = r1 ? false : try_retarget(h.second, h.first);
+            if (r1 || r2) {
+                ++lf.ra_coalesced;
+#ifdef JULES_DEBUG_RA3
+                std::fprintf(stderr, "[ra3] coalesce s%d<-s%d: s%d -> reg %d\n", h.first, h.second,
+                             r1 ? h.first : h.second,
+                             (int)range(r1 ? h.first : h.second).assigned);
+#endif
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Liveness: backward dataflow over the emitted blocks, then a
@@ -263,7 +634,12 @@ struct Allocator {
         // the promotion logic (and dead-store cleanup) treats it as dead.
         for (LiveRange& r : ranges) {
             if (r.first_live == SIZE_MAX) r.first_live = r.last_live;
+            r.starts_at_def =
+                r.defined && r.first_live < lf.code.size() &&
+                slot_def_at(lf.code[r.first_live]);
         }
+
+        compute_gens();
 
         // Backedge detection on the linear stream: a jump to an earlier
         // label. A live range that spans a backedge is loop-carried — the
@@ -333,18 +709,72 @@ struct Allocator {
     // for everything: fewer live push/pop pairs trade a little speed for
     // smaller frames and prologues.
     void assign(bool size_biased) {
-        const R gp_caller[] = {R::R10, R::R11};
         const R gp_callee[] = {R::Rbx, R::R12, R::R13, R::R14, R::R15};
-        // xmm2-13: all XMMs are caller-saved in SysV, so these are only
-        // usable for ranges that do not cross calls; xmm14-15 are reserved
-        // for the isel constant pool.
-        const R xmm[] = {R::Xmm2, R::Xmm3, R::Xmm4, R::Xmm5,  R::Xmm6,  R::Xmm7,
-                         R::Xmm8, R::Xmm9, R::Xmm10, R::Xmm11, R::Xmm12, R::Xmm13};
+        // xmm2..: all XMMs are caller-saved in SysV, so these are only
+        // usable for ranges that do not cross calls. The isel FP constant
+        // pool owns the top of the bank down to lf.fp_const_min_xmm (it
+        // grows from xmm15 when the function has distinct loop constants —
+        // a bigger pool trades allocatable registers for zero per-iteration
+        // rematerialization, which is the right trade for FP-heavy loops).
+        int xmm_hi = lf.fp_const_min_xmm;
+        if (xmm_hi > 14) xmm_hi = 14; // pool unused: 14/15 stay reserved
+        if (xmm_hi < 3) xmm_hi = 3;   // degenerate: keep at least xmm2
+        const R xmm_fixed[] = {R::Xmm2,  R::Xmm3,  R::Xmm4,  R::Xmm5,  R::Xmm6,
+                              R::Xmm7,  R::Xmm8,  R::Xmm9,  R::Xmm10, R::Xmm11,
+                              R::Xmm12, R::Xmm13};
+        const size_t xmm_n = static_cast<size_t>(xmm_hi - 2);
 
         // Caller-saved pool: usable only for non-crossing GPR ranges.
-        RegPool caller_pool(gp_caller, sizeof gp_caller / sizeof gp_caller[0]);
+        // In functions with no calls at all, the argument registers are
+        // dead isel territory — nothing ever writes them after the
+        // prologue parameter spill (which only READS them). Scanning the
+        // emitted stream for actual writes and adopting every untouched
+        // argument register relieves exactly the pressure that hurts
+        // multi-loop kernels (7+ simultaneously live values vs the 7
+        // registers the base pools offer). rax/rcx stay out: Setcc/MovZX
+        // and the div/shift contracts write them unconditionally.
+        R extra_caller[5];
+        u8 n_extra = 0;
+        {
+            const R cand[] = {R::Rdx, R::Rsi, R::Rdi, R::R8, R::R9};
+            auto writes_reg = [&](const Inst& q, R c) {
+                auto dst = [&](const Operand& o) {
+                    return o.k == Operand::K::Reg && o.reg == c;
+                };
+                switch (q.op) {
+                    case IOp::MovRR: case IOp::MovSR: case IOp::MovRImm:
+                    case IOp::ArithRR: case IOp::ArithRImm:
+                    case IOp::ShiftImm: case IOp::ShiftCl:
+                    case IOp::Neg: case IOp::Not: case IOp::Cmov:
+                    case IOp::LoadMem: case IOp::LeaSlot: case IOp::LeaSym:
+                    case IOp::SExt32:
+                        return dst(q.a);
+                    case IOp::Cqo: return c == R::Rdx;
+                    case IOp::IDiv: case IOp::UDiv:
+                        return c == R::Rax || c == R::Rdx;
+                    case IOp::CallFn: case IOp::CallSym: case IOp::TailCallFn:
+                        return true; // clobbers every caller-saved register
+                    default:
+                        return false; // FP ops / stores / labels / branches
+                }
+            };
+            for (R c : cand) {
+                bool clean = true;
+                for (const Inst& q : lf.code) {
+                    if (writes_reg(q, c)) { clean = false; break; }
+                }
+                if (clean) extra_caller[n_extra++] = c;
+            }
+        }
+        std::vector<R> caller_list;
+        caller_list.push_back(R::R10);
+        caller_list.push_back(R::R11);
+        for (u8 e = 0; e < n_extra; ++e) caller_list.push_back(extra_caller[e]);
+        RegPool caller_pool(caller_list.data(), caller_list.size());
         RegPool callee_pool(gp_callee, sizeof gp_callee / sizeof gp_callee[0]);
-        RegPool xmm_pool(xmm, sizeof xmm / sizeof xmm[0]);
+        RegPool xmm_pool(xmm_fixed, xmm_n < sizeof xmm_fixed / sizeof xmm_fixed[0]
+                                         ? xmm_n
+                                         : sizeof xmm_fixed / sizeof xmm_fixed[0]);
         // A register in the caller pool that is also used by the callee pool
         // never happens (disjoint lists).
 
@@ -365,9 +795,19 @@ struct Allocator {
         std::vector<Active> active;
 
         for (LiveRange* r : order) {
-            // expire: ranges that ended before this one starts
+            // expire: ranges that ended before this one starts. A range
+            // whose FIRST activity is a def may start exactly at another
+            // range's final use (the fused [mov Z, A] reads A and writes Z
+            // in one instruction — and a coalesced op reads the old value
+            // and writes the new one in the same instruction), so the
+            // touching case `u.last_live == r.first_live` is a handover,
+            // not an interference — but only when the newcomer begins
+            // with a def. A newcomer that begins with a USE genuinely
+            // overlaps (both values live at that position).
             for (Active& a : active) {
                 if (a.r->last_live < r->first_live) a.dead = true;
+                else if (a.r->last_live == r->first_live && r->starts_at_def)
+                    a.dead = true;
             }
             // (mark-then-sweep to keep indices stable)
             std::vector<Active> keep;
@@ -447,68 +887,7 @@ struct Allocator {
     }
 
     void rewrite() {
-        // Store-load pair folding (the pass-86 patterns, applied BEFORE the
-        // promotion rewrite: an adjacent same-register store+load pair costs
-        // ZERO instructions when folded, but ONE move when promoted — for
-        // single-use values the fold strictly dominates promotion. This also
-        // feeds the frame-elision decision (post-fold stream).
- //     [mov [s], reg][mov reg', [s]] -> [mov reg', reg] when s is not read later
-        //     [movq $imm, [s]][mov reg', [s]] -> [movq $imm, reg'] likewise
-        //     same-register pair -> nothing at all
-        auto slot_read_after = [&](size_t from, i32 s) {
-            for (size_t j = from; j < lf.code.size(); ++j) {
-                const Inst& c = lf.code[j];
-                if ((c.op == IOp::MovSR || c.op == IOp::MovFpR) &&
-                    c.b.k == Operand::K::Slot && c.b.slot == s)
-                    return true;
-            }
-            return false;
-        };
-        for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
-            Inst& cur = lf.code[i];
-            Inst& nxt = lf.code[i + 1];
-            if (cur.op == IOp::MovFpS && cur.b.k == Operand::K::Slot &&
-                nxt.op == IOp::MovFpR && nxt.b.k == Operand::K::Slot &&
-                nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
-                nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.b.slot)) {
-                if (nxt.a.reg != cur.a.reg) {
-                    cur.op = IOp::MovFpFp;
-                    cur.a.reg = nxt.a.reg; // dst
-                    cur.b.k = Operand::K::Reg;
-                } else {
-                    cur.op = IOp::Nop;
-                }
-                nxt.op = IOp::Nop;
-                continue;
-            }
-            if (cur.op == IOp::MovRS && cur.b.k == Operand::K::Slot &&
-                nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
-                nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
-                nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.b.slot)) {
-                if (nxt.a.reg != cur.a.reg) {
-                    cur.op = IOp::MovRR;
-                    cur.a.reg = nxt.a.reg; // dst
-                    cur.b.k = Operand::K::Reg;
-                    cur.size = 8;
-                } else {
-                    cur.op = IOp::Nop;
-                }
-                nxt.op = IOp::Nop;
-                continue;
-            }
-            if (cur.op == IOp::MovSImm && cur.a.k == Operand::K::Slot &&
-                nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
-                nxt.b.slot == cur.a.slot && nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.a.slot)) {
-                cur.op = IOp::MovRImm;
-                cur.a.k = Operand::K::Reg;
-                cur.a.reg = nxt.a.reg;
-                nxt.op = IOp::Nop;
-                continue;
-            }
-        }
+        // (pair folding ran before liveness analysis — see run())
 
         for (Inst& i : lf.code) {
             if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot) {
@@ -564,7 +943,9 @@ struct Allocator {
         // into xmm0/xmm1 via MovFpFp (after promotion). A register-resident
         // source feeding the fixed src register can fold straight into the
         // consumer's operand, killing the movsd: SSE is two-operand, and
-        // FpBin/FpCmp/FpNeg take real register operands now.
+        // FpBin/FpCmp/FpNeg take real register operands now. FpCmp is
+        // non-destructive (flags only), so its *destination* operand folds
+        // too: [movsd xmm0, X][ucomisd xmm1, xmm0] -> [ucomisd xmm1, X].
         for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
             Inst& mov = lf.code[i];
             Inst& use = lf.code[i + 1];
@@ -573,11 +954,137 @@ struct Allocator {
                 continue;
             IOp consumer = use.op;
             if (consumer != IOp::FpBin && consumer != IOp::FpCmp) continue;
-            // the mov must be loading the consumer's SOURCE register
-            if (use.b.k != Operand::K::Reg || use.b.reg != mov.a.reg) continue;
-            if (mov.b.reg == use.a.reg) continue; // would alias dst and src
-            use.b.reg = mov.b.reg;
-            mov.op = IOp::Nop;
+            // B-side: the mov loads the consumer's SOURCE register
+            if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
+                mov.b.reg != use.a.reg) {
+                use.b.reg = mov.b.reg;
+                mov.op = IOp::Nop;
+                continue;
+            }
+            // A-side (non-destructive compare only)
+            if (consumer == IOp::FpCmp && use.a.k == Operand::K::Reg &&
+                use.a.reg == mov.a.reg &&
+                !(use.b.k == Operand::K::Reg && use.b.reg == mov.b.reg)) {
+                use.a.reg = mov.b.reg;
+                mov.op = IOp::Nop;
+            }
+        }
+
+        // GP operand folding (mirror of the FP fold): the isel contract
+        // loads ArithRR/CmpRR operands into rax (destination) / rcx
+        // (source). A register-resident source feeding the fixed scratch
+        // register folds straight into the consumer's operand, killing the
+        // mov — compare/branch pairs collapse to `cmp %reg, %reg` with no
+        // setup moves, and binary ops read their operands directly out of
+        // promoted registers. CmpRR/Test are non-destructive (flags), so
+        // the destination operand folds as well.
+        for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
+            Inst& mov = lf.code[i];
+            Inst& use = lf.code[i + 1];
+            if (mov.op != IOp::MovRR || mov.a.k != Operand::K::Reg ||
+                mov.b.k != Operand::K::Reg)
+                continue;
+            // only isel scratch targets: never touch allocator-homed moves
+            if (mov.a.reg != R::Rax && mov.a.reg != R::Rcx) continue;
+            if (use.op == IOp::ArithRR) {
+                if (use.b.k != Operand::K::Reg || use.b.reg != mov.a.reg) continue;
+                if (mov.b.reg == use.a.reg) continue; // would alias dst/src
+                use.b.reg = mov.b.reg;
+                mov.op = IOp::Nop;
+            } else if (use.op == IOp::CmpRR) {
+                if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
+                    mov.b.reg != use.a.reg) {
+                    use.b.reg = mov.b.reg; // B-side
+                    mov.op = IOp::Nop;
+                } else if (use.a.k == Operand::K::Reg && use.a.reg == mov.a.reg &&
+                           !(use.b.k == Operand::K::Reg && use.b.reg == mov.b.reg)) {
+                    use.a.reg = mov.b.reg; // A-side (non-destructive)
+                    mov.op = IOp::Nop;
+                }
+            } else if (use.op == IOp::Test) {
+                if (use.a.k == Operand::K::Reg && use.a.reg == mov.a.reg) {
+                    use.a.reg = mov.b.reg;
+                    mov.op = IOp::Nop;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Accumulator-chain fusion (the pre-registered Fuses). Post-
+        // promotion, the chain has one of these shapes:
+        //   [mov acc, X]  (A promoted)   or  [mov acc, [sA]]  (A memory)
+        //   [op acc, ...] xN
+        //   [mov Z, acc]  (Z promoted)   or  [mov [sZ], acc]  (Z memory)
+        // Rewrite, when Z is promoted:
+        //   [mov Z, X][op Z, ...]         (A register-resident)
+        //   [mov Z, [sA]][op Z, ...]      (A memory-resident)
+        // and when Z's register == A's register (hint coalescing landed
+        // AND the load is A's generation's last use), the leading move
+        // disappears entirely: the op runs in place, exactly like the
+        // two-operand forms a production compiler emits. Zero-op chains
+        // (phi copies) whose slots ended up on the same register simply
+        // evaporate — the value is already in the right home.
+        // ------------------------------------------------------------------
+        {
+            u32 fused = 0;
+            for (const Fuse& f : fuses_) {
+                Inst& load = lf.code[f.load_pos];
+                Inst& store = lf.code[f.store_pos];
+                if (load.op == IOp::Nop || store.op == IOp::Nop) continue;
+                const LiveRange& zr = range(f.z_slot);
+                if (!zr.promoted) continue; // result must be register-resident
+                R acc = f.fp ? R::Xmm0 : R::Rax;
+                R Z = zr.assigned;
+                // coalescing may have landed an operand of this very chain
+                // on Z's register (slot-identity is not enough — registers
+                // are shared): the leading [mov Z, X] / in-place op would
+                // clobber the operand before the chain reads it
+                bool operand_on_z = false;
+                for (i32 g : f.gap_slots) {
+                    const LiveRange& gr = range(g);
+                    if (gr.promoted && gr.assigned == Z) { operand_on_z = true; break; }
+                }
+                if (operand_on_z) continue;
+
+                // A's home: register X or memory slot
+                bool a_is_reg = (load.op == (f.fp ? IOp::MovFpFp : IOp::MovRR)) &&
+                                load.a.k == Operand::K::Reg && load.a.reg == acc &&
+                                load.b.k == Operand::K::Reg;
+                R X = a_is_reg ? load.b.reg : R::Rax;
+
+                bool same_reg = a_is_reg && X == Z;
+                if (same_reg && f.ops > 0 && !f.inplace_ok) continue;
+                // (in-place would clobber A while its old value still has
+                // readers; the copy form degenerates to a self-move)
+
+                // retarget every chain op from the accumulator to Z
+                for (size_t k = f.load_pos + 1; k < f.store_pos; ++k) {
+                    Inst& c = lf.code[k];
+                    if (c.op == IOp::Nop) continue;
+                    if (c.a.k == Operand::K::Reg && c.a.reg == acc) c.a.reg = Z;
+                }
+
+                if (same_reg) {
+                    // in place: no leading move at all
+                    load.op = IOp::Nop;
+                } else if (a_is_reg) {
+                    load.op = f.fp ? IOp::MovFpFp : IOp::MovRR;
+                    load.a.k = Operand::K::Reg;
+                    load.a.reg = Z;          // dst
+                    load.b.k = Operand::K::Reg;
+                    load.b.reg = X;          // src (unchanged)
+                } else {
+                    // A memory-resident: load straight into Z
+                    load.a.reg = Z;          // (op stays MovSR / MovFpR)
+                }
+                store.op = IOp::Nop;         // the result is already home
+                ++fused;
+#ifdef JULES_DEBUG_RA3
+                std::fprintf(stderr, "[ra3] fuse APPLIED a=s%d(z=s%d) same=%d Z=%d X=%d\n",
+                             f.a_slot, f.z_slot, (int)same_reg, (int)Z, (int)X);
+#endif
+            }
+            lf.ra_fused += fused;
         }
 
         // Dead-def stores: slots that are defined but never read keep a
@@ -608,10 +1115,17 @@ struct Allocator {
             if (r.promoted && reg_is_callee_saved_gpr(r.assigned))
                 callee_used.push_back(r.assigned);
         }
-        // stable order (rbx, r12..r15) for deterministic frames
-        std::sort(callee_used.begin(), callee_used.end(), [](R a, R b) {
-            return static_cast<int>(a) < static_cast<int>(b);
-        });
+        // Several promoted ranges can share one callee-saved register (hint
+        // coalescing / pool reuse). Each physical register is saved exactly
+        // once: a duplicate push would shift every rbp-relative slot below
+        // it and double every restore.
+        {
+            std::sort(callee_used.begin(), callee_used.end(), [](R a, R b) {
+                return static_cast<int>(a) < static_cast<int>(b);
+            });
+            callee_used.erase(std::unique(callee_used.begin(), callee_used.end()),
+                              callee_used.end());
+        }
 
         // ---- rebuild the instruction stream ----
         std::vector<Inst> out;
@@ -764,9 +1278,12 @@ struct Allocator {
             lf.frame_size = 16;
             return false;
         }
-        analyze();
+        pair_fold();      // same-slot store/load adjacency — before analysis
+        analyze();        // ranges, generations, exact sub-intervals
+        extract_fuses();  // accumulator chains + coalescing hints
         assign(size_biased);
-        rewrite();
+        retarget();       // unify hinted pairs onto shared registers
+        rewrite();        // promotion + operand folds + fuse application
         finalize();
         return lf.ra_promoted > 0;
     }

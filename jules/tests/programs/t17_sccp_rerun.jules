@@ -1,0 +1,21 @@
+fn acc(n: i64) -> i64 {
+    let cell: *mut i64 = alloc(i64);
+    *cell = 0;
+    var i: i64 = 0;
+    var total: i64 = 100;
+    while i < n {
+        *cell = *cell + i * 3;
+        total = total + *cell;
+        i = i + 1;
+    }
+    let out: i64 = *cell;
+    free(cell);
+    return total * 1000 + out;
+}
+
+fn main() -> i64 {
+    print(acc(20 as i64));
+    print(acc(0 as i64));
+    print(acc(1 as i64));
+    return 0 as i64;
+}

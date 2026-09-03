@@ -63,10 +63,8 @@ public:
                 if (uo == Op::IfTrue) tproj = u;
                 if (uo == Op::IfFalse) fproj = u;
             }
-            if (tproj != kNoNode && fproj != kNoNode) {
-                mark_exec(tproj);
-                mark_exec(fproj);
-            }
+            if (tproj != kNoNode) mark_exec(tproj);
+            if (fproj != kNoNode) mark_exec(fproj);
         }
         return rewrite();
     }
@@ -264,12 +262,18 @@ private:
                     if (g_.node(u).op == Op::IfTrue) tproj = u;
                     if (g_.node(u).op == Op::IfFalse) fproj = u;
                 }
-                if (tproj == kNoNode || fproj == kNoNode) return;
+                // A re-run can see an If whose dead projection was already
+                // killed by a previous SCCP sweep (constant-branch rewrite).
+                // The surviving projection must still become executable —
+                // bailing out here starves every downstream block of
+                // executability and the pred-trim then decapitates reachable
+                // code (observed: an inlined loop losing its ENTRY edge).
                 if (c.kind == Lat::Const) {
-                    mark_exec(c.v.iv != 0 ? tproj : fproj);
+                    NodeId taken = c.v.iv != 0 ? tproj : fproj;
+                    if (taken != kNoNode) mark_exec(taken);
                 } else {
-                    mark_exec(tproj);
-                    mark_exec(fproj);
+                    if (tproj != kNoNode) mark_exec(tproj);
+                    if (fproj != kNoNode) mark_exec(fproj);
                 }
                 return;
             }

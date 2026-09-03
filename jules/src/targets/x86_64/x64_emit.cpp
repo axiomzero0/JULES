@@ -104,15 +104,17 @@ struct Emitter {
     }
 
     // ---- FP constant pool ------------------------------------------------
-    // f64/f32 constants are materialized into the high XMM bank (xmm8-15):
-    // never used for argument passing (SysV vector args use xmm0-7), never
-    // assigned by the register allocator (pool = xmm2-7), and dead across
-    // nothing except calls, where the cache is invalidated and the constant
-    // re-materialized — a loop without calls sees one materialization total
-    // instead of one per use per iteration.
+    // f64/f32 constants are materialized into the high XMM bank, growing down
+    // from xmm15. The bank is never used for argument passing (SysV vector
+    // args use xmm0-7) and dead across nothing except calls, where the cache
+    // is invalidated and the constant re-materialized — a loop without calls
+    // sees one materialization total instead of one per use per iteration.
+    // The pool watermark (lf_.fp_const_min_xmm) tells the register allocator
+    // where to stop so the two never collide: with few live FP values the
+    // pool grows (more loop constants cached), with many it stays small.
     R fp_const_reg(u64 bits, u8 size) {
         if (const R* r = fp_const_cache_.find(bits)) return *r;
-        if (next_const_xmm_ > 15) {
+        if (next_const_xmm_ < 8) {
             // pool exhausted: re-materialize per use; the loop-invariant
             // hoist in pass 87 moves repeated materializations out of
             // loops, so per-iteration cost stays bounded
@@ -122,15 +124,17 @@ struct Emitter {
             (void)size;
             return R::Xmm1;
         }
-        R reg = static_cast<R>(static_cast<int>(R::Xmm0) + next_const_xmm_++);
+        R reg = static_cast<R>(static_cast<int>(R::Xmm0) + next_const_xmm_--);
         fp_const_cache_.insert(bits, reg);
+        int idx = static_cast<int>(reg) - static_cast<int>(R::Xmm0);
+        if (idx < lf_.fp_const_min_xmm) lf_.fp_const_min_xmm = idx;
         imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
         Inst& mv = reg2(IOp::MovFpFromGpr, reg, R::Rax);
         (void)mv;
         (void)size;
         return reg;
     }
-    void invalidate_fp_consts() { fp_const_cache_.clear(); next_const_xmm_ = 14; }
+    void invalidate_fp_consts() { fp_const_cache_.clear(); next_const_xmm_ = 15; }
 
     // ---- emit shorthands --------------------------------------------------------
     Inst& emit(IOp op) {
@@ -209,6 +213,14 @@ struct Emitter {
         const Node& nd = g_.node(n);
         u8 size = sz_of(nd.ty);
         if (nd.op == Op::Const) {
+            if (nd.fval == 0.0) {
+                // +0.0: one xorpd instead of a pool slot + a move
+                Inst& z = emit(IOp::FpZero);
+                z.a.k = Operand::K::Reg;
+                z.a.reg = r;
+                z.size = size;
+                return;
+            }
             u64 bits = 0;
             if (size == 8) {
                 std::memcpy(&bits, &nd.fval, sizeof bits);
@@ -802,7 +814,7 @@ struct Emitter {
     Graph& g_;
     SymbolTable& syms_;
     FlatMap<u64, R> fp_const_cache_;
-    int next_const_xmm_ = 14;
+    int next_const_xmm_ = 15;
 };
 
 } // namespace
@@ -1391,6 +1403,23 @@ bool x64_branch_fusion(LFunction& lf) {
 
 bool x64_machine_peephole(LFunction& lf) {
     bool changed = false;
+    // Linear dead code: after an unconditional control transfer (jmp /
+    // leave;jmp / leave;ret / ret) nothing is reachable until the next
+    // label. TCO rewriting and epilogue threading leave zombie blocks
+    // there (e.g. the original return path after a tail-call conversion).
+    {
+        bool dead = false;
+        for (Inst& c : lf.code) {
+            if (c.op == IOp::Label) { dead = false; continue; }
+            if (dead) {
+                if (c.op != IOp::Nop) { c.op = IOp::Nop; changed = true; }
+                continue;
+            }
+            if (false && (c.op == IOp::Jmp || c.op == IOp::Ret || c.op == IOp::RetNaked ||
+                c.op == IOp::TailCallFn || c.op == IOp::TailCallNaked))
+                dead = true;
+        }
+    }
     for (Inst& i : lf.code) {
         if (i.op == IOp::CmpRImm && i.b.k == Operand::K::Imm && i.b.imm == 0 &&
             i.a.k == Operand::K::Reg) {
@@ -1560,6 +1589,10 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::MovFpFromGpr32: os << "\tmovd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFp:
             os << "\tmov" << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        case IOp::FpZero:
+            os << (i.size == 8 ? "\txorpd " : "\txorps ") << r(i.a.reg) << ", "
+               << r(i.a.reg) << "\n";
             break;
         case IOp::PushCal: os << "\tpushq " << r(i.a.reg) << "\n"; break;
         case IOp::PopCal: os << "\tpopq " << r(i.a.reg) << "\n"; break;

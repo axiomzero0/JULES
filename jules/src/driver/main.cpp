@@ -130,12 +130,18 @@ int run(int argc, char** argv) {
 
     // JIT compile-latency budget caps the effective level (spec §12); the
     // requested level is preserved for reporting. Not an execution tier.
-    opts.level = cap_level_for_jit(opts.jit_budget, opts.requested_level);
-    if (opts.level != opts.requested_level)
-        std::fprintf(stderr, "note: --jit-budget=%s caps effective level %s -> %s\n",
-                     opts.jit_budget == JitBudget::Fast ? "fast"
-                     : opts.jit_budget == JitBudget::Balanced ? "balanced" : "peak",
-                     opt_level_name(opts.requested_level), opt_level_name(opts.level));
+    // AOT compilation has no runtime compile latency, so the budget only
+    // engages for the JIT modes.
+    if (opts.mode == CompileMode::AOT) {
+        opts.level = opts.requested_level;
+    } else {
+        opts.level = cap_level_for_jit(opts.jit_budget, opts.requested_level);
+        if (opts.level != opts.requested_level)
+            std::fprintf(stderr, "note: --jit-budget=%s caps effective level %s -> %s\n",
+                         opts.jit_budget == JitBudget::Fast ? "fast"
+                         : opts.jit_budget == JitBudget::Balanced ? "balanced" : "peak",
+                         opt_level_name(opts.requested_level), opt_level_name(opts.level));
+    }
 
     if (list_passes) {
         std::vector<Pass*> all = PassRegistry::instance().create_all();
