@@ -300,11 +300,17 @@ struct Allocator {
         bool fp = false;
         u32 ops = 0;           // chain-op count (0 = pure phi copy)
         bool inplace_ok = false; // the load is sA's generation's last use
-        SmallVec<i32, 8> gap_slots; // memory-resident operand loads in the
-                                    // window; their registers must not end
-                                    // up equal to Z (coalescing can do that
-                                    // — the leading move would clobber the
-                                    // operand before the op reads it)
+        bool self_update = false; // sZ == sA: the chain updates its own
+                                  // accumulator slot in place (a = a*c + d)
+        size_t first_op_pos = SIZE_MAX; // first acc-WRITING op position (a
+                                  // gap reading sZ before it sees the old
+                                  // value; after it, the new one)
+        SmallVec<std::pair<i32, size_t>, 8> gap_slots; // (slot, position) of
+                                  // memory-resident operand loads in the
+                                  // window; their registers must not end
+                                  // up equal to Z (coalescing can do that
+                                  // — the leading move would clobber the
+                                  // operand before the op reads it)
     };
     std::vector<Fuse> fuses_;
     std::vector<std::pair<i32, i32>> hints_; // (z, a): z wants a's register
@@ -315,9 +321,15 @@ struct Allocator {
         if (i.a.k != Operand::K::Reg) return false;
         if (fp) {
             if (i.a.reg != R::Xmm0) return false;
+            // A snapshot store of an INTERMEDIATE chain result keeps the
+            // accumulator value intact (the pair fold already removed the
+            // adjacent reload, or a later reload is a legal gap load): the
+            // chain continues through it. Retargeted to Z like the ops.
+            if (i.op == IOp::MovFpS) return i.b.k == Operand::K::Slot;
             return i.op == IOp::FpBin || i.op == IOp::FpNeg;
         }
         if (i.a.reg != R::Rax) return false;
+        if (i.op == IOp::MovRS) return i.b.k == Operand::K::Slot; // snapshot store
         switch (i.op) {
             case IOp::ArithRR:
             case IOp::ArithRImm:
@@ -331,9 +343,15 @@ struct Allocator {
         }
     }
 
-    // A "gap" instruction between chain ops: loads the next op's B
-    // operand into the fixed source scratch, never touches the
-    // accumulator.
+    // A "gap" instruction between chain ops: never reads or writes the
+    // accumulator, and writes only non-allocator registers (scratch or the
+    // const pool) — so the fused op running on Z cannot interact with it.
+    //   * B-operand loads into the fixed source scratch (mov rcx/xmm1, ...)
+    //   * FP constant materialization pairs [movq $bits, %rax][movq %rax,
+    //     %xmmN(pool)] — present inside loops at RA time; pass 87 hoists
+    //     them out afterwards, but the chain must survive them NOW or the
+    //     a-chain of `a = a*c + d` never fuses
+    //   * FpZero (+0.0 materialization into the scratch)
     bool is_gap_ok(const Inst& i, bool fp) const {
         if (i.op == IOp::Nop) return true;
         if (i.a.k != Operand::K::Reg) return false;
@@ -341,10 +359,14 @@ struct Allocator {
         if (i.a.reg == acc) return false;
         if (i.b.k == Operand::K::Reg && i.b.reg == acc) return false;
         switch (i.op) {
-            case IOp::MovRR:  // B-operand load (GP): mov rcx, X
-            case IOp::MovSR:  // B-operand load (GP, memory): mov rcx, [s]
+            case IOp::MovRR:   // B-operand load (GP): mov rcx, X
+            case IOp::MovSR:   // B-operand load (GP, memory): mov rcx, [s]
             case IOp::MovFpFp: // B-operand load (FP): movsd xmm1, X
-            case IOp::MovFpR: // B-operand load (FP, memory)
+            case IOp::MovFpR:  // B-operand load (FP, memory)
+            case IOp::MovRImm:      // FP const bits into rax (never the FP acc)
+            case IOp::MovFpFromGpr: // FP const bits: rax -> pool xmm
+            case IOp::MovFpFromGpr32:
+            case IOp::FpZero:       // +0.0 into the scratch
                 return true;
             default:
                 return false;
@@ -376,37 +398,87 @@ struct Allocator {
             // (B-operand loads into the fixed source scratch) are legal
             // before the first op too — the isel emits [load A][load B]
             // [op] [store], so the operand load precedes the chain.
+            // Snapshot stores [store s_mid <- acc] are chain elements:
+            // they read the accumulator without clobbering it (an adjacent
+            // reload was already pair-folded; a later reload is a legal
+            // gap). The chain TERMINATES at the last store in the run —
+            // the walk only breaks at non-chain non-gap instructions, so
+            // at most trailing gaps sit between the terminal store and the
+            // break; they belong to FOLLOWING nodes and must not join the
+            // fuse window (a trailing gap loading sZ is a legitimate
+            // post-store use, not an operand clobber).
             size_t j = i + 1;
-            u32 ops = 0;
-            SmallVec<i32, 8> gap_slots;
+            u32 ops = 0;                    // acc-WRITING ops only (stores excluded:
+            size_t first_write_pos = SIZE_MAX; // stores never clobber the accumulator
+            size_t last_store_pos = SIZE_MAX; // terminal (or snapshot) store
+            SmallVec<std::pair<i32, size_t>, 8> gap_slots;
             while (j < lf.code.size()) {
                 const Inst& c = lf.code[j];
                 if (c.op == IOp::Nop) { ++j; continue; }
-                if (is_chain_op(c, fp)) { ++ops; ++j; continue; }
+                if (is_chain_op(c, fp)) {
+                    bool is_store = (c.op == IOp::MovFpS || c.op == IOp::MovRS);
+                    if (is_store) {
+                        last_store_pos = j;
+                    } else {
+                        ++ops;
+                        if (first_write_pos == SIZE_MAX) first_write_pos = j;
+                    }
+                    ++j;
+                    continue;
+                }
                 if (is_gap_ok(c, fp)) {
                     // remember memory-resident operand loads: if the chain
                     // reads the RESULT slot as an operand (`x = y + x`),
                     // the fused leading move would clobber it before the op
-                    if (c.b.k == Operand::K::Slot) gap_slots.push_back(c.b.slot);
+                    if (c.b.k == Operand::K::Slot)
+                        gap_slots.push_back({c.b.slot, j});
                     ++j;
                     continue;
                 }
                 break;
             }
-            if (j >= lf.code.size()) continue;
+            size_t t = last_store_pos;
+            if (t == SIZE_MAX) {
+                // BISECT fallback: terminal = store at the break position
+                if (j < lf.code.size() && (lf.code[j].op == IOp::MovFpS ||
+                                           lf.code[j].op == IOp::MovRS))
+                    t = j;
+                else continue;
+            }
+            // trailing gaps after the terminal store: outside the window
+            {
+                SmallVec<std::pair<i32, size_t>, 8> inside;
+                for (const auto& g : gap_slots)
+                    if (g.second < t) inside.push_back(g);
+                gap_slots = inside;
+            }
             // terminal: slot-store from the same accumulator
-            const Inst& stt = lf.code[j];
+            const Inst& stt = lf.code[t];
             bool sfp = stt.op == IOp::MovFpS;
             if (stt.op != IOp::MovRS && stt.op != IOp::MovFpS) continue;
             if (stt.b.k != Operand::K::Slot) continue;
             if (sfp != fp) continue;                     // class must match
             if (!is_acc(stt.a.reg, fp)) continue;
             i32 z_slot = stt.b.slot;
-            if (z_slot == a_slot) continue;             // pair-fold territory
-            // the result slot must not feed the chain as an operand
-            for (i32 g : gap_slots)
-                if (g == z_slot) { z_slot = -1; break; }
-            if (z_slot < 0) continue;
+            size_t j_end = t; // fuse window end (retarget loop bound)
+            // Self-update chains (z == a: `a = a*c + d` through the phi
+            // slot itself) fuse IN PLACE only — the copy form degenerates
+            // to a self-move. A gap reading the accumulator slot is legal
+            // only BEFORE the first chain op (old-value read); after the
+            // first op writes Z, a gap would see the new value instead.
+            bool self_update = (z_slot == a_slot);
+            bool z_gap_after_first_op = false;
+            for (const auto& g : gap_slots)
+                if (g.first == z_slot && g.second > first_write_pos)
+                    { z_gap_after_first_op = true; break; }
+            if (z_gap_after_first_op) continue;
+            // the result slot must not feed the chain as an operand for
+            // distinct-slot chains (leading-move clobber; see rewrite)
+            if (!self_update) {
+                for (const auto& g : gap_slots)
+                    if (g.first == z_slot) { z_slot = -1; break; }
+                if (z_slot < 0) continue;
+            }
 
             // In-place validity: the load must be sA's generation's LAST
             // use — after the fused op clobbers the register, sA's old
@@ -419,12 +491,14 @@ struct Allocator {
 
             Fuse fz;
             fz.load_pos = i;
-            fz.store_pos = j;
+            fz.store_pos = j_end;
             fz.a_slot = a_slot;
             fz.z_slot = z_slot;
             fz.fp = fp;
             fz.ops = ops;
             fz.inplace_ok = last_of_gen;
+            fz.self_update = self_update;
+            fz.first_op_pos = first_write_pos;
             fz.gap_slots = gap_slots;
             fuses_.push_back(fz);
             // Coalescing hints: a phi copy (ops == 0) closes the loop cycle
@@ -434,14 +508,19 @@ struct Allocator {
             // across a backedge is re-read on every dynamic iteration, and
             // an in-place op would clobber it before those re-reads (the
             // static "last use" lies — the use itself re-executes).
-            if (ops == 0 || !range(a_slot).spans_backedge)
+            // Self-update chains need no hint: A and Z are the same slot,
+            // already on one register by construction.
+            if (!self_update && (ops == 0 || !range(a_slot).spans_backedge))
                 hints_.push_back({z_slot, a_slot});
             // range extension: the fused [mov Z, A] writes Z's register at
             // the load position, so Z's live range must start there
-            LiveRange& zr = range(z_slot);
-            if (zr.first_live > i) {
-                zr.first_live = i;
-                zr.starts_at_def = true;
+            // (self-update: the load already reads the slot, no extension)
+            if (!self_update) {
+                LiveRange& zr = range(z_slot);
+                if (zr.first_live > i) {
+                    zr.first_live = i;
+                    zr.starts_at_def = true;
+                }
             }
         }
         // ranges were extended: regenerate exact sub-intervals so the
@@ -886,13 +965,41 @@ struct Allocator {
         }
     }
 
+    // Slot use positions (collected pre-promotion, when operands still
+    // carry Slot ids) and promoted home-store positions (collected during
+    // the promotion loop). Together they drive single-use def forwarding:
+    // a promoted value with exactly one use whose load the operand folds
+    // already absorbed — its home store can die and the consumer can read
+    // the value straight from the store's source register.
+    std::vector<std::vector<size_t>> slot_use_pos_;
+    std::vector<std::vector<size_t>> slot_def_pos_;
+    FlatMap<size_t, i32> home_store_;
+    FlatMap<size_t, i32> use_slot_at_; // use position -> the slot it read
+
     void rewrite() {
         // (pair folding ran before liveness analysis — see run())
 
-        for (Inst& i : lf.code) {
+        slot_use_pos_.assign(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0), {});
+        slot_def_pos_.assign(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0), {});
+        home_store_.clear();
+        use_slot_at_.clear();
+        for (size_t p = 0; p < lf.code.size(); ++p) {
+            i32 s = 0;
+            bool f = false, a = false;
+            if (slot_use_inst(lf.code[p], s, f, a)) {
+                slot_use_pos_[static_cast<size_t>(s)].push_back(p);
+                use_slot_at_.insert(static_cast<i32>(p), s);
+            }
+            if (slot_def_inst(lf.code[p], s, f))
+                slot_def_pos_[static_cast<size_t>(s)].push_back(p);
+        }
+
+        for (size_t p = 0; p < lf.code.size(); ++p) {
+            Inst& i = lf.code[p];
             if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot) {
                 const LiveRange& r = range(i.b.slot);
                 if (!r.promoted) continue;
+                home_store_.insert(static_cast<i32>(p), i.b.slot);
                 if (i.op == IOp::MovRS) {
                     // store: mov [slot], reg  ->  mov assigned, reg
                     R src = i.a.reg;
@@ -939,6 +1046,18 @@ struct Allocator {
             }
         }
 
+        // (positional promotion loop ends above)
+
+        // Next live (non-Nop) index at-or-after `from`: folds must look
+        // THROUGH instructions earlier folds killed — adjacency-by-
+        // position alone misses the A-side setup mov once the B-side mov
+        // became a Nop between it and the consumer.
+        auto next_live = [&](size_t from) -> size_t {
+            size_t j = from;
+            while (j < lf.code.size() && lf.code[j].op == IOp::Nop) ++j;
+            return j;
+        };
+
         // FP operand folding: the isel contract loads FpBin/FpCmp operands
         // into xmm0/xmm1 via MovFpFp (after promotion). A register-resident
         // source feeding the fixed src register can fold straight into the
@@ -946,12 +1065,20 @@ struct Allocator {
         // FpBin/FpCmp/FpNeg take real register operands now. FpCmp is
         // non-destructive (flags only), so its *destination* operand folds
         // too: [movsd xmm0, X][ucomisd xmm1, xmm0] -> [ucomisd xmm1, X].
+        // Fixpoint: the isel emits up to two setup movs per consumer
+        // (A-then-B); one pass folds only the LAST one, because killing it
+        // is what makes the earlier one adjacent to the consumer. Loop
+        // until no fold fires (bounded by setup-mov count per inst).
+        for (int round = 0; round < 4; ++round) {
+        bool folded_this_round = false;
         for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
             Inst& mov = lf.code[i];
-            Inst& use = lf.code[i + 1];
             if (mov.op != IOp::MovFpFp || mov.a.k != Operand::K::Reg ||
                 mov.b.k != Operand::K::Reg)
                 continue;
+            size_t ui = next_live(i + 1);
+            if (ui >= lf.code.size()) continue;
+            Inst& use = lf.code[ui];
             IOp consumer = use.op;
             if (consumer != IOp::FpBin && consumer != IOp::FpCmp) continue;
             // B-side: the mov loads the consumer's SOURCE register
@@ -959,6 +1086,7 @@ struct Allocator {
                 mov.b.reg != use.a.reg) {
                 use.b.reg = mov.b.reg;
                 mov.op = IOp::Nop;
+                folded_this_round = true;
                 continue;
             }
             // A-side (non-destructive compare only)
@@ -967,7 +1095,10 @@ struct Allocator {
                 !(use.b.k == Operand::K::Reg && use.b.reg == mov.b.reg)) {
                 use.a.reg = mov.b.reg;
                 mov.op = IOp::Nop;
+                folded_this_round = true;
             }
+        }
+        if (!folded_this_round) break;
         }
 
         // GP operand folding (mirror of the FP fold): the isel contract
@@ -978,34 +1109,147 @@ struct Allocator {
         // setup moves, and binary ops read their operands directly out of
         // promoted registers. CmpRR/Test are non-destructive (flags), so
         // the destination operand folds as well.
+        // Fixpoint (same reason as the FP fold): a consumer with two setup
+        // movs [mov rax, A][mov rcx, B][cmp] only exposes the rax mov after
+        // the rcx mov dies; without the re-run the loop guard kept
+        // `mov %r10, %rax; cmp %rdx, %rax` — the bound never landed in the
+        // compare's operand slot.
+        for (int round = 0; round < 4; ++round) {
+        bool folded_this_round = false;
         for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
             Inst& mov = lf.code[i];
-            Inst& use = lf.code[i + 1];
             if (mov.op != IOp::MovRR || mov.a.k != Operand::K::Reg ||
                 mov.b.k != Operand::K::Reg)
                 continue;
+            size_t ui = next_live(i + 1);
+            if (ui >= lf.code.size()) continue;
+            Inst& use = lf.code[ui];
             // only isel scratch targets: never touch allocator-homed moves
             if (mov.a.reg != R::Rax && mov.a.reg != R::Rcx) continue;
             if (use.op == IOp::ArithRR) {
-                if (use.b.k != Operand::K::Reg || use.b.reg != mov.a.reg) continue;
-                if (mov.b.reg == use.a.reg) continue; // would alias dst/src
-                use.b.reg = mov.b.reg;
-                mov.op = IOp::Nop;
+                if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
+                    mov.b.reg != use.a.reg) {
+                    use.b.reg = mov.b.reg;
+                    mov.op = IOp::Nop;
+                    folded_this_round = true;
+                    continue;
+                }
+                // A-side fold for DESTRUCTIVE consumers (the op writes its
+                // a operand) is coalescing-unsafe: mov.b.reg may be the
+                // home of OTHER gen-disjoint slots whose uses after this
+                // point would read the op's result instead of their value.
+                // The compare-and-branch family (non-destructive) keeps its
+                // A-side fold; destructive ops keep the one setup mov.
             } else if (use.op == IOp::CmpRR) {
                 if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
                     mov.b.reg != use.a.reg) {
                     use.b.reg = mov.b.reg; // B-side
                     mov.op = IOp::Nop;
+                    folded_this_round = true;
                 } else if (use.a.k == Operand::K::Reg && use.a.reg == mov.a.reg &&
                            !(use.b.k == Operand::K::Reg && use.b.reg == mov.b.reg)) {
                     use.a.reg = mov.b.reg; // A-side (non-destructive)
                     mov.op = IOp::Nop;
+                    folded_this_round = true;
                 }
             } else if (use.op == IOp::Test) {
                 if (use.a.k == Operand::K::Reg && use.a.reg == mov.a.reg) {
                     use.a.reg = mov.b.reg;
                     mov.op = IOp::Nop;
+                    folded_this_round = true;
                 }
+            } else if (use.op == IOp::CmpRImm) {
+                // [mov rax, X][cmp $imm, rax] -> [cmp $imm, X]: loop guards
+                // compare the IV against an invariant constant
+                if (use.a.k == Operand::K::Reg && use.a.reg == mov.a.reg) {
+                    use.a.reg = mov.b.reg;
+                    mov.op = IOp::Nop;
+                    folded_this_round = true;
+                }
+            }
+        }
+        if (!folded_this_round) break;
+        }
+
+        // ------------------------------------------------------------------
+        // Single-use home-store forwarding. A promoted value with exactly
+        // one use, whose load the operand folds already absorbed, keeps a
+        // round trip [movsd H, S] ... [consumer reads H]: the value went to
+        // its home register only to be read right back. When nothing in
+        // between touches H or clobbers S, the consumer reads S directly
+        // and the home store dies. The single-use property (from the
+        // pre-promotion slot scan) plus the RA's interference-free
+        // assignment (no other slot on H is live inside the window) make
+        // the later readers question moot: any later H reader belongs to a
+        // slot whose own def rewrites H first.
+        // ------------------------------------------------------------------
+        {
+            // The window scan must block on ANY reference to H (the home)
+            // or of S (the forwarded source — an isel SCRATCH that every
+            // later isel op reuses: setcc/movzx write AL/RAX, arith writes
+            // its accumulator, loads write their target). Reference-level
+            // blocking is strictly sound; a setcc-writes-AL gap here left
+            // a hoisted `a < b` bool in %rax across a loop whose body's
+            // own setcc clobbered it (t19 @ -Oz).
+            auto reg_ref = [](const Inst& q, R x) {
+                if (q.a.k == Operand::K::Reg && q.a.reg == x) return true;
+                if (q.b.k == Operand::K::Reg && q.b.reg == x) return true;
+                return false;
+            };
+            for (const auto& e : home_store_.entries()) {
+                size_t d = static_cast<size_t>(e.first);
+                i32 s = e.second;
+                if (s < 0 || static_cast<size_t>(s) >= slot_use_pos_.size()) continue;
+                Inst& mov = lf.code[d];
+                if (mov.op != IOp::MovFpFp && mov.op != IOp::MovRR) continue;
+                if (mov.a.k != Operand::K::Reg || mov.b.k != Operand::K::Reg) continue;
+                R H = mov.a.reg, S = mov.b.reg;
+                if (H == S) continue;
+                // single-def AND single-use: a phi slot has one def per
+                // predecessor (a merge!), and forwarding one def's source
+                // register to the consumer silently breaks every other
+                // def's path — the consumer would read whatever register
+                // happens to be live there instead of the merged value.
+                if (slot_use_pos_[static_cast<size_t>(s)].size() != 1 ||
+                    slot_def_pos_[static_cast<size_t>(s)].size() != 1) continue;
+                size_t u = slot_use_pos_[static_cast<size_t>(s)][0];
+                if (u <= d || u + 1 >= lf.code.size()) continue;
+                if (lf.code[u].op != IOp::Nop) continue; // use-load survived the folds
+                Inst& consumer = lf.code[u + 1];
+                // locate the H-reading operand to forward
+                bool fwd_b = false, fwd_a = false;
+                switch (consumer.op) {
+                    case IOp::FpBin: case IOp::ArithRR: case IOp::Cmov:
+                        if (consumer.b.k == Operand::K::Reg && consumer.b.reg == H)
+                            fwd_b = true;
+                        break;
+                    case IOp::CmpRR: case IOp::FpCmp:
+                        if (consumer.b.k == Operand::K::Reg && consumer.b.reg == H)
+                            fwd_b = true;
+                        else if (consumer.a.k == Operand::K::Reg && consumer.a.reg == H)
+                            fwd_a = true;
+                        break;
+                    case IOp::Test:
+                        if (consumer.a.k == Operand::K::Reg && consumer.a.reg == H)
+                            fwd_a = true;
+                        break;
+                    default: break;
+                }
+                if (!fwd_b && !fwd_a) continue;
+                // the consumer must not write S (its result would replace
+                // S's value for downstream readers)
+                if (consumer.a.k == Operand::K::Reg && consumer.a.reg == S) continue;
+                // gap window (d, u): nothing may reference H or S
+                bool ok = true;
+                for (size_t k = d + 1; k < u; ++k) {
+                    const Inst& q = lf.code[k];
+                    if (q.op == IOp::Nop) continue;
+                    if (reg_ref(q, H) || reg_ref(q, S)) { ok = false; break; }
+                }
+                if (!ok) continue;
+                if (fwd_b) consumer.b.reg = S;
+                if (fwd_a) consumer.a.reg = S;
+                mov.op = IOp::Nop;
             }
         }
 
@@ -1035,16 +1279,6 @@ struct Allocator {
                 if (!zr.promoted) continue; // result must be register-resident
                 R acc = f.fp ? R::Xmm0 : R::Rax;
                 R Z = zr.assigned;
-                // coalescing may have landed an operand of this very chain
-                // on Z's register (slot-identity is not enough — registers
-                // are shared): the leading [mov Z, X] / in-place op would
-                // clobber the operand before the chain reads it
-                bool operand_on_z = false;
-                for (i32 g : f.gap_slots) {
-                    const LiveRange& gr = range(g);
-                    if (gr.promoted && gr.assigned == Z) { operand_on_z = true; break; }
-                }
-                if (operand_on_z) continue;
 
                 // A's home: register X or memory slot
                 bool a_is_reg = (load.op == (f.fp ? IOp::MovFpFp : IOp::MovRR)) &&
@@ -1053,15 +1287,44 @@ struct Allocator {
                 R X = a_is_reg ? load.b.reg : R::Rax;
 
                 bool same_reg = a_is_reg && X == Z;
+                // coalescing may have landed an operand of this very chain
+                // on Z's register (slot-identity is not enough — registers
+                // are shared): the leading [mov Z, X] / in-place op would
+                // clobber the operand before the chain reads it.
+                // In-place exception: a gap that reads Z's register BEFORE
+                // the first chain op reads the OLD value ([mulsd Z, g] with
+                // g loaded first) — that is exactly what the original code
+                // did. Gaps after the first op see the NEW value and stay
+                // forbidden. Copy-form chains have their leading move at
+                // load_pos, before every gap: any Z-register gap is a
+                // clobber, no exception.
+                bool operand_on_z = false;
+                for (const auto& g : f.gap_slots) {
+                    const LiveRange& gr = range(g.first);
+                    if (gr.promoted && gr.assigned == Z) {
+                        if (same_reg && g.second < f.first_op_pos) continue;
+                        operand_on_z = true;
+                        break;
+                    }
+                }
+                if (operand_on_z) continue;
+
                 if (same_reg && f.ops > 0 && !f.inplace_ok) continue;
                 // (in-place would clobber A while its old value still has
                 // readers; the copy form degenerates to a self-move)
 
                 // retarget every chain op from the accumulator to Z
+                // (ops carry the acc in `a`; promoted snapshot stores carry
+                // it in `b` — [MovFpFp H_mid <- acc] reads the accumulator)
                 for (size_t k = f.load_pos + 1; k < f.store_pos; ++k) {
                     Inst& c = lf.code[k];
                     if (c.op == IOp::Nop) continue;
-                    if (c.a.k == Operand::K::Reg && c.a.reg == acc) c.a.reg = Z;
+                    if (c.a.k == Operand::K::Reg && c.a.reg == acc) {
+                        c.a.reg = Z;
+                    } else if ((c.op == IOp::MovFpFp || c.op == IOp::MovRR) &&
+                               c.b.k == Operand::K::Reg && c.b.reg == acc) {
+                        c.b.reg = Z;
+                    }
                 }
 
                 if (same_reg) {
@@ -1110,6 +1373,8 @@ struct Allocator {
 
     // Prologue pushes + pre-epilogue restores + frame layout + FrameSub patch.
     void finalize() {
+        lf.slot_offset.assign(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0), 0);
+        lf.slot_reg.clear();
         std::vector<R> callee_used;
         for (const LiveRange& r : ranges) {
             if (r.promoted && reg_is_callee_saved_gpr(r.assigned))
@@ -1137,7 +1402,70 @@ struct Allocator {
             if (range(s).needs_memory()) ++unpromoted;
 
         i32 callee_area = 8 * static_cast<i32>(callee_used.size());
-        i32 slot_area = 8 * unpromoted;
+
+        // ---- stack slot coloring (pass 28 at machine level) -------------
+        // Two memory slots whose live ranges are disjoint share one frame
+        // offset — the classic coloring over spill slots, driven by the
+        // same exact live ranges the register assignment used. Address-
+        // taken slots never share: distinct allocations must keep distinct
+        // addresses. Multi-def slots use their hull (conservative).
+        std::vector<i32> color_of(static_cast<size_t>(lf.slot_count), -1);
+        i32 distinct_slots = 0;
+        {
+            struct Hole { i32 slot; size_t first, last; };
+            std::vector<Hole> holes;
+            for (i32 s = 0; s < lf.slot_count; ++s) {
+                if (color_of[static_cast<size_t>(s)] != -1) continue; // (none yet)
+                const LiveRange& r = range(s);
+                if (r.promoted || !r.needs_memory() || r.addr_taken) continue;
+                size_t lo = r.first_live, hi = r.last_live;
+                for (const auto& g : r.gens) {
+                    lo = std::min(lo, g.first);
+                    hi = std::max(hi, g.second);
+                }
+                holes.push_back(Hole{s, lo, hi});
+            }
+            std::vector<size_t> color_last; // last activity per offset
+            for (Hole& h : holes) {
+                i32 c = -1;
+                for (size_t k = 0; k < color_last.size(); ++k) {
+                    if (color_last[k] < h.first) { // strictly before: disjoint
+                        c = static_cast<i32>(k);
+                        color_last[k] = h.last;
+                        break;
+                    }
+                }
+                if (c < 0) {
+                    color_last.push_back(h.last);
+                    c = static_cast<i32>(color_last.size() - 1);
+                }
+                color_of[static_cast<size_t>(h.slot)] = c;
+            }
+            distinct_slots = static_cast<i32>(color_last.size());
+            // every un-shared memory slot (addr-taken or unmatched) keeps
+            // its own offset beyond the colored ones
+            i32 extra = 0;
+            for (i32 s = 0; s < lf.slot_count; ++s) {
+                if (color_of[static_cast<size_t>(s)] != -1) continue;
+                const LiveRange& r = range(s);
+                if (r.promoted || !r.needs_memory()) continue;
+                color_of[static_cast<size_t>(s)] = distinct_slots + extra;
+                ++extra;
+            }
+            distinct_slots += extra;
+            // record the offsets (callee_area known here)
+            for (i32 s = 0; s < lf.slot_count; ++s) {
+                i32 c = color_of[static_cast<size_t>(s)];
+                if (c < 0) continue;
+                lf.slot_offset[static_cast<size_t>(s)] =
+                    -(callee_area + 8 * (c + 1));
+            }
+            lf.ra_colored = static_cast<u32>(
+                static_cast<i32>(holes.size()) > distinct_slots
+                    ? static_cast<i32>(holes.size()) - distinct_slots
+                    : 0);
+        }
+        i32 slot_area = 8 * distinct_slots;
         i32 total = callee_area + slot_area;
         i32 frame = (total + 15) & ~15;          // keep rsp 16-byte aligned
         i32 frame_sub = frame - callee_area;     // pushes already moved rsp
@@ -1249,20 +1577,6 @@ struct Allocator {
                                     (rbp_pad ? 8 : 0)
                               : frame;
 
-        // ---- slot offsets: memory-resident slots live below the callee area ----
-        lf.slot_offset.assign(static_cast<size_t>(lf.slot_count), 0);
-        lf.slot_reg.clear();
-        i32 next = 0;
-        for (i32 s = 0; s < lf.slot_count; ++s) {
-            const LiveRange& r = range(s);
-            if (r.promoted) {
-                lf.slot_reg.insert(s, r.assigned);
-            } else if (r.needs_memory()) {
-                ++next;
-                lf.slot_offset[static_cast<size_t>(s)] =
-                    -(callee_area + 8 * next);
-            }
-        }
         lf.ra_promoted = 0;
         lf.ra_spilled = 0;
         for (i32 s = 0; s < lf.slot_count; ++s) {

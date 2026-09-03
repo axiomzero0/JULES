@@ -54,7 +54,8 @@ set(JULES_SOURCES
     src/core/son/passes/p39_loop_classification.cpp
     src/core/son/passes/p40_licm.cpp
     src/core/son/passes/p41_load_licm.cpp
-    src/core/son/passes/p42_loop_unrolling.cpp
+    src/core/son/passes/loop_transforms.cpp
+src/core/son/passes/p42_loop_unrolling.cpp
     src/core/son/passes/p43_profile_guided_unrolling.cpp
     src/core/son/passes/p44_loop_peeling.cpp
     src/core/son/passes/p45_loop_interchange.cpp

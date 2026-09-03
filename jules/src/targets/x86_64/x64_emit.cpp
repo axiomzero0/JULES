@@ -442,7 +442,9 @@ struct Emitter {
         }
         Inst& sc = emit(IOp::Setcc);
         sc.cond = cond;
-        emit(IOp::MovZX);
+        Inst& zx = emit(IOp::MovZX);
+        zx.a.k = Operand::K::Reg;
+        zx.a.reg = R::Rax;
         store_result(n, 8);
     }
 
@@ -1000,29 +1002,118 @@ SlotCounts count_slot_refs(const std::vector<Inst>& code) {
 
 } // namespace
 
-// Fused compare-and-branch + post-RA accumulator folds (the assembly-level
-// gap analysis: setcc/movzx/test sequences around branches, and rax
-// round-trips through promoted registers).
-bool x64_branch_fusion(LFunction& lf) {
+// Machine loop rotation (pass 88): one taken branch per iteration.
+//
+// The pre-rotation while-loop shape costs TWO taken control transfers per
+// iteration (the guard's taken jcc into the body + the unconditional latch
+// jump back to the head):
+//     [L: cond][jcc body] [exit code] [body: ...][jmp L]
+// Rotated layout (guard moved to the bottom, latch deleted, entry shim):
+//     [L: jmp check] [body: ...] [check: cond][jcc body (backedge)] [exit]
+// Fallthrough from check reaches the exit; every entry (fallthrough into L
+// or a jump to L) runs through the shim and evaluates the guard BEFORE the
+// body — semantics preserved exactly; per-iteration taken branches: ONE.
+//
+// Validity (conservative):
+//   * the head [L+1 .. guard] is one basic block: no labels, no jumps, one
+//     jcc (the guard) whose target label (the body) lies inside the region
+//   * the guard's fallthrough segment (exit code) is nonempty and ends in
+//     a full terminator (jmp/ret/tail-call) — no fallthrough INTO the body
+//   * label-based jumps are position-independent in this MIR, so blocks
+//     move freely; only fallthrough adjacency constrains the layout, and
+//     the three fallthrough edges (body->check, check->exit, into-L->shim)
+//     are exactly what the new order preserves
+//   * multiple latches / conditional backedges stay correct: they target
+//     the entry label and re-run the guard through the shim
+bool x64_loop_rotate(LFunction& lf) {
+    if (lf.code.empty()) return false;
+    bool any = false;
+    for (int guard_round = 0; guard_round < 256; ++guard_round) {
+        FlatMap<int, size_t> label_pos;
+        for (size_t i = 0; i < lf.code.size(); ++i)
+            if (lf.code[i].op == IOp::Label) label_pos.insert(lf.code[i].a.label, i);
+
+        bool found = false;
+        size_t best_span = SIZE_MAX;
+        size_t L = 0, guard_pos = 0, body_pos = 0, latch_pos = 0;
+
+        for (size_t p = 0; p < lf.code.size(); ++p) {
+            if (lf.code[p].op != IOp::Jmp) continue;
+            const size_t* lp = label_pos.find(lf.code[p].a.label);
+            if (!lp || *lp >= p) continue; // not a backedge latch
+            size_t l = *lp;
+            size_t span = p - l;
+            if (span >= best_span) continue;
+
+            // head must be a single basic block ending in the guard jcc:
+            // walk through ordinary instructions; a Label or Jmp means the
+            // head is multi-block (skip — e.g. short-circuit && guards)
+            size_t j = l + 1;
+            bool head_ok = false;
+            while (j < p) {
+                const Inst& c = lf.code[j];
+                if (c.op == IOp::Nop) { ++j; continue; }
+                if (c.op == IOp::Jcc) { head_ok = true; break; }
+                if (c.op == IOp::Label || c.op == IOp::Jmp) break;
+                ++j; // ordinary head instruction (loads, cmp, arith, ...)
+            }
+            if (!head_ok) continue;
+            size_t gp = j;
+            // guard target must be the body label inside the region
+            if (lf.code[gp].a.k != Operand::K::Label) continue;
+            const size_t* bp = label_pos.find(lf.code[gp].a.label);
+            if (!bp || *bp <= gp || *bp >= p) continue;
+            size_t bpos = *bp;
+            // exit segment must be nonempty and end in a full terminator
+            size_t e_end = bpos;
+            while (e_end > gp + 1 && lf.code[e_end - 1].op == IOp::Nop) --e_end;
+            if (e_end == gp + 1) continue;
+            IOp last = lf.code[e_end - 1].op;
+            if (last != IOp::Jmp && last != IOp::Ret && last != IOp::RetNaked &&
+                last != IOp::TailCallFn && last != IOp::TailCallNaked)
+                continue;
+
+            found = true;
+            best_span = span;
+            L = l; guard_pos = gp; body_pos = bpos; latch_pos = p;
+        }
+        if (!found) break;
+
+        int check_label = lf.label_counter++;
+        std::vector<Inst> out;
+        out.reserve(lf.code.size() + 2);
+        for (size_t i = 0; i <= L; ++i) out.push_back(lf.code[i]);          // entry label
+        Inst shim;
+        shim.op = IOp::Jmp;
+        shim.a.k = Operand::K::Label;
+        shim.a.label = check_label;
+        out.push_back(shim);                                                 // [L: jmp check]
+        for (size_t i = body_pos; i < latch_pos; ++i) out.push_back(lf.code[i]); // body
+        Inst cl;
+        cl.op = IOp::Label;
+        cl.a.k = Operand::K::Label;
+        cl.a.label = check_label;
+        out.push_back(cl);                                                   // check:
+        for (size_t i = L + 1; i <= guard_pos; ++i) out.push_back(lf.code[i]);   // cond + guard jcc
+        for (size_t i = guard_pos + 1; i < body_pos; ++i) out.push_back(lf.code[i]); // exit
+        for (size_t i = latch_pos + 1; i < lf.code.size(); ++i) out.push_back(lf.code[i]);
+        lf.code = std::move(out);
+        any = true;
+    }
+    return any;
+}
+
+
+// Loop-invariant FP constant hoisting (machine level). Extracted from the
+// pass-87 peephole family into pass 88 (MachineLICM) where it belongs:
+// hoisting is a loop transform, not a peephole. Runs AFTER loop rotation,
+// so backedge regions are the rotated [body .. check] spans and hoisted
+// pairs land before the rotation shim (after the entry label) — every
+// entry path (fallthrough or jump to the entry label) executes them.
+bool x64_hoist_loop_constants(LFunction& lf) {
     if (lf.code.empty()) return false;
     bool changed = false;
     auto& code = lf.code;
-
-    // ---- 1) dead slot stores: a store whose slot is never read --------
-    {
-        SlotCounts sc = count_slot_refs(code);
-        for (Inst& i : code) {
-            if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot) {
-                const u32* u = sc.uses.find(i.b.slot);
-                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
-            } else if (i.op == IOp::MovSImm && i.a.k == Operand::K::Slot) {
-                const u32* u = sc.uses.find(i.a.slot);
-                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
-            }
-        }
-    }
-
-    // ---- 1b) loop-invariant FP constant hoisting --------------------------
     // The isel constant pool (xmm8-15) materializes each f64/f32 constant at
     // its FIRST USE — which for loop-carried constants sits inside the loop
     // body and re-executes every iteration. A materialization pair
@@ -1066,7 +1157,7 @@ bool x64_branch_fusion(LFunction& lf) {
                     code[i + 1].b.k == Operand::K::Reg && code[i + 1].b.reg == R::Rax)
                     pairs.push_back(Pair{i, code[i + 1].a.reg});
             }
-            // decide a destination (loop-top label position) per pair
+            // decide a destination (loop entry) per pair
             FlatMap<size_t, i64> remove;      // pair imm_idx -> unused
             FlatMap<size_t, size_t> dest;     // pair imm_idx -> insert-before pos
             FlatMap<size_t, u32> dest_count;  // insert pos -> number of pairs
@@ -1089,12 +1180,24 @@ bool x64_branch_fusion(LFunction& lf) {
                             { bad = true; break; }
                     }
                     if (bad) continue;
-                    dest.insert(pr.imm_idx, rg.top);
+                    // Rotated regions carry a shim [jmp check] right before
+                    // the region-top (body) label; inserting before the BODY
+                    // label would strand the pair after the shim (dead). The
+                    // shim is recognized by its jump target lying INSIDE the
+                    // region. Inserting before the shim = right after the
+                    // entry label: fallthrough AND jump entries both run it.
+                    size_t ins = rg.top;
+                    if (rg.top > 0 && code[rg.top - 1].op == IOp::Jmp &&
+                        code[rg.top - 1].a.k == Operand::K::Label) {
+                        const size_t* sp = label_pos.find(code[rg.top - 1].a.label);
+                        if (sp && *sp > rg.top && *sp <= rg.end) ins = rg.top - 1;
+                    }
+                    dest.insert(pr.imm_idx, ins);
                     remove.insert(pr.imm_idx, 0);
-                    if (const u32* c = dest_count.find(rg.top))
-                        dest_count.insert(rg.top, *c + 1);
+                    if (const u32* c = dest_count.find(ins))
+                        dest_count.insert(ins, *c + 1);
                     else
-                        dest_count.insert(rg.top, 1);
+                        dest_count.insert(ins, 1);
                     break; // outermost qualifying region wins
                 }
             }
@@ -1132,6 +1235,31 @@ bool x64_branch_fusion(LFunction& lf) {
                     out.push_back(code[i]);
                 }
                 code = std::move(out);
+            }
+        }
+    }
+
+    return changed;
+}
+
+// Fused compare-and-branch + post-RA accumulator folds (the assembly-level
+// gap analysis: setcc/movzx/test sequences around branches, and rax
+// round-trips through promoted registers).
+bool x64_branch_fusion(LFunction& lf) {
+    if (lf.code.empty()) return false;
+    bool changed = false;
+    auto& code = lf.code;
+
+    // ---- 1) dead slot stores: a store whose slot is never read --------
+    {
+        SlotCounts sc = count_slot_refs(code);
+        for (Inst& i : code) {
+            if ((i.op == IOp::MovRS || i.op == IOp::MovFpS) && i.b.k == Operand::K::Slot) {
+                const u32* u = sc.uses.find(i.b.slot);
+                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
+            } else if (i.op == IOp::MovSImm && i.a.k == Operand::K::Slot) {
+                const u32* u = sc.uses.find(i.a.slot);
+                if (!u || *u == 0) { i.op = IOp::Nop; changed = true; }
             }
         }
     }
@@ -1403,13 +1531,158 @@ bool x64_branch_fusion(LFunction& lf) {
 
 bool x64_machine_peephole(LFunction& lf) {
     bool changed = false;
+    auto& code = lf.code;
+
+    // Register-reference predicates for the scan-based patterns below.
+    auto reads_reg = [](const Inst& q, R x) {
+        if (q.b.k == Operand::K::Reg && q.b.reg == x) return true;
+        switch (q.op) {
+            case IOp::ArithRR: case IOp::CmpRR: case IOp::FpBin:
+            case IOp::FpCmp: case IOp::Cmov: case IOp::Test:
+            case IOp::IDiv: case IOp::UDiv:
+                return q.a.k == Operand::K::Reg && q.a.reg == x;
+            default: return false;
+        }
+    };
+    auto writes_reg = [](const Inst& q, R x) {
+        switch (q.op) {
+            case IOp::MovRR: case IOp::MovFpFp: case IOp::ArithRR:
+            case IOp::ArithRImm: case IOp::FpBin: case IOp::FpNeg:
+            case IOp::MovRImm: case IOp::ShiftImm: case IOp::ShiftCl:
+            case IOp::Neg: case IOp::Not: case IOp::SExt32:
+            case IOp::MovFpR: case IOp::MovFpFromGpr: case IOp::MovSR:
+            case IOp::MovFpS: case IOp::MovRS: case IOp::MovZX:
+            case IOp::CvtToFp: case IOp::CvtToInt: case IOp::Cmov:
+            case IOp::Setcc:
+                return q.a.k == Operand::K::Reg && q.a.reg == x;
+            default: return false;
+        }
+    };
+    // control-flow boundary: scans stop here (crossing a label needs real
+    // liveness, not local scanning)
+    auto is_boundary = [](const Inst& q) {
+        switch (q.op) {
+            case IOp::Label: case IOp::Jcc: case IOp::Jmp: case IOp::Ret:
+            case IOp::RetNaked: case IOp::CallFn: case IOp::CallSym:
+            case IOp::TailCallFn: case IOp::TailCallNaked:
+                return true;
+            default: return false;
+        }
+    };
+    auto next_live = [&](size_t from) -> size_t {
+        size_t j = from;
+        while (j < code.size() && code[j].op == IOp::Nop) ++j;
+        return j;
+    };
+
+    // ---- movzx destination retarget -------------------------------------
+    // [movzbq %al, %rax][mov X, %rax] -> [movzbq %al, %X]: the extended
+    // byte lands in its home directly. Sound when nothing reads rax
+    // between the pair and rax's next def (a later reader would see the
+    // pre-extension value instead of the extended one).
+    for (size_t i = 0; i + 1 < code.size(); ++i) {
+        Inst& zx = code[i];
+        if (zx.op != IOp::MovZX || zx.a.k != Operand::K::Reg) continue;
+        size_t mi = next_live(i + 1);
+        if (mi >= code.size()) continue;
+        Inst& mv = code[mi];
+        if (mv.op != IOp::MovRR || mv.a.k != Operand::K::Reg ||
+            mv.b.k != Operand::K::Reg || mv.b.reg != R::Rax) continue;
+        if (mv.a.reg == R::Rax) continue;
+        // forward scan: rax must be redefined before any read / boundary
+        bool ok = false, abort = false;
+        for (size_t j = mi + 1; j < code.size(); ++j) {
+            const Inst& q = code[j];
+            if (is_boundary(q)) { abort = true; break; }
+            if (q.op == IOp::Nop) continue;
+            if (writes_reg(q, R::Rax)) { ok = true; break; }
+            if (reads_reg(q, R::Rax)) { abort = true; break; }
+        }
+        if (!ok || abort) continue;
+        zx.a.reg = mv.a.reg;
+        mv.op = IOp::Nop;
+        changed = true;
+    }
+
+    // ---- and/or accumulator + branch fold --------------------------------
+    // [mov rax, B][op rax, X][test rax, rax][jcc NE|E] -> [op B, X][jcc]
+    // (op must set flags — and/or/add/sub; the test is folded by the
+    // redundant-test pattern below). B must be dead after (its old value
+    // has no readers before its next def).
+    for (size_t i = 0; i + 3 < code.size(); ++i) {
+        Inst& mv = code[i];
+        if (mv.op != IOp::MovRR || mv.a.k != Operand::K::Reg ||
+            mv.b.k != Operand::K::Reg || mv.a.reg != R::Rax) continue;
+        R B = mv.b.reg;
+        if (B == R::Rax) continue;
+        size_t oi = next_live(i + 1);
+        if (oi >= code.size()) continue;
+        Inst& op = code[oi];
+        if (op.op != IOp::ArithRR || op.a.k != Operand::K::Reg || op.a.reg != R::Rax) continue;
+        if (op.bin != BinOp::And && op.bin != BinOp::Or &&
+            op.bin != BinOp::Add && op.bin != BinOp::Sub) continue;
+        if (op.b.k != Operand::K::Reg || op.b.reg == B) continue;
+        size_t ti = next_live(oi + 1);
+        if (ti >= code.size()) continue;
+        if (code[ti].op != IOp::Test || code[ti].a.k != Operand::K::Reg ||
+            code[ti].a.reg != R::Rax) continue;
+        size_t ji = next_live(ti + 1);
+        if (ji >= code.size()) continue;
+        if (code[ji].op != IOp::Jcc) continue;
+        Cond jc = code[ji].cond;
+        if (jc != Cond::NE && jc != Cond::E) continue;
+        // B dead after: no reads of B before its next def / boundary
+        bool ok = false, abort = false;
+        for (size_t j = oi + 1; j < code.size(); ++j) {
+            const Inst& q = code[j];
+            if (is_boundary(q)) { abort = true; break; }
+            if (q.op == IOp::Nop) continue;
+            if (writes_reg(q, B)) { ok = true; break; }
+            if (reads_reg(q, B)) { abort = true; break; }
+        }
+        if (!ok || abort) continue;
+        op.a.reg = B;
+        code[ti].a.reg = B;
+        mv.op = IOp::Nop;
+        changed = true;
+    }
+
+    // ---- redundant test after flag-setting ops ---------------------------
+    // [and/or/add/sub/imul/cmp r, x][test r, r][jcc E|NE] -> [op][jcc]:
+    // the arithmetic already set ZF/SF for exactly this result. The test
+    // only survives when something between the op and the test clobbers
+    // flags (conservative: only Nops allowed between).
+    for (size_t i = 0; i + 1 < code.size(); ++i) {
+        const Inst& op = code[i];
+        bool sets_flags = false;
+        switch (op.op) {
+            case IOp::ArithRR: case IOp::ArithRImm:
+                sets_flags = true; break;
+            default: break;
+        }
+        if (!sets_flags) continue;
+        size_t ti = next_live(i + 1);
+        if (ti >= code.size()) continue;
+        const Inst& tst = code[ti];
+        if (tst.op != IOp::Test || tst.a.k != Operand::K::Reg) continue;
+        if (op.a.k != Operand::K::Reg || tst.a.reg != op.a.reg) continue;
+        size_t ji = next_live(ti + 1);
+        if (ji >= code.size()) continue;
+        if (code[ji].op != IOp::Jcc) continue;
+        Cond jc = code[ji].cond;
+        if (jc != Cond::NE && jc != Cond::E) continue;
+        code[ti].op = IOp::Nop;
+        changed = true;
+    }
+
+    // ---- existing sweeps --------------------------------------------------
     // Linear dead code: after an unconditional control transfer (jmp /
     // leave;jmp / leave;ret / ret) nothing is reachable until the next
     // label. TCO rewriting and epilogue threading leave zombie blocks
     // there (e.g. the original return path after a tail-call conversion).
     {
         bool dead = false;
-        for (Inst& c : lf.code) {
+        for (Inst& c : code) {
             if (c.op == IOp::Label) { dead = false; continue; }
             if (dead) {
                 if (c.op != IOp::Nop) { c.op = IOp::Nop; changed = true; }
@@ -1420,7 +1693,7 @@ bool x64_machine_peephole(LFunction& lf) {
                 dead = true;
         }
     }
-    for (Inst& i : lf.code) {
+    for (Inst& i : code) {
         if (i.op == IOp::CmpRImm && i.b.k == Operand::K::Imm && i.b.imm == 0 &&
             i.a.k == Operand::K::Reg) {
             i.op = IOp::Test;
@@ -1436,10 +1709,10 @@ bool x64_machine_peephole(LFunction& lf) {
         }
     }
     std::vector<Inst> out;
-    out.reserve(lf.code.size());
-    for (const Inst& i : lf.code)
+    out.reserve(code.size());
+    for (const Inst& i : code)
         if (i.op != IOp::Nop) out.push_back(i);
-    if (out.size() != lf.code.size()) changed = true;
+    if (out.size() != code.size()) changed = true;
     lf.code = std::move(out);
     return changed;
 }
@@ -1476,7 +1749,7 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::MovSR: os << "\tmov" << ssz(i.size) << " " << slotstr(i.b) << ", " << rs(i.a.reg, i.size) << "\n"; break;
         case IOp::MovRImm: os << "\tmovq $" << i.b.imm << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovSImm: os << "\tmovq $" << i.b.imm << ", " << slotstr(i.a) << "\n"; break;
-        case IOp::MovZX: os << "\tmovzbq %al, %rax\n"; break;
+        case IOp::MovZX: os << "\tmovzbq %al, " << r(i.a.reg) << "\n"; break;
         case IOp::LoadMem: os << "\tmov" << ssz(i.size) << " (" << r(i.b.reg) << "), " << rs(i.a.reg, i.size) << "\n"; break;
         case IOp::StoreMem: os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", (" << r(i.a.reg) << ")\n"; break;
         case IOp::LeaSlot: os << "\tleaq " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;

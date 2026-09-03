@@ -1,6 +1,18 @@
 # 89-Pass Status Matrix
 
+Audit (2025-09 session): all 89 catalog passes are registered
+(`--list-passes`: 89 rows), scheduled by the catalog-order pass manager
+with mode/level/kill-switch gating, and emit telemetry (`--stats`
+per-pass `changes` / node deltas; `--only`/`--disable` isolate any pass).
+Pass-activity is regression-locked: tools/test_runner.sh asserts the pass
+actually transformed on programs written to exercise it (GVN, SCCP, SROA,
+inlining, TCO, LICM, unrolling, predication). Reproduce the audit:
+`./build/julesc --list-passes`, `./build/julesc --stats <file>`,
+`./tools/test_runner.sh`.
+
 Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or MIR.; `SIMPLIFIED` — Real but reduced: core mechanism present, documented reductions.; `VACUOUS` — Complete for the current IR: the constructs it targets do not exist in the MVP subset.; `SCAFFOLD` — Not yet implemented: contract, modes and telemetry in place; honest no-op.
+
+Status roll-up: 49 IMPLEMENTED, 5 SIMPLIFIED, 6 VACUOUS, 29 SCAFFOLD.
 
 | # | Pass | Status | Notes |
 |---|------|--------|-------|
@@ -18,7 +30,7 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 12 | AlgebraicSimplification | IMPLEMENTED | Multi-pattern algebra with side conditions. |
 | 13 | Reassociation | IMPLEMENTED | Canonical operand order (FP gated by --fp=fast). |
 | 14 | SignExtensionElimination | IMPLEMENTED | Remove redundant extends via width analysis. |
-| 15 | NarrowingTransform | SCAFFOLD (honest no-op) | Demote ops to narrower types when consumers allow. |
+| 15 | NarrowingTransform | SCAFFOLD (honest no-op) | Demote ops to narrower types when consumers allow. Blocked on isel: the x64 backend emits per-width encodings keyed on the node type; retyping live IV arithmetic (i64->i32) mid-graph needs matching i32 arithmetic support in emit + RA operand folding. No 32-bit speed gain on x86-64 anyway (size-only win, -Os/-Oz). |
 | 16 | BitwiseOptimization | IMPLEMENTED | Bit-level rewrites, bitfield extracts, De Morgan. |
 | 17 | SelectOptimization | IMPLEMENTED | Select chains, condition inversion. |
 | 18 | OverflowCheckElimination | VACUOUS (nothing to do in MVP) | Remove overflow checks via range lattices (no check nodes yet). |
@@ -27,11 +39,11 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 21 | RedundantLoadElimination | IMPLEMENTED | Remove loads satisfied by dominating loads. |
 | 22 | StoreToLoadForwarding | IMPLEMENTED | Forward store values to loads. |
 | 23 | DeadStoreElimination | IMPLEMENTED | Remove overwritten/unread stores. |
-| 24 | StoreMerging | SCAFFOLD (honest no-op) | Combine adjacent narrow stores (alignment-aware). |
+| 24 | StoreMerging | SCAFFOLD (honest no-op) | Combine adjacent narrow stores (alignment-aware). The SoN emits one Store per assignment; adjacent-field writes only arise from struct-like usage this MVP language does not have (SROA promotes the single-field cells first). |
 | 25 | LoadHoisting | IMPLEMENTED | Hoist provably-safe loads out of loops. |
 | 26 | ScalarReplacementOfAggregates | IMPLEMENTED | Promote memory-backed locals to SSA values. Promotion also treats memory-phi users as chain uses (not escapes) and ignores dead users, so loop counters/temps promote even when earlier passes killed their consumers. |
-| 27 | BitfieldLowering | SCAFFOLD (honest no-op) | Lower bitfield access to mask/shift (needs bitfield types). |
-| 28 | StackSlotColoring | SCAFFOLD (honest no-op) | Merge non-overlapping stack slots (post-SROA). |
+| 27 | BitfieldLowering | VACUOUS (nothing to lower) | The language has no bitfield types: the IR cannot express a bitfield access, so there is nothing to lower. Contract stays for the day the type lattice grows. |
+| 28 | StackSlotColoring | IMPLEMENTED | Machine-level coloring in pass 85's finalize(): memory-resident slots whose exact live ranges (the same generation sub-intervals the register assignment used) are disjoint share one rbp offset; address-taken slots never share (distinct allocations keep distinct addresses); the frame size and offsets are derived from the color count. Telemetry: lf.ra_colored. |
 | 29 | HeapToStackPromotion | IMPLEMENTED | Promote NoEscape allocations to stack slots. |
 | 30 | MemorySSARepair | IMPLEMENTED | Restore memory chains after aggressive transforms. |
 | 31 | PointsToAnalysis | IMPLEMENTED | Flow-insensitive points-to graph. |
@@ -39,23 +51,23 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 33 | PartialEscapeAnalysis | SCAFFOLD (honest no-op) | Path-sensitive escape refinement (JIT). |
 | 34 | AllocationSiteProfiling | SCAFFOLD (honest no-op) | Per-site escape behavior instrumentation (JIT). |
 | 35 | MaterializationPointInsertion | SCAFFOLD (honest no-op) | Lazy materialization points for PEA (JIT). |
-| 36 | LockElision | SCAFFOLD (honest no-op) | Remove locks on non-escaping objects (needs sync ops). |
+| 36 | LockElision | VACUOUS (nothing to elide) | No sync/lock ops exist in the MVP language or IR; there is no lock to elide. |
 | 37 | LoopDetection | IMPLEMENTED | Natural loops via backedges; loop tree. |
 | 38 | InductionVariableRecognition | IMPLEMENTED | Basic/derived IVs, trip counts. |
 | 39 | LoopClassification | IMPLEMENTED | Counted/uncounted/early-exit/nested tagging. |
 | 40 | LoopInvariantCodeMotion | IMPLEMENTED | Hoist invariant pure ops to preheaders. |
 | 41 | LoadLICM | IMPLEMENTED | LICM for loads with alias proofs. |
-| 42 | LoopUnrolling | SCAFFOLD (honest no-op) | Duplicate loop bodies (static heuristic). |
-| 43 | ProfileGuidedUnrolling | SCAFFOLD (honest no-op) | Unroll from profiled trip counts. |
-| 44 | LoopPeeling | SCAFFOLD (honest no-op) | Extract first/last iterations. |
+| 42 | LoopUnrolling | IMPLEMENTED | Body-duplication unrolling for counted loops with compile-time-constant trip counts (shared cloner in passes/loop_transforms.cpp): match IV phi + Add(phi,+k) + const bound + no early exits; factor from the level budget (O2:4, O3:8); remainder peeled first when T%F!=0; F-1 copies chained behind the body (per-copy seeds remap every header phi to the previous copy's update so copy m sees iteration base+m); the header latch and phi backedges retarget to the last copy; IV steps F*k per unrolled iteration. Runs in the main pipeline and again in the post-inline cleanup (inlining propagates const bounds). Dynamic-trip guarded epilogue unrolling = documented roadmap. Fires on t18_unroll. |
+| 43 | ProfileGuidedUnrolling | SCAFFOLD (honest no-op) | Unroll from profiled trip counts. Needs the PGO profile format + counters (not in this MVP); pass 42 already consumes the static-const trip counts. |
+| 44 | LoopPeeling | IMPLEMENTED | Remainder peeling at the loop ENTRY: r = T mod F peeled copies chain from the entry predecessor (each executes unconditionally — T is an exact constant, so those iterations always ran), every header phi's entry input becomes the last peeled copy's value (the IV starts at init + r*k), and the residual loop trips T-r, divisible by F so pass 42 unrolls it exactly. Fires on t18_unroll (sumsq(101)). |
 | 45 | LoopInterchange | SCAFFOLD (honest no-op) | Swap nested loop order (dependence validation). |
 | 46 | LoopFusion | SCAFFOLD (honest no-op) | Merge adjacent compatible loops. |
 | 47 | LoopFission | SCAFFOLD (honest no-op) | Split loops for register pressure. |
-| 48 | Predication | SCAFFOLD (honest no-op) | Convert branches to selects (general form). |
+| 48 | Predication | IMPLEMENTED | Short-circuit condition flattening: `a && b` / `a || b` lower as full control flow (If -> projections -> Region -> value phi); when the RHS slice is pure (no loads/stores/calls; phis allowed as dominating loop-header leaves), the merge dissolves into Bin(And|Or, c1, c2) pinned in the pre-branch block — one branch instead of two per iteration, the escape-check shape every latency-bound loop wants. Nested short-circuits flatten iteratively (inner first). The short-circuit constant is identified by VALUE (earlier passes re-pin Consts to Start); projection contents (including that constant) are re-pinned to the branch block before the projections die. Fires on mandel's inner guard and t19_predication. |
 | 49 | IfConversion | IMPLEMENTED | Effect-free if-diamonds to Select. |
 | 50 | TailRecursionElimination | IMPLEMENTED | Self tail calls become entry jumps. |
 | 51 | BranchProbabilityInference | IMPLEMENTED | Edge probabilities from heuristics. |
-| 52 | HotPathStraightening | SIMPLIFIED | RPO layout with loop/hot fallthrough preference. |
+| 52 | HotPathStraightening | SIMPLIFIED | RPO layout with loop/hot fallthrough preference. The branch-count half of straightening (loop rotation: one taken branch per iteration instead of two) is implemented at machine level in pass 88, where the rotated shape is expressible; this pass keeps the block-order half. |
 | 53 | IdiomRecognition | SCAFFOLD (honest no-op) | memset/memcpy/popcount pattern detection. |
 | 54 | SLPVectorizer | SCAFFOLD (honest no-op) | Bottom-up adjacent scalar packing. |
 | 55 | SuperwordPacker | SCAFFOLD (honest no-op) | Non-adjacent packing via packing graph (research). |
@@ -88,8 +100,8 @@ Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or 
 | 82 | LTOSummaryGeneration | SCAFFOLD (honest no-op) | Serialize cross-module info for LTO (AOT). |
 | 83 | CFGLinearization | IMPLEMENTED | SoN -> ordered blocks with scheduled nodes. |
 | 84 | InstructionSelection | IMPLEMENTED | x86-64 MIR emission (SysV). |
-| 85 | RegisterAllocation | IMPLEMENTED | Level-dispatched: -O0/-Og spill-everywhere; -O1+ linear scan over live ranges from backwards-liveness dataflow over the emitted blocks (sound with loop backedges). Pools: callee-saved GPRs (rbx, r12-r15) for call-crossing ranges; caller-saved r10/r11 plus every isel-untouched argument register (rdx/rsi/rdi/r8/r9 — write-scanned, call-free functions only) for local ranges; xmm2..N where N adapts to the isel FP const pool watermark (the pool grows down from xmm15 for loop constants). Spill heuristic: density-ranked, never victimizes backedge-spanning (loop-carried) ranges. Exact liveness per slot via generation sub-intervals (multi-def phi slots split at redefinitions); expiry allows def-start handovers. Accumulator-chain fusion: rax/xmm0-threaded [load][op]+[store] chains rewrite into the result's register ([mov Z, X][op Z, src]), in place when phi-cycle coalescing (hint retarget validated on generation-disjoint exact liveness) lands the pair on one register — loop updates emit `addq $1, %r15` / `addsd %xmm4, %xmm3` directly. Phi copies between coalesced slots vanish. Soundness gates: result slot must not feed its own chain, no operand may share the result register post-coalescing, in-place only for phi-successor or non-loop-carried sources. Frame elision with SysV alignment; callee-save pushes deduplicated per physical register. |
+| 85 | RegisterAllocation | IMPLEMENTED | Level-dispatched: -O0/-Og spill-everywhere; -O1+ linear scan over live ranges from backwards-liveness dataflow over the emitted blocks (sound with loop backedges). Pools: callee-saved GPRs (rbx, r12-r15) for call-crossing ranges; caller-saved r10/r11 plus every isel-untouched argument register (rdx/rsi/rdi/r8/r9 — write-scanned, call-free functions only) for local ranges; xmm2..N where N adapts to the isel FP const pool watermark (the pool grows down from xmm15 for loop constants). Spill heuristic: density-ranked, never victimizes backedge-spanning (loop-carried) ranges. This session: operand folds run to fixpoint THROUGH killed instructions (two setup movs per consumer exposed the A-side only after the B-side died); snapshot stores [store s_mid<-acc] and FP const-materialization pairs are legal chain elements/gaps so pure-register recurrences fuse; self-update chains (a = a*c + d through the phi slot) fuse in place; single-use single-def home-store forwarding kills [movsd H<-S][consumer reads H] round trips (window scan blocks on ANY reference to H or the scratch S — setcc/movzx write AL/RAX and once slipped through); stack slot coloring (pass 28) shares rbp offsets; CmpRImm A-side folding drops the loop-guard setup mov. Exact liveness per slot via generation sub-intervals (multi-def phi slots split at redefinitions); expiry allows def-start handovers. Accumulator-chain fusion: rax/xmm0-threaded [load][op]+[store] chains rewrite into the result's register ([mov Z, X][op Z, src]), in place when phi-cycle coalescing (hint retarget validated on generation-disjoint exact liveness) lands the pair on one register — loop updates emit `addq $1, %r15` / `addsd %xmm4, %xmm3` directly. Phi copies between coalesced slots vanish. Soundness gates: result slot must not feed its own chain, no operand may share the result register post-coalescing, in-place only for phi-successor or non-loop-carried sources. Frame elision with SysV alignment; callee-save pushes deduplicated per physical register. |
 | 86 | PostRACleanup | IMPLEMENTED | Fold store+load pairs (GP and FP) including same-register elision; slot-immediate to register-immediate forwarding. |
 | 87 | MachinePeephole | IMPLEMENTED | Fused compare-and-branch (cmp/jcc from setcc/movzx/test chains, incl. post-fold short chains and cross-block promoted booleans), loop-invariant FP constant hoisting, mov+test folding (register and cmp-$0,[mem] forms), rax accumulator folding, copy-chain elimination through scratch registers, adjacent mov-pair elimination, dead store removal, cmp-$0 to test, linear dead code after unconditional transfers (TCO zombie epilogues). |
-| 88 | MachineLICM | SIMPLIFIED | Post-isel invariant hoisting (scan phase). |
+| 88 | MachineLICM | IMPLEMENTED | Two machine loop transforms, post-RA: (1) LOOP ROTATION — the emitted while-loop [head: cond; jcc body][exit][body; jmp head] takes two branches per iteration; rotation reorders to [entry: jmp check][body][check: cond; jcc body] with the latch deleted (label-based jumps make block moves safe; the three fallthrough edges are exactly what the new order preserves; multi-latch/conditional backedges re-run the guard through the entry shim). (2) invariant FP-constant materialization hoisting out of backedge regions (moved here from the pass 87 peephole family — a loop transform, not a peephole); after rotation the hoist lands before the entry shim so both fallthrough and jump entries execute it once. |
 | 89 | DeoptMetadataEmission | SIMPLIFIED | Deopt manifest (JIT modes; empty guard set). |

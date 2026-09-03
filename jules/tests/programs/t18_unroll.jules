@@ -1,0 +1,36 @@
+// unrolling + peeling: constant-trip counted loops at several shapes
+//   * sumsq(100): trip 100, factor 4 -> exact unroll
+//   * sumsq(101): trip 101 -> peel 1, unroll 4x25
+//   * sumsq(7):   trip 7  -> too small, no transform
+//   * weighted:   nested ifs inside the body (cloned with the body)
+fn sumsq(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * i + 3 * i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn weighted(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i / 2 * 2 == i {
+            s = s + 2;
+        } else {
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    print(sumsq(100 as i64));
+    print(sumsq(101 as i64));
+    print(sumsq(7 as i64));
+    print(weighted(12 as i64));
+    return 0 as i64;
+}

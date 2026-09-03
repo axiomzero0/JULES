@@ -1,0 +1,26 @@
+// predication: pure short-circuit conditions flatten to And/Or, removing
+// the second branch; nested && flattens iteratively
+fn count(a: i64, b: i64, n: i64) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < n && (a < b || i / 3 * 3 == i) {
+        c = c + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+fn three(x: i64, y: i64, z: i64) -> i64 {
+    if x < y && y < z && (x + z) / 2 == y {
+        return 1 as i64;
+    }
+    return 0 as i64;
+}
+
+fn main() -> i64 {
+    print(count(1 as i64, 100 as i64, 50 as i64));
+    print(count(100 as i64, 1 as i64, 50 as i64));
+    print(three(1 as i64, 2 as i64, 3 as i64));
+    print(three(3 as i64, 2 as i64, 1 as i64));
+    return 0 as i64;
+}

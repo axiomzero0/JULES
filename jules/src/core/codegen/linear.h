@@ -170,6 +170,8 @@ struct LFunction {
     FlatMap<i32, R> slot_reg;           // pass 85: slot -> assigned register
     u32 ra_promoted = 0;                // pass 85 telemetry: promoted slots
     u32 ra_spilled = 0;                 // pass 85 telemetry: memory slots
+    u32 ra_colored = 0;                 // pass 28/85 telemetry: offsets shared
+                                        // by disjoint-range spill slots
     u32 ra_fused = 0;                   // pass 85 telemetry: fused accumulator chains
     u32 ra_coalesced = 0;               // pass 85 telemetry: hint-unified register pairs
     int fp_const_min_xmm = 14;          // isel FP const pool: lowest xmm index
@@ -208,5 +210,13 @@ bool x64_post_ra_cleanup(LFunction& lf);
 bool x64_machine_peephole(LFunction& lf);
 // Pass 87 helper: fused compare-and-branch + accumulator folds.
 bool x64_branch_fusion(LFunction& lf);
+// Pass 88 (MachineLICM): machine loop transforms —
+//   * loop rotation: while-loop [head: cond; jcc body][exit][body; jmp head]
+     //     becomes [entry: jmp check][body][check: cond; jcc body] so each
+     //     iteration takes ONE branch instead of two
+//   * loop-invariant FP constant materialization hoisting (moved here from
+//     the pass 87 peephole family — a loop transform, not a peephole)
+bool x64_loop_rotate(LFunction& lf);
+bool x64_hoist_loop_constants(LFunction& lf);
 
 } // namespace jules
