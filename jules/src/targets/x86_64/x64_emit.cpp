@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <functional>
 
 namespace jules {
 
@@ -1390,6 +1391,121 @@ bool x64_loop_rotate(LFunction& lf) {
     return any;
 }
 
+// Loop-entry fallthrough layout. After rotation the shape is
+//   [entry: ...code...][shim: jmp CHECK][body ...][CHECK: cond; jcc body]
+//   [base: ...; jmp EPI][EPI: ...; ret]
+// The shim is a taken jump on EVERY physical entry (158M on tak: every
+// recursive call), and the base's jmp-to-epilogue is a taken jump on every
+// LEAF exit (118M). Moving the [CHECK .. EPI] cluster to immediately after
+// the entry code makes both edges fallthrough:
+//   [entry: ...code...][CHECK: cond; jcc body][base: ...][EPI: ...; ret]
+//   [body ...][jmp CHECK]
+// The leaf path (guard not taken -> base -> epilogue -> ret) becomes zero
+// taken jumps. Label-based jumps make any contiguous range movable; only
+// fallthrough adjacency constrains layout, and each cut preserves its edge:
+// the entry's out-edge (was: shim jmp CHECK, now: fallthrough into the
+// moved CHECK), the body's out-edge (was: fallthrough into CHECK, now: the
+// appended latch jmp), and the cluster's own end (a full terminator, so
+// nothing falls out of it). The cluster chains through [jmp L][L: ...]
+// adjacency (the base->EPI edge) so the epilogue travels with it and the
+// jmp becomes elidable fallthrough.
+bool x64_loop_entry_fallthrough(LFunction& lf) {
+    if (lf.code.empty()) return false;
+    bool any = false;
+
+    auto is_full_term = [](const Inst& q) {
+        switch (q.op) {
+            case IOp::Jmp: case IOp::Ret: case IOp::RetNaked:
+            case IOp::TailCallFn: case IOp::TailCallNaked:
+                return true;
+            default: return false;
+        }
+    };
+
+    for (int round = 0; round < 64; ++round) {
+        auto& code = lf.code;
+        FlatMap<int, size_t> label_pos;
+        for (size_t i = 0; i < code.size(); ++i)
+            if (code[i].op == IOp::Label) label_pos.insert(code[i].a.label, i);
+
+        bool found = false;
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            if (code[i].op != IOp::Jmp || code[i].a.k != Operand::K::Label) continue;
+            const size_t* tp = label_pos.find(code[i].a.label);
+            if (!tp || *tp <= i + 1) continue;             // forward, body nonempty
+            size_t t = *tp;
+            if (code[i + 1].op != IOp::Label ||
+                code[i + 1].a.k != Operand::K::Label) continue; // body head
+
+            // cluster: [t .. end], ending at a full terminator, chaining
+            // through [jmp L][L: ...] adjacency
+            size_t u = t;
+            bool ok = false;
+            while (u < code.size()) {
+                const Inst& q = code[u];
+                if (q.op == IOp::Nop || q.op == IOp::Label) { ++u; continue; }
+                if (!is_full_term(q)) { ++u; continue; }
+                if (q.op == IOp::Jmp && q.a.k == Operand::K::Label) {
+                    // chain: jmp whose target label immediately follows
+                    size_t v = u + 1;
+                    while (v < code.size() && code[v].op == IOp::Nop) ++v;
+                    if (v < code.size() && code[v].op == IOp::Label &&
+                        code[v].a.k == Operand::K::Label && code[v].a.label == q.a.label) {
+                        u = v + 1;
+                        continue;
+                    }
+                }
+                ok = true; // full terminator ends the cluster here (inclusive)
+                break;
+            }
+            if (!ok) continue;
+            size_t cluster_end = u;
+
+            // the cluster must carry a guard jcc — a rotated loop check,
+            // not an arbitrary skip-over jump
+            bool has_jcc = false;
+            for (size_t k = t; k <= cluster_end; ++k)
+                if (code[k].op == IOp::Jcc) { has_jcc = true; break; }
+            if (!has_jcc) continue;
+
+            std::vector<Inst> out;
+            out.reserve(code.size() + 2);
+            for (size_t k = 0; k < i; ++k) out.push_back(code[k]);          // entry
+            for (size_t k = t; k <= cluster_end; ++k) out.push_back(code[k]); // cluster
+            for (size_t k = i + 1; k < t; ++k) out.push_back(code[k]);      // body
+            Inst latch;
+            latch.op = IOp::Jmp;
+            latch.a.k = Operand::K::Label;
+            latch.a.label = code[i].a.label;                                 // jmp CHECK
+            out.push_back(latch);
+            for (size_t k = cluster_end + 1; k < code.size(); ++k) out.push_back(code[k]);
+            code = std::move(out);
+            found = true;
+            any = true;
+            break; // positions shifted; restart the scan
+        }
+        if (!found) break;
+    }
+
+    // [jmp L][Label L] -> fallthrough (the base->epilogue edge after the
+    // cluster move; also catches rotation's explicit exit jumps)
+    {
+        auto& code = lf.code;
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            if (code[i].op != IOp::Jmp || code[i].a.k != Operand::K::Label) continue;
+            size_t j = i + 1;
+            while (j < code.size() && code[j].op == IOp::Nop) ++j;
+            if (j >= code.size()) continue;
+            if (code[j].op == IOp::Label && code[j].a.k == Operand::K::Label &&
+                code[j].a.label == code[i].a.label) {
+                code[i].op = IOp::Nop;
+                any = true;
+            }
+        }
+    }
+    return any;
+}
+
 
 // Loop-invariant FP constant hoisting (machine level). Extracted from the
 // pass-87 peephole family into pass 88 (MachineLICM) where it belongs:
@@ -1939,6 +2055,132 @@ bool x64_machine_peephole(LFunction& lf) {
         zx.a.reg = mv.a.reg;
         mv.op = IOp::Nop;
         changed = true;
+    }
+
+    // ---- producer destination retarget ----------------------------------
+    // [lea/mov-imm/arith-imm → S][mov D, S] -> [producer → D]: the value
+    // lands in its final home in one hop instead of two (gcc's
+    // `lea -1(%rbx),%rdi` shape for recursive call arguments). Sound when
+    // nothing reads S between the copy and S's next redefinition; a call
+    // counts as a redefinition of rax only (the return register) — other
+    // registers survive calls or become garbage, so the scan stops there.
+    {
+        auto scan_dead = [&](size_t from, R x) -> bool {
+            for (size_t j = from; j < code.size(); ++j) {
+                const Inst& q = code[j];
+                if (q.op == IOp::Nop) continue;
+                if (q.op == IOp::CallFn || q.op == IOp::CallSym) {
+                    if (x == R::Rax) return true;  // rax = return value
+                    return false;                  // survives or garbage: stop
+                }
+                if (is_boundary(q)) return false;
+                if (writes_reg(q, x)) return true;
+                if (reads_reg(q, x)) return false;
+            }
+            return false;
+        };
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& p = code[i];
+            bool is_lea = (p.op == IOp::LeaRR);
+            // MovRImm only: it WRITES its dst without reading it. ArithRImm
+            // (add/sub/... $k, S) READS S — retargeting would compute
+            // D+k instead of S+k (found by t01 @ -Og: fib args corrupted).
+            bool is_imm = (p.op == IOp::MovRImm);
+            if (!is_lea && !is_imm) continue;
+            if (p.a.k != Operand::K::Reg) continue;
+            R S = p.a.reg;
+            size_t mi = next_live(i + 1);
+            if (mi >= code.size()) continue;
+            Inst& mv = code[mi];
+            if (mv.op != IOp::MovRR || mv.a.k != Operand::K::Reg ||
+                mv.b.k != Operand::K::Reg || mv.b.reg != S) continue;
+            R D = mv.a.reg;
+            if (D == S) continue;
+            // LeaRR.size is the SCALE (1/2/4/8), not the width — leas are
+            // 64-bit here; only the imm producers carry a real width.
+            if (is_imm && p.size != mv.size) continue;      // width mismatch
+            if (is_lea && p.b.k == Operand::K::Reg && p.b.reg == D) continue; // lea reads D
+            if (!scan_dead(mi + 1, S)) continue;
+            p.a.reg = D;
+            mv.op = IOp::Nop;
+            changed = true;
+        }
+    }
+
+    // ---- commutative phi-backedge fusion ---------------------------------
+    // [op X, Y][mov Y, X] (commutative op) -> [op X... -> [op Y, X]: the
+    // operation writes its result straight into the phi home it is copied
+    // to — `addq %rbx,%rax; movq %rax,%rbx` becomes `addq %rax,%rbx`, one
+    // instruction instead of two on every loop iteration (fib's
+    // accumulator). Sound when X is dead on every path from the copy to
+    // X's next redefinition (the walk follows jmp targets and requires
+    // BOTH jcc paths dead; calls redefine rax — the return register — and
+    // Ret reads it).
+    {
+        FlatMap<int, size_t> label_pos;
+        for (size_t i = 0; i < code.size(); ++i)
+            if (code[i].op == IOp::Label) label_pos.insert(code[i].a.label, i);
+
+        enum class LS { Dead, Live, Unknown };
+        // budget-bounded walk: ~1500 instructions examined per path set
+        std::function<LS(size_t, R, int)> walk = [&](size_t i, R x, int budget) -> LS {
+            for (size_t j = i; j < code.size() && budget > 0; --budget) {
+                const Inst& q = code[j];
+                if (q.op == IOp::Label) { ++j; continue; }   // fallthrough merge
+                if (q.op == IOp::Nop) { ++j; continue; }
+                if (q.op == IOp::CallFn || q.op == IOp::CallSym) {
+                    return (x == R::Rax) ? LS::Dead : LS::Unknown;
+                }
+                if (q.op == IOp::Ret || q.op == IOp::RetNaked) {
+                    return (x == R::Rax) ? LS::Live : LS::Dead; // return value / dead at exit
+                }
+                if (q.op == IOp::TailCallFn || q.op == IOp::TailCallNaked)
+                    return LS::Unknown; // control leaves; registers may be live at the target
+                if (q.op == IOp::Jmp) {
+                    if (q.a.k != Operand::K::Label) return LS::Unknown;
+                    const size_t* tp = label_pos.find(q.a.label);
+                    if (!tp) return LS::Unknown;
+                    j = *tp; // continue at the target label
+                    continue;
+                }
+                if (q.op == IOp::Jcc) {
+                    if (q.a.k != Operand::K::Label) return LS::Unknown;
+                    const size_t* tp = label_pos.find(q.a.label);
+                    if (!tp) return LS::Unknown;
+                    LS t = walk(*tp, x, budget / 2);      // taken path
+                    LS f = walk(j + 1, x, budget / 2);    // fallthrough path
+                    if (t == LS::Live || f == LS::Live) return LS::Live;
+                    if (t == LS::Dead && f == LS::Dead) return LS::Dead;
+                    return LS::Unknown;
+                }
+                if (writes_reg(q, x)) return LS::Dead;
+                if (reads_reg(q, x)) return LS::Live;
+                ++j;
+            }
+            return LS::Unknown;
+        };
+
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& op = code[i];
+            if (op.op != IOp::ArithRR || op.a.k != Operand::K::Reg ||
+                op.b.k != Operand::K::Reg) continue;
+            if (op.bin != BinOp::Add && op.bin != BinOp::And &&
+                op.bin != BinOp::Or && op.bin != BinOp::Xor &&
+                op.bin != BinOp::Mul) continue;      // commutative only
+            size_t mi = next_live(i + 1);
+            if (mi >= code.size()) continue;
+            Inst& mv = code[mi];
+            if (mv.op != IOp::MovRR || mv.a.k != Operand::K::Reg ||
+                mv.b.k != Operand::K::Reg) continue;
+            if (mv.b.reg != op.a.reg || mv.a.reg != op.b.reg) continue;
+            if (op.a.reg == op.b.reg) continue;
+            if (mv.size != op.size) continue;
+            R X = op.a.reg;
+            if (walk(mi + 1, X, 1500) != LS::Dead) continue;
+            std::swap(op.a.reg, op.b.reg);
+            mv.op = IOp::Nop;
+            changed = true;
+        }
     }
 
     // ---- and/or accumulator + branch fold --------------------------------

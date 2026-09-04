@@ -221,4 +221,9 @@ bool x64_branch_fusion(LFunction& lf);
 bool x64_loop_rotate(LFunction& lf);
 bool x64_hoist_loop_constants(LFunction& lf);
 
+// Loop-entry fallthrough layout: post-rotation, moves the [check..epilogue]
+// cluster to immediately after the entry code so the entry edge and the
+// leaf-exit edge become fallthrough instead of taken jumps.
+bool x64_loop_entry_fallthrough(LFunction& lf);
+
 } // namespace jules

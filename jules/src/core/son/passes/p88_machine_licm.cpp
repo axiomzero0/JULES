@@ -35,6 +35,8 @@ public:
             changed |= x64_loop_rotate(lf);          // rotation first: regions
                                                     // become the rotated spans
             changed |= x64_hoist_loop_constants(lf); // then hoist out of them
+            changed |= x64_loop_entry_fallthrough(lf); // entry/leaf-exit edges
+                                                    // become fallthrough
         }
         return changed;
     }

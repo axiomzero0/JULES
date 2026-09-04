@@ -1,0 +1,29 @@
+// recursive self-inlining + tail-to-loop + memory effects:
+//   * tick: a self TAIL call whose body writes memory every level — the
+//     loopified spine must thread the memory phi past the stores, and the
+//     inlined copies (O3) must forward the cell's version between levels.
+//   * inner: two INNER self-calls (no tail) — the O3 self-inliner expands
+//     both sites through the single-return clone merge; no tail call, so
+//     the plain recursion stays.
+fn tick(n: i64, cell: *mut i64) -> i64 {
+    *cell = *cell + n;
+    if n <= 0 { return *cell * 3; }
+    return tick(n - 1, cell);
+}
+
+fn inner(a: i64) -> i64 {
+    if a < 3 { return a + 100; }
+    return inner(a - 1) + inner(a - 2) * 2;
+}
+
+fn main() -> i64 {
+    let cell: *mut i64 = alloc(i64);
+    *cell = 7;
+    print(tick(5 as i64, cell));
+    *cell = 0;
+    print(tick(0 as i64, cell));
+    free(cell);
+    print(inner(12 as i64));
+    print(inner(2 as i64));
+    return 0 as i64;
+}
