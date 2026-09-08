@@ -78,6 +78,20 @@ private:
     // ---- promotion ---------------------------------------------------------------
     void promote(NodeId alloc) {
         TypeId pointee = pointee_of(alloc);
+        // The VALUE type flowing through this slot: the loads' result type.
+        // Pointer-valued locals get a degraded *i64 slot (no ptr-to-ptr in
+        // the MVP lattice), so the pointee (i64) is NOT the value type —
+        // value phis and zero constants must carry the declared pointer
+        // type or the type lie collapses when a phi folds (verifier: Bin
+        // operand/result mismatch).
+        TypeId value_ty = pointee;
+        for (NodeId u : g_.uses_of(alloc)) {
+            const Node& un = g_.node(u);
+            if (un.op == Op::Load && un.in[2] == alloc && un.ty != ty_none()) {
+                value_ty = un.ty;
+                break;
+            }
+        }
         memo_.clear();
         poison_ = false; // per-allocation reset
         if (getenv("JULES_DEBUG_SROA"))
@@ -93,7 +107,7 @@ private:
         for (NodeId u : users) {
             Node& un = g_.node(u);
             if (un.op != Op::Load || un.in[2] != alloc) continue;
-            NodeId val = resolve(un.in[1], alloc, pointee, un.in[0]);
+            NodeId val = resolve(un.in[1], alloc, value_ty, un.in[0]);
             if (val == kNoNode || val == u) { all_ok = false; break; }
             repls.push_back({u, val});
         }

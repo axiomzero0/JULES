@@ -1,0 +1,84 @@
+// vectorization: packed 128-bit loops (SSE2 baseline)
+//   * sum_i64: i64 reduction over one array (paddq + lane extraction)
+//   * sum_two: reduction over two arrays in one loop (two packed loads)
+//   * axpy_f64: element-wise f64 store loop (mulpd — strict-FP safe:
+//     each lane computes the identical scalar expression)
+//   * odd/short trips exercise the guard + scalar remainder path
+//   * fill_const: stores of a loop-invariant constant (broadcast)
+fn sum_i64(a: *mut i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sum_two(a: *mut i64, b: *mut i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + a[i] + b[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn axpy_f64(a: *mut f64, b: *mut f64, n: i64) -> f64 {
+    var i: i64 = 0;
+    var chk: f64 = 0.0;
+    while i < n {
+        b[i] = a[i] * 3.0 + 1.0;
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        chk = chk + b[i];
+        i = i + 1;
+    }
+    return chk;
+}
+
+fn fill_const(a: *mut i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        a[i] = 7;
+        i = i + 1;
+    }
+    return a[0] + a[n - 1];
+}
+
+fn main() -> i64 {
+    let a: *mut i64 = alloc(i64, 10);
+    let b: *mut i64 = alloc(i64, 10);
+    var i: i64 = 0;
+    while i < 10 {
+        a[i] = i + 1;         // 1..10
+        b[i] = 10 - i;        // 10..1
+        i = i + 1;
+    }
+    print(sum_i64(a, 10 as i64));     // 55
+    print(sum_two(a, b, 10 as i64));  // 110
+    print(sum_i64(a, 9 as i64));      // 45  (odd trip: 4 vector + 1 scalar)
+    print(sum_i64(a, 1 as i64));      // 1   (trip < VF: scalar only)
+    print(sum_i64(a, 0 as i64));      // 0
+    free(a);
+    free(b);
+
+    let x: *mut f64 = alloc(f64, 8);
+    let y: *mut f64 = alloc(f64, 8);
+    i = 0;
+    while i < 8 {
+        x[i] = (i as f64) * 0.5;
+        i = i + 1;
+    }
+    print(axpy_f64(x, y, 8 as i64));  // sum((i*.5)*3+1) = 1+2.5+4+5.5+7+8.5+10+11.5 = 50
+    free(x);
+    free(y);
+
+    let c: *mut i64 = alloc(i64, 6);
+    print(fill_const(c, 6 as i64));   // 14
+    free(c);
+    return 0 as i64;
+}

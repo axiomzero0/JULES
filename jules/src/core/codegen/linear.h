@@ -128,6 +128,16 @@ enum class IOp : u16 {
     Comment,        // emission-time annotation (MIR comments, disabled in release)
     LeaRR,          // lea: dst(a.reg) = base(b.reg)*scale + disp(b.imm); scale in
                     // `size` (1/2/4/8); pass-87 formation from [mov][add/sub/shl]
+    // ---- packed-vector ops (128-bit SSE2 baseline; passes 54-66) ----
+    VecBinF64,      // addpd/subpd/mulpd/divpd xmm0, xmm1 (bin encodes op)
+    VecBinI64,      // paddq/psubq (Add/Sub only — no SIMD i64 mul below AVX512DQ)
+    VecBinI32,      // paddd/psubd (Add/Sub only — pmulld needs SSE4.1)
+    VecBinF32,      // addps/subps/mulps/divps
+    VecLogical,     // pand/por/pxor (any lane kind; bin encodes And/Or/Xor)
+    VecExtract,     // lane extraction to scalar: b.imm = lane; size = lane size;
+                    // sar = lane is float (f64: unpckhpd, i64: psrldq, 32: pshufd)
+    VecBcast,       // broadcast low scalar to all lanes: size = lane size
+                    // (8: punpcklqdq, 4: pshufd $0)
 };
 
 struct Operand {
@@ -179,6 +189,9 @@ struct LFunction {
     int fp_const_min_xmm = 14;          // isel FP const pool: lowest xmm index
                                         // ever taken (pool spans 15 down to this;
                                         // allocator stops below it)
+    FlatMap<i32, bool> slot_wide;       // slot id -> 16-byte vector slot (pass 85
+                                        // frame layout: wide slots get their own
+                                        // 16-aligned area, never 8-byte colored)
     i32 frame_size = 0;
     std::vector<StringConst> strings;   // printf formats owned by this fn
     int label_counter = 0;

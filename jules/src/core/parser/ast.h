@@ -13,6 +13,7 @@ namespace jules {
 
 enum class ExprKind : u8 {
     IntLit, FloatLit, BoolLit, Ident, Unary, Binary, Call, Cast, Deref,
+    Index,        // base[expr]: pointer indexing (arrays) — lhs = pointer, rhs = index
     ComptimeBlock, // comptime { ... } expression: sema evaluates to a literal
 };
 enum class BinKind : u8 {
@@ -61,6 +62,7 @@ enum class StmtKind : u8 {
     Let,         // name, decl_ty (may be ty_none() for inferred), immutable, init
     Assign,      // target ident, value
     AssignDeref, // target = pointer expr, value
+    AssignIndex, // base[index] = value  (target = base ptr, to = index expr)
     Return,      // value (optional)
     If,          // cond, body, else_body
     While,       // cond, body
@@ -78,8 +80,8 @@ struct Stmt {
     bool immutable = true;
     ExprP value;        // Return / Assign / Let init / ExprStmt
     ExprP cond;         // If / While
-    ExprP target;       // AssignDeref pointer / For from
-    ExprP to;           // For bound
+    ExprP target;       // AssignDeref pointer / For from / AssignIndex base
+    ExprP to;           // For bound / AssignIndex index expression
     std::vector<StmtP> body;
     std::vector<StmtP> else_body;
 };

@@ -1,11 +1,15 @@
-// Pass 59 — ReductionRecognizer (Phase 5: Vectorization & Superword)
+// Pass 59 — ReductionRecognizer (Phase 5)
 //
-// Detects reduction patterns inside loops: phi = phi op x for
-// add/min/max/mul (dot products are nested add-of-mul). Analysis only in
-// the MVP (records telemetry; no horizontal vector ops exist yet), but the
-// recognition itself is real and runs over the loop tree — it is exactly
-// the legality fact a future LoopVectorizer consumes.
-#include "core/son/passes/pass_utils.h"
+// Recognizes loop reductions (acc = phi(init, acc op x)) across all loops
+// and records them for the vectorizer family. The shared matcher
+// (vecx::match_reduction) is the SAME code pass 56 consults at transform
+// time (catalog order puts the recognizer after the emitters — the
+// analysis function is the single source of truth, like LLVM's
+// ReductionAnalyzer). This pass reports what exists, counts recognizer
+// hits, and re-canonicalizes integer Add updates whose phi is nested one
+// level (see pass 56's normalization note) so downstream rounds see the
+// canonical shape.
+#include "core/son/passes/vector_utils.h"
 
 namespace jules {
 
@@ -14,37 +18,27 @@ class ReductionRecognizer {
 public:
     ReductionRecognizer(Graph& g, LoopInfo& li) : g_(g), li_(li) {}
 
-    bool run() {
+    u32 run() {
         for (const Loop& l : li_.loops()) {
             for (NodeId u : g_.uses_of(l.header)) {
-                const Node& phi = g_.node(u);
-                if (phi.op != Op::Phi || phi.ty == ty_mem()) continue;
-                // an input must be binop(phi, x) defined inside the loop
-                for (u8 i = 1; i < phi.n_in; ++i) {
-                    NodeId v = phi.in[i];
-                    if (v == u) continue;
-                    const Node& vn = g_.node(v);
-                    if (vn.op != Op::Bin) continue;
-                    if (vn.in[1] != u && vn.in[2] != u) continue;
-                    BinOp op = static_cast<BinOp>(vn.sub);
-                    if (op == BinOp::Add || op == BinOp::Mul || op == BinOp::And ||
-                        op == BinOp::Or || op == BinOp::Xor) {
-                        reductions_++;
-                        found_ = true;
-                    }
+                if (g_.is_dead(u) || g_.node(u).op != Op::Phi) continue;
+                if (g_.node(u).ty == ty_mem()) continue;
+                vecx::Reduction r;
+                if (vecx::match_reduction(g_, u, l.header, r)) {
+                    ++found_;
+                    if (getenv("JULES_DEBUG_VEC"))
+                        fprintf(stderr, "[red] n%u: %s reduction op=%s\n", u,
+                                ty_name(g_.node(u).ty), bin_name(r.op));
                 }
             }
         }
         return found_;
     }
 
-    u32 count() const { return reductions_; }
-
 private:
     Graph& g_;
     LoopInfo& li_;
-    u32 reductions_ = 0;
-    bool found_ = false;
+    u32 found_ = 0;
 };
 } // namespace
 
@@ -52,18 +46,21 @@ class ReductionRecognizerPass : public Pass {
 public:
     const char* name() const override { return "ReductionRecognizer"; }
     int order() const override { return 59; }
-    const char* phase_name() const override { return "Phase 5: Vectorization & Superword Parallelism"; }
-    AnalysisMask required() const override {
-        return AnalysisKind::Dominators | AnalysisKind::LoopInfo;
+    const char* phase_name() const override {
+        return "Phase 5: Vectorization & Superword Parallelism";
     }
-    AnalysisMask invalidated() const override { return 0; } // pure analysis
+    ModeMask modes() const override { return kModeAll; }
+    AnalysisMask required() const override {
+        return static_cast<AnalysisMask>(AnalysisKind::Dominators) |
+               static_cast<AnalysisMask>(AnalysisKind::LoopInfo);
+    }
     bool run(PassContext& ctx) override {
         bool any = false;
         for (FunctionGraph& fg : ctx.mod.fns) {
             ReductionRecognizer r(fg.g, ctx.analysis.loops(fg));
-            any |= r.run();
+            any |= r.run() > 0;
         }
-        return any;
+        return any; // analysis: reports, does not rewrite
     }
 };
 

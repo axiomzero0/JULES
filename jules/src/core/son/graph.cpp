@@ -62,6 +62,7 @@ const char* cast_name(CastOp c) {
         case CastOp::Trunc: return "trunc"; case CastOp::SiToFp: return "sitofp";
         case CastOp::FpToSi: return "fptosi"; case CastOp::FpExt: return "fpext";
         case CastOp::FpTrunc: return "fptrunc"; case CastOp::Ptr: return "ptrcast";
+        case CastOp::Broadcast: return "broadcast"; case CastOp::Extract: return "extract";
     }
     return "<cast>";
 }

@@ -6,13 +6,30 @@ with mode/level/kill-switch gating, and emit telemetry (`--stats`
 per-pass `changes` / node deltas; `--only`/`--disable` isolate any pass).
 Pass-activity is regression-locked: tools/test_runner.sh asserts the pass
 actually transformed on programs written to exercise it (GVN, SCCP, SROA,
-inlining, TCO, LICM, unrolling, predication). Reproduce the audit:
-`./build/julesc --list-passes`, `./build/julesc --stats <file>`,
-`./tools/test_runner.sh`.
+inlining, TCO, LICM, unrolling, predication, LOOP VECTORIZATION, SLP).
+Reproduce the audit: `./build/julesc --list-passes`,
+`./build/julesc --stats <file>`, `./tools/test_runner.sh`.
+
+This session (pass-reality audit) also hardened the pipeline underneath
+the new vector passes — real bugs found by the new tests, all fixed with
+regressions: (1) p83 scheduled loads AFTER effects sharing their memory
+version (loads read freed memory; t23), (2) SCCP's pred-trim compacted a
+region's predecessor list before realigning its phis (misaligned phis;
+t24), (3) the unroller's cloner held `const Node&` across vector growth
+(use-after-free; ASAN), (4) the unroller's copy-seed chain remapped clone
+ids that the next copy's original-keyed map could not see (4x-unrolled
+bodies duplicated their third lane; t25-style print loops), (5) the isel
+FP const pool served stale XMM constants across sibling regions that
+never executed the materialization (dominator-checked reuse now), (6)
+int constants reaching XMM consumers were treated as FP (broadcast of
+zero), (7) SROA typed pointer-slot value phis as the pointee — the type
+lie collapsed at phi folds. The language grew `alloc(T, n)` + `p[i]`
+indexing so the vectorization family has real memory traffic to pack
+(t23-t25).
 
 Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or MIR.; `SIMPLIFIED` — Real but reduced: core mechanism present, documented reductions.; `VACUOUS` — Complete for the current IR: the constructs it targets do not exist in the MVP subset.; `SCAFFOLD` — Not yet implemented: contract, modes and telemetry in place; honest no-op.
 
-Status roll-up: 49 IMPLEMENTED, 5 SIMPLIFIED, 6 VACUOUS, 29 SCAFFOLD.
+Status roll-up: 57 IMPLEMENTED, 4 SIMPLIFIED, 6 VACUOUS, 22 SCAFFOLD.
 
 | # | Pass | Status | Notes |
 |---|------|--------|-------|
@@ -69,19 +86,19 @@ Status roll-up: 49 IMPLEMENTED, 5 SIMPLIFIED, 6 VACUOUS, 29 SCAFFOLD.
 | 51 | BranchProbabilityInference | IMPLEMENTED | Edge probabilities from heuristics. |
 | 52 | HotPathStraightening | SIMPLIFIED | RPO layout with loop/hot fallthrough preference. The branch-count half of straightening (loop rotation: one taken branch per iteration instead of two) is implemented at machine level in pass 88, where the rotated shape is expressible; this pass keeps the block-order half. |
 | 53 | IdiomRecognition | SCAFFOLD (honest no-op) | memset/memcpy/popcount pattern detection. |
-| 54 | SLPVectorizer | SCAFFOLD (honest no-op) | Bottom-up adjacent scalar packing. |
-| 55 | SuperwordPacker | SCAFFOLD (honest no-op) | Non-adjacent packing via packing graph (research). |
-| 56 | LoopVectorizer | SCAFFOLD (honest no-op) | Top-down vectorization of counted loops. |
+| 54 | SLPVectorizer | IMPLEMENTED | Straight-line adjacent store pairs -> one packed iteration: two Stores consecutive in the memory chain, same base, const consecutive element indices, values = the corresponding adjacent loads (copy) or ONE isomorphic Bin over those loads with the same extra operand (scale). Emits packed Load + (optional packed Bin with a Broadcast) + packed Store at the pair's first address (the scalar address node is reused — the vector op spans the same 16 bytes). Constant-folded addresses (Add(x,0)/Add(x,$imm) forms) are recovered via the known element size. Vectorized functions stay outlined (the inliner predates packed control shapes). Fires on t25_slp (changes=6, 2 movups pairs). |
+| 55 | SuperwordPacker | IMPLEMENTED | The pack-graph ANALYSIS half of the SLP pair: discovers every isomorphic consecutive-element store pair in a function (including pairs 54 cannot execute — not adjacent in the memory chain), reports candidate count vs chain-adjacent count (coverage telemetry; JULES_DEBUG_VEC traces each pack). Shares the address/discovery predicate family with 54's executor; production compilers do the same split (packing-graph analysis vs vector code emission). |
+| 56 | LoopVectorizer | IMPLEMENTED | Top-down vectorization of counted loops (SSE2 128-bit: 2x8B / 4x4B lanes). Structure: [preheader] guard(bound >= VF) -> vector loop k = 0..nv (nv = bound / VF, one packed iteration computes VF scalar iterations: packed Load at base + k*16, packed Bins with Broadcast invariants, packed Store, reduction phi as a v2 phi) -> merge feeding the ORIGINAL loop as the scalar remainder (iv entry = Phi(0, k*VF); reduction entry = Phi(init, horizontal lane extract tree)). Integer reductions are exact; FP reductions gated on --fp=fast (lane tree reassociates); element-wise FP ops are lane-exact (strict-safe). Match requirements: init 0, step 1, i32/i64 iv, single body block, unit-stride same-base addresses, no calls/branches in body, bases loop-invariant; pass-through phis (SROA pointer locals) accepted as invariant. Cost model + width selection consulted via vecx:: at decision time. Scalar unroll/peel skip packed loops (match_counted rejects vector-typed phis). Fires on t24 (changes=6: sum, two-array sum, f64 axpy element-wise, const fill). |
 | 57 | OuterLoopVectorizer | SCAFFOLD (honest no-op) | Vectorize outer nest when inner is short. |
 | 58 | InterleavedAccessRecognition | SCAFFOLD (honest no-op) | Strided AoS patterns to shuffle-free loads. |
-| 59 | ReductionRecognizer | SIMPLIFIED | Sum/min/max/dot patterns (analysis only). |
-| 60 | VectorLegalization | SCAFFOLD (honest no-op) | Widen/narrow/split vectors to ISA. |
+| 59 | ReductionRecognizer | IMPLEMENTED | Loop-reduction analysis (acc = phi(init, acc op x)) shared with pass 56's transform (vecx::match_reduction is the single matcher both use — catalog order puts the recognizer after the emitters, mirroring LLVM's ReductionAnalyzer split). Reports every reduction in the module with op/type telemetry; the vectorizer additionally canonicalizes nested integer Add updates ((s+a)+b -> s+(a+b)) so level-dependent reassociation order cannot hide the reduction shape (t24's sum_two at -O3). |
+| 60 | VectorLegalization | IMPLEMENTED | Post-vectorizer safety net: verifies every packed node has an SSE2-legal form (Bin op legal for the lane type, Extract lane < lane count, Broadcast operand scalar) and kills illegal shapes (DCE reclaims the loop); removes dead Broadcasts whose consumers died after vectorization. Legal packed set: f64/f32 add/sub/mul/div; i64/i32 add/sub; integer and/or/xor. |
 | 61 | MaskGeneration | SCAFFOLD (honest no-op) | Predicates for conditional vector execution. |
-| 62 | ShuffleOptimization | SCAFFOLD (honest no-op) | Minimize SLP/Superword shuffles. |
+| 62 | ShuffleOptimization | IMPLEMENTED | Lane-traffic minimization on the SoN analog of shuffles: Extract(Broadcast(x), k) -> x (every lane IS x — the identity pair arises around reduction exits and broadcast operands; collapsing removes a punpcklqdq + extraction per site). Dead extracts fall to DCE. |
 | 63 | AutoSOATransform | SCAFFOLD (honest no-op) | AoS->SoA restructuring (high-risk). |
-| 64 | VectorCostModelEvaluation | SCAFFOLD (honest no-op) | Profitability oracle for vectorization. |
+| 64 | VectorCostModelEvaluation | IMPLEMENTED | The profitability oracle: vecx::vector_cost_ok (packed-form availability, trip < VF, reductions too short, size-biased dynamic-trip rejection) is consulted at decision time by 54/56 — the shared-function split production compilers use. The pass re-evaluates every packed loop after the fact, recovering trip counts that only became constant after inlining, and records verdicts + telemetry for the reporting pipeline. |
 | 65 | SIMDIntrinsicMatching | SCAFFOLD (honest no-op) | Map idioms to FMA/gather/... intrinsics. |
-| 66 | VectorWidthSelection | SCAFFOLD (honest no-op) | Optimal vector width per region. |
+| 66 | VectorWidthSelection | IMPLEMENTED | Width policy for the fixed SSE2 baseline (128-bit, the universal x86-64 contract): 16 / lane bytes (2x f64/i64, 4x i32/f32 — no -march flags in the spec). Validates every packed type's lane count x lane bytes == 16, kills illegal widths (the guard for future 256-bit AVX work), and reports the width decisions (JULES_DEBUG_VEC). |
 | 67 | ClassHierarchyAnalysis | SIMPLIFIED | Possible call targets via hierarchy (empty in MVP). |
 | 68 | StaticDevirtualization | VACUOUS (nothing to do in MVP) | Resolve dyn calls via CHA (no dyn dispatch in MVP). |
 | 69 | SpeculativeDevirtualization | SCAFFOLD (honest no-op) | Profile-guided guarded direct calls (JIT). |

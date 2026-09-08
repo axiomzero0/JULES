@@ -427,6 +427,23 @@ private:
         }
         StmtP s = make_stmt(StmtKind::ExprStmt);
         s->value = parse_expr();
+        if (accept(Tok::Assign)) {
+            // Indexed store: base[idx] = value (parsed as an Index expression).
+            if (s->value && s->value->kind == ExprKind::Index) {
+                StmtP a = make_stmt(StmtKind::AssignIndex);
+                a->pos = s->value->pos;
+                a->target = std::move(s->value->lhs); // base pointer
+                a->to = std::move(s->value->rhs);     // index expression
+                a->value = parse_expr();
+                expect(Tok::Semi, "';' after assignment");
+                return a;
+            }
+            diag_.error(cur().pos,
+                        "left side of assignment must be a name, '*pointer' or 'base[index]'");
+            errored_ = true;
+            expect(Tok::Semi, "';' after assignment");
+            return s;
+        }
         expect(Tok::Semi, "';' after expression statement");
         return s;
     }
@@ -554,6 +571,19 @@ private:
                 c->kind = ExprKind::Cast;
                 c->cast_target = t;
                 c->lhs = std::move(e);
+                e = std::move(c);
+                continue;
+            }
+            if (check(Tok::LBracket)) {
+                // pointer indexing: base[expr] — arrays are *mut T from alloc(T, n)
+                SourcePos pos = cur().pos;
+                ExprP c = std::make_unique<Expr>();
+                c->pos = pos;
+                c->kind = ExprKind::Index;
+                advance();
+                c->lhs = std::move(e);
+                c->rhs = parse_expr();
+                expect(Tok::RBracket, "']' after index");
                 e = std::move(c);
                 continue;
             }

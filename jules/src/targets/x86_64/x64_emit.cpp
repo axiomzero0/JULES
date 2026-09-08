@@ -106,8 +106,11 @@ constexpr int kBlockLabelBase = 0;     // block labels: 0..N-1
 constexpr int kLocalLabelBase = 100000; // local labels (epilogue, fp selects)
 constexpr int kEntryLabelId = 999999;   // function entry: BEFORE the prologue
 
-u8 sz_of(TypeId t) { return ty_bits(t) == 32 ? 4 : 8; }
-bool fp_of(TypeId t) { return ty_is_float(t); }
+u8 sz_of(TypeId t) {
+    if (ty_is_vector(t)) return 16;
+    return ty_bits(t) == 32 ? 4 : 8;
+}
+bool fp_of(TypeId t) { return ty_in_xmm(t); } // scalar FP + packed vectors: XMM class
 
 struct Emitter {
     Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms)
@@ -120,6 +123,7 @@ struct Emitter {
         if (const i32* s = lf_.slot_of.find(n)) return *s;
         i32 s = lf_.slot_count++;
         lf_.slot_of.insert(n, s);
+        if (ty_is_vector(g_.node(n).ty)) lf_.slot_wide.insert(s, true);
         return s;
     }
 
@@ -132,8 +136,70 @@ struct Emitter {
     // The pool watermark (lf_.fp_const_min_xmm) tells the register allocator
     // where to stop so the two never collide: with few live FP values the
     // pool grows (more loop constants cached), with many it stays small.
+    //
+    // DOMINANCE SOUNDNESS: a cached entry is only reusable when its
+    // materialization block dominates the use block. Emission order (RPO)
+    // does NOT imply execution order for sibling regions — the vectorizer's
+    // guard/remainder structure emitted the scalar path first, and the
+    // packed body on the sibling path read xmm14/15 registers that were
+    // never written on that path (axpy mulpd by stale bits). Non-dominated
+    // uses re-materialize into the SAME pool register (idempotent) at the
+    // use site; pass 87/88 hoist repeated materializations out of loops.
+    struct PoolEntry {
+        R reg = R::Xmm15;
+        int block = -1; // LBlock index of the materialization
+    };
+    FlatMap<u64, PoolEntry> fp_const_cache_dom_;
+    int cur_block_ = 0;
+    std::vector<u64> block_dom_mask_; // dominator bitsets over LBlocks
+
+    void compute_block_dominators() {
+        size_t n = lf_.blocks.size();
+        block_dom_mask_.assign(n, 0);
+        if (n == 0 || n > 63) return; // too many blocks: dominator check
+                                       // degenerates to always-rematerialize
+        u64 all = (n == 64) ? ~0ull : ((1ull << n) - 1);
+        for (size_t i = 0; i < n; ++i) block_dom_mask_[i] = all;
+        block_dom_mask_[0] = 1; // entry block (RPO order, index 0)
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t i = 1; i < n; ++i) {
+                const LBlock& b = lf_.blocks[i];
+                if (b.preds.empty()) { // unreachable in this order: keep all
+                    continue;
+                }
+                u64 d = all;
+                for (int p : b.preds) d &= block_dom_mask_[static_cast<size_t>(p)];
+                d |= (1ull << i);
+                if (d != block_dom_mask_[i]) {
+                    block_dom_mask_[i] = d;
+                    changed = true;
+                }
+            }
+        }
+    }
+    bool materialization_dominates(int mat_block, int use_block) const {
+        if (mat_block < 0) return false;
+        if (block_dom_mask_.empty()) return false; // no info: re-materialize
+        if (static_cast<size_t>(use_block) >= block_dom_mask_.size() ||
+            static_cast<size_t>(mat_block) >= block_dom_mask_.size())
+            return false;
+        return (block_dom_mask_[static_cast<size_t>(use_block)] >> mat_block) & 1ull;
+    }
+
     R fp_const_reg(u64 bits, u8 size) {
-        if (const R* r = fp_const_cache_.find(bits)) return *r;
+        (void)size;
+        if (const PoolEntry* e = fp_const_cache_dom_.find(bits)) {
+            if (materialization_dominates(e->block, cur_block_)) return e->reg;
+            // cached, but the materialization does not dominate this use
+            // (sibling region): re-materialize the SAME register here —
+            // writing the constant again is idempotent, and paths that did
+            // pass the original site keep the correct value too.
+            imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
+            reg2(IOp::MovFpFromGpr, e->reg, R::Rax);
+            return e->reg;
+        }
         if (next_const_xmm_ < 8) {
             // pool exhausted: re-materialize per use; the loop-invariant
             // hoist in pass 87 moves repeated materializations out of
@@ -141,20 +207,21 @@ struct Emitter {
             imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
             Inst& mv = reg2(IOp::MovFpFromGpr, R::Xmm1, R::Rax);
             (void)mv;
-            (void)size;
             return R::Xmm1;
         }
         R reg = static_cast<R>(static_cast<int>(R::Xmm0) + next_const_xmm_--);
-        fp_const_cache_.insert(bits, reg);
+        PoolEntry entry;
+        entry.reg = reg;
+        entry.block = cur_block_;
+        fp_const_cache_dom_.insert(bits, entry);
         int idx = static_cast<int>(reg) - static_cast<int>(R::Xmm0);
         if (idx < lf_.fp_const_min_xmm) lf_.fp_const_min_xmm = idx;
         imm_reg(IOp::MovRImm, R::Rax, static_cast<i64>(bits));
         Inst& mv = reg2(IOp::MovFpFromGpr, reg, R::Rax);
         (void)mv;
-        (void)size;
         return reg;
     }
-    void invalidate_fp_consts() { fp_const_cache_.clear(); next_const_xmm_ = 15; }
+    void invalidate_fp_consts() { fp_const_cache_dom_.clear(); next_const_xmm_ = 15; }
 
     // ---- emit shorthands --------------------------------------------------------
     Inst& emit(IOp op) {
@@ -230,9 +297,20 @@ struct Emitter {
         ld_slot(IOp::MovSR, r, slot(n), size);
     }
     void load_fp(NodeId n, R r) {
-        const Node& nd = g_.node(n);
+        Node nd = g_.node(n); // copy: fp_const_reg below may grow nothing, but
+                              // instructions are appended (lf_.code) — safe;
+                              // keep the copy for clarity
         u8 size = sz_of(nd.ty);
         if (nd.op == Op::Const) {
+            if (!ty_is_float(nd.ty)) {
+                // integer constant feeding an XMM consumer (vector
+                // broadcast source, extract results): materialize in a GPR
+                // and move the bits. Treating it as an FP const read the
+                // zero fval and broadcast +0.0 (t24: fill_const wrote 0s).
+                imm_reg(IOp::MovRImm, R::Rax, nd.ival);
+                reg2(IOp::MovFpFromGpr, r, R::Rax);
+                return;
+            }
             if (nd.fval == 0.0) {
                 // +0.0: one xorpd instead of a pool slot + a move
                 Inst& z = emit(IOp::FpZero);
@@ -267,6 +345,7 @@ struct Emitter {
     // ---- function ---------------------------------------------------------------------
     bool run() {
         epilogue_label_ = new_label();
+        compute_block_dominators(); // FP const pool reuse soundness
 
         // the entry label sits BEFORE the prologue: call targets land here
         label(kEntryLabelId);
@@ -294,6 +373,7 @@ struct Emitter {
 
         for (LBlock& b : lf_.blocks) {
             label(kBlockLabelBase + b.index);
+            cur_block_ = b.index;
             sc_begin_block(b); // fused short-circuit: suppress chain nodes
             for (NodeId n : b.nodes) {
                 const bool* sup = suppress_.find(n);
@@ -318,7 +398,8 @@ struct Emitter {
         const Node& nd = g_.node(n);
         switch (nd.op) {
             case Op::Bin:
-                if (fp_of(nd.ty)) emit_fp_bin(n);
+                if (ty_is_vector(nd.ty)) emit_vec_bin(n);
+                else if (fp_of(nd.ty)) emit_fp_bin(n);
                 else emit_int_bin(n);
                 break;
             case Op::Cmp:  emit_cmp(n);  break;
@@ -422,6 +503,32 @@ struct Emitter {
             i.bin = op;
         }
         store_result(n, size);
+    }
+
+    void emit_vec_bin(NodeId n) {
+        const Node& nd = g_.node(n);
+        BinOp op = static_cast<BinOp>(nd.sub);
+        u8 lane = static_cast<u8>(ty_store_bytes(ty_lane_type(nd.ty)));
+        load_fp(nd.in[1], R::Xmm0);
+        load_fp(nd.in[2], R::Xmm1);
+        IOp kind;
+        switch (nd.ty) {
+            case ty_v2f64(): kind = IOp::VecBinF64; break;
+            case ty_v2i64(): kind = IOp::VecBinI64; break;
+            case ty_v4i32(): kind = IOp::VecBinI32; break;
+            case ty_v4f32(): kind = IOp::VecBinF32; break;
+            default: kind = IOp::VecLogical; break;
+        }
+        if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor) kind = IOp::VecLogical;
+        Inst& i = emit(kind);
+        i.bin = op;
+        i.size = lane;
+        i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0; // dst (packed ops accumulate)
+        i.b.k = Operand::K::Reg; i.b.reg = R::Xmm1; // src
+        Inst& st = emit(IOp::MovFpS);
+        st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+        st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+        st.size = 16;
     }
 
     void emit_fp_bin(NodeId n) {
@@ -561,6 +668,35 @@ struct Emitter {
         u8 dst_size = sz_of(nd.ty);
 
         switch (static_cast<CastOp>(nd.sub)) {
+            case CastOp::Broadcast: {
+                // scalar (low lane) -> vector, all lanes replicated
+                load_fp(src, R::Xmm0);
+                Inst& i = emit(IOp::VecBcast);
+                i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0;
+                i.size = static_cast<u8>(ty_store_bytes(ty_lane_type(nd.ty)));
+                Inst& st = emit(IOp::MovFpS);
+                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+                st.size = 16;
+                return;
+            }
+            case CastOp::Extract: {
+                // vector -> scalar lane `aux`; result is the scalar lane type
+                load_fp(src, R::Xmm0);
+                u8 lane_size = static_cast<u8>(ty_store_bytes(ty_lane_type(g_.node(src).ty)));
+                Inst& i = emit(nd.aux > 0 ? IOp::VecExtract : IOp::Nop);
+                if (nd.aux > 0) {
+                    i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0;
+                    i.b.k = Operand::K::Imm; i.b.imm = static_cast<i64>(nd.aux);
+                    i.size = lane_size;
+                    i.sar = ty_is_float(ty_lane_type(g_.node(src).ty));
+                }
+                Inst& st = emit(IOp::MovFpS);
+                st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+                st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+                st.size = lane_size;
+                return;
+            }
             case CastOp::ZExt:
                 // Const sources are materialized, never stored to their
                 // slot (load_value handles them); extend the constant
@@ -666,6 +802,20 @@ struct Emitter {
 
     void emit_load(NodeId n) {
         const Node& nd = g_.node(n);
+        if (ty_is_vector(nd.ty)) {
+            // packed load: movups (unaligned-safe — malloc alignment is
+            // 16 but computed offsets are not provably aligned in MVP)
+            load_value(nd.in[2], R::Rax, 8);
+            Inst& i = emit(IOp::LoadMem);
+            i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0;
+            i.b.k = Operand::K::Reg; i.b.reg = R::Rax;
+            i.size = 16;
+            Inst& st = emit(IOp::MovFpS);
+            st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+            st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+            st.size = 16;
+            return;
+        }
         u8 size = sz_of(nd.ty);
         load_value(nd.in[2], R::Rax, 8);
         Inst& i = emit(IOp::LoadMem);
@@ -678,9 +828,18 @@ struct Emitter {
     void emit_store(NodeId n) {
         const Node& nd = g_.node(n);
         NodeId val = nd.in[3];
+        bool vec = ty_is_vector(g_.node(val).ty);
         bool fp = fp_of(g_.node(val).ty);
         u8 size = sz_of(g_.node(val).ty);
         load_value(nd.in[2], R::Rcx, 8);
+        if (vec) {
+            load_fp(val, R::Xmm0);
+            Inst& i = emit(IOp::StoreMem);
+            i.a.k = Operand::K::Reg; i.a.reg = R::Rcx;
+            i.b.k = Operand::K::Reg; i.b.reg = R::Xmm0;
+            i.size = 16;
+            return;
+        }
         if (fp) {
             load_fp(val, R::Xmm0);
             Inst& i = emit(IOp::StoreMem);
@@ -704,7 +863,12 @@ struct Emitter {
         }
         invalidate_fp_consts(); // malloc clobbers caller-saved XMMs
         const Node& size = g_.node(nd.in[2]);
-        imm_reg(IOp::MovRImm, R::Rdi, size.ival);
+        if (size.op == Op::Const) {
+            imm_reg(IOp::MovRImm, R::Rdi, size.ival);
+        } else {
+            // alloc(T, n): byte size computed at runtime (n * elem size)
+            load_value(nd.in[2], R::Rdi, 8);
+        }
         Inst& c = emit(IOp::CallSym);
         c.a.k = Operand::K::Sym; c.a.sym = "malloc";
         store_result(n, 8);
@@ -1031,7 +1195,7 @@ struct Emitter {
     FunctionGraph& fg_;
     Graph& g_;
     SymbolTable& syms_;
-    FlatMap<u64, R> fp_const_cache_;
+    // replaced by fp_const_cache_dom_ (dominance-checked)
     int next_const_xmm_ = 15;
 };
 
@@ -1046,10 +1210,25 @@ bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms
 // ---- pass 85: frame layout (spill-everywhere allocator) --------------------------
 bool x64_allocate_frame(LFunction& lf) {
     lf.slot_offset.assign(static_cast<size_t>(lf.slot_count), 0);
-    for (i32 s = 0; s < lf.slot_count; ++s)
-        lf.slot_offset[static_cast<size_t>(s)] = -(s + 1) * 8;
-    i32 frame = lf.slot_count * 8;
-    frame = (frame + 15) & ~15; // 16-byte call alignment
+    auto is_wide = [&](i32 s) {
+        const bool* w = lf.slot_wide.find(s);
+        return w && *w;
+    };
+    // scalar slots: 8 bytes each; wide (vector) slots: 16 bytes, placed after
+    // the scalar area on a 16-aligned boundary (movups slot traffic).
+    i32 off = 0;
+    for (i32 s = 0; s < lf.slot_count; ++s) {
+        if (is_wide(s)) continue;
+        off += 8;
+        lf.slot_offset[static_cast<size_t>(s)] = -off;
+    }
+    off = (off + 15) & ~15;
+    for (i32 s = 0; s < lf.slot_count; ++s) {
+        if (!is_wide(s)) continue;
+        off += 16;
+        lf.slot_offset[static_cast<size_t>(s)] = -off;
+    }
+    i32 frame = (off + 15) & ~15; // 16-byte call alignment
     lf.frame_size = frame;
     for (Inst& i : lf.code)
         if (i.op == IOp::FrameSub) i.b.imm = frame;
@@ -2329,8 +2508,14 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::MovRImm: os << "\tmovq $" << i.b.imm << ", " << r(i.a.reg) << "\n"; break;
         case IOp::MovSImm: os << "\tmovq $" << i.b.imm << ", " << slotstr(i.a) << "\n"; break;
         case IOp::MovZX: os << "\tmovzbq %al, " << r(i.a.reg) << "\n"; break;
-        case IOp::LoadMem: os << "\tmov" << ssz(i.size) << " (" << r(i.b.reg) << "), " << rs(i.a.reg, i.size) << "\n"; break;
-        case IOp::StoreMem: os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", (" << r(i.a.reg) << ")\n"; break;
+        case IOp::LoadMem:
+            if (i.size == 16) os << "\tmovups (" << r(i.b.reg) << "), " << r(i.a.reg) << "\n";
+            else os << "\tmov" << ssz(i.size) << " (" << r(i.b.reg) << "), " << rs(i.a.reg, i.size) << "\n";
+            break;
+        case IOp::StoreMem:
+            if (i.size == 16) os << "\tmovups " << r(i.b.reg) << ", (" << r(i.a.reg) << ")\n";
+            else os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", (" << r(i.a.reg) << ")\n";
+            break;
         case IOp::LeaSlot: os << "\tleaq " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;
         case IOp::LeaSym: {
             std::string l = "?";
@@ -2433,8 +2618,14 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             break;
         case IOp::FpExt: os << "\tcvtss2sd %xmm0, %xmm0\n"; break;
         case IOp::FpTrunc: os << "\tcvtsd2ss %xmm0, %xmm0\n"; break;
-        case IOp::MovFpS: os << "\tmov" << fpsz(i.size) << " " << r(i.a.reg) << ", " << slotstr(i.b) << "\n"; break;
-        case IOp::MovFpR: os << "\tmov" << fpsz(i.size) << " " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;
+        case IOp::MovFpS:
+            if (i.size == 16) os << "\tmovups " << r(i.a.reg) << ", " << slotstr(i.b) << "\n";
+            else os << "\tmov" << fpsz(i.size) << " " << r(i.a.reg) << ", " << slotstr(i.b) << "\n";
+            break;
+        case IOp::MovFpR:
+            if (i.size == 16) os << "\tmovups " << slotstr(i.b) << ", " << r(i.a.reg) << "\n";
+            else os << "\tmov" << fpsz(i.size) << " " << slotstr(i.b) << ", " << r(i.a.reg) << "\n";
+            break;
         case IOp::Neg: os << "\tnegq " << r(i.a.reg) << "\n"; break;
         case IOp::Not: os << "\tnotq " << r(i.a.reg) << "\n"; break;
         case IOp::MovFpFromGpr: os << "\tmovq " << r(i.b.reg) << ", " << r(i.a.reg) << "\n"; break;
@@ -2451,6 +2642,62 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::FpZero:
             os << (i.size == 8 ? "\txorpd " : "\txorps ") << r(i.a.reg) << ", "
                << r(i.a.reg) << "\n";
+            break;
+        case IOp::VecBinF64: {
+            const char* mn = "addpd";
+            switch (i.bin) {
+                case BinOp::Add: mn = "addpd"; break;
+                case BinOp::Sub: mn = "subpd"; break;
+                case BinOp::Mul: mn = "mulpd"; break;
+                case BinOp::Div: mn = "divpd"; break;
+                default: break;
+            }
+            os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecBinI64: {
+            const char* mn = i.bin == BinOp::Sub ? "psubq" : "paddq";
+            os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecBinI32: {
+            const char* mn = i.bin == BinOp::Sub ? "psubd" : "paddd";
+            os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecBinF32: {
+            const char* mn = "addps";
+            switch (i.bin) {
+                case BinOp::Add: mn = "addps"; break;
+                case BinOp::Sub: mn = "subps"; break;
+                case BinOp::Mul: mn = "mulps"; break;
+                case BinOp::Div: mn = "divps"; break;
+                default: break;
+            }
+            os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecLogical: {
+            const char* mn = i.bin == BinOp::Or ? "por" : i.bin == BinOp::Xor ? "pxor" : "pand";
+            os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecExtract: {
+            // lane extraction into the low lane; result consumed as scalar
+            if (i.size == 8) {
+                if (i.b.imm == 1) {
+                    if (i.sar) os << "\tunpckhpd " << r(i.a.reg) << ", " << r(i.a.reg) << "\n";
+                    else       os << "\tpsrldq $8, " << r(i.a.reg) << "\n";
+                }
+                // lane 0 is already the low lane (no instruction)
+            } else if (i.b.imm > 0) {
+                os << "\tpshufd $" << i.b.imm << ", " << r(i.a.reg) << ", " << r(i.a.reg) << "\n";
+            }
+            break;
+        }
+        case IOp::VecBcast:
+            if (i.size == 8) os << "\tpunpcklqdq " << r(i.a.reg) << ", " << r(i.a.reg) << "\n";
+            else             os << "\tpshufd $0, " << r(i.a.reg) << ", " << r(i.a.reg) << "\n";
             break;
         case IOp::PushCal: os << "\tpushq " << r(i.a.reg) << "\n"; break;
         case IOp::PopCal: os << "\tpopq " << r(i.a.reg) << "\n"; break;

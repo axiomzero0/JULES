@@ -1,0 +1,1372 @@
+     1→Yes. But the key rule is:
+     2→
+     3→> **Optimization levels are compile-time budget presets. PGO, FTO/LTO, Thin, Full, and JIT profiling are not separate levels. They are modifiers that tune the same unified pipeline.**
+     4→
+     5→Do not create `-O4`, and do not create hidden runtime tiers. You want a small, orthogonal matrix:
+     6→
+     7→```text
+     8→-O level       = how aggressively to optimize
+     9→--size         = whether to optimize for size
+    10→--pgo          = where profile evidence comes from
+    11→--lto / --fto  = how much cross-module visibility the optimizer gets
+    12→--jit-budget   = runtime compilation latency budget, not an execution tier
+    13→```
+    14→
+    15→---
+    16→
+    17→# 1. Recommended User-Visible Optimization Levels
+    18→
+    19→```text
+    20→-O0
+    21→-Og
+    22→-O1
+    23→-O2
+    24→-O3
+    25→-Os
+    26→-Oz
+    27→```
+    28→
+    29→That is enough. More levels create confusion and support burden.
+    30→
+    31→## Summary Table
+    32→
+    33→| Level | Goal | Compile Speed | Code Quality | Use Case |
+    34→|---|---|---:|---:|---|
+    35→| `-O0` | Debug fidelity | Fastest | Lowest | Debugging, crash triage |
+    36→| `-Og` | Debug-friendly optimization | Fast | Low-medium | Debug with some optimization |
+    37→| `-O1` | Fast compile, basic optimization | Fast | Medium | Developer iteration |
+    38→| `-O2` | Default production | Moderate | High | Normal release builds |
+    39→| `-O3` | Peak performance | Slow | Highest | Final release, HPC, HFT, engines |
+    40→| `-Os` | Size-aware production | Moderate | High, size-biased | Embedded, mobile, binary size limits |
+    41→| `-Oz` | Aggressive size reduction | Moderate | Medium-high, size-first | Extremely constrained environments |
+    42→
+    43→---
+    44→
+    45→# 2. What Each Level Means
+    46→
+    47→## `-O0` — No Optimization
+    48→
+    49→Purpose:
+    50→
+    51→- preserve source-level correspondence
+    52→- make debugging predictable
+    53→- compile as fast as possible
+    54→- keep assertions and checks visible
+    55→- avoid confusing stack traces
+    56→
+    57→Enabled:
+    58→
+    59→- required lowering only
+    60→- no scalar optimization
+    61→- no inlining except what is semantically mandatory
+    62→- no vectorization
+    63→- no speculative optimization
+    64→- no PGO-driven transforms
+    65→- linear-scan register allocation or simplest possible allocator
+    66→- full debug info preserved
+    67→
+    68→Disabled:
+    69→
+    70→- GVN
+    71→- SCCP
+    72→- LICM
+    73→- loop transforms
+    74→- vectorization
+    75→- escape analysis
+    76→- PEA
+    77→- speculative devirtualization
+    78→- aggressive inlining
+    79→- hot/cold splitting
+    80→
+    81→`-O0` is not “bad code.” It is **faithful code**.
+    82→
+    83→---
+    84→
+    85→## `-Og` — Debug-Friendly Optimization
+    86→
+    87→Purpose:
+    88→
+    89→- improve performance slightly without destroying debuggability
+    90→- keep local variables mostly visible
+    91→- avoid aggressive inlining
+    92→- avoid transforms that heavily distort stack traces
+    93→
+    94→Enabled:
+    95→
+    96→- constant folding
+    97→- identity collapse
+    98→- dead node elimination
+    99→- copy propagation
+   100→- simple algebraic simplification
+   101→- very small always-inline expansion
+   102→- basic register coalescing
+   103→
+   104→Disabled:
+   105→
+   106→- aggressive inlining
+   107→- loop unrolling
+   108→- vectorization
+   109→- SROA when it destroys variable visibility
+   110→- PEA
+   111→- speculative devirtualization
+   112→
+   113→`-Og` is useful for developers who need performance sanity without losing their debugger.
+   114→
+   115→---
+   116→
+   117→## `-O1` — Fast Optimization
+   118→
+   119→Purpose:
+   120→
+   121→- fast compile
+   122→- obvious wins only
+   123→- low memory usage
+   124→- good enough for iteration builds
+   125→
+   126→Enabled:
+   127→
+   128→- canonicalization
+   129→- constant folding
+   130→- SCCP, limited
+   131→- GVN, limited
+   132→- dead code elimination
+   133→- copy propagation
+   134→- phi simplification
+   135→- algebraic simplification
+   136→- tail recursion elimination
+   137→- small inlining
+   138→- basic loop detection
+   139→- basic branch probability heuristics
+   140→- linear-scan register allocation
+   141→- simple machine peephole
+   142→
+   143→Disabled or limited:
+   144→
+   145→- no aggressive LICM
+   146→- no loop unrolling except trivial
+   147→- no vectorization
+   148→- no SROA except obvious cases
+   149→- no PEA
+   150→- no speculative devirtualization
+   151→- no outer-loop vectorization
+   152→- no superword packing
+   153→
+   154→`-O1` should feel like:
+   155→
+   156→```text
+   157→Much faster than -O0, but still compiles quickly.
+   158→```
+   159→
+   160→---
+   161→
+   162→## `-O2` — Default Production
+   163→
+   164→This is the most important level.
+   165→
+   166→Purpose:
+   167→
+   168→- best general-purpose tradeoff
+   169→- strong optimization without insane compile time
+   170→- safe speculation only with strong evidence
+   171→- good code size
+   172→- reliable diagnostics and debuggability
+   173→
+   174→Enabled:
+   175→
+   176→- full canonicalization
+   177→- SCCP
+   178→- GVN
+   179→- redundant load elimination
+   180→- store-to-load forwarding
+   181→- dead store elimination
+   182→- SROA
+   183→- alias analysis
+   184→- memory dependence analysis
+   185→- LICM
+   186→- loop detection and classification
+   187→- induction variable analysis
+   188→- limited loop unrolling
+   189→- loop peeling when useful
+   190→- if-conversion
+   191→- predication
+   192→- branch probability inference
+   193→- hot path straightening
+   194→- basic loop vectorization
+   195→- SLP vectorization
+   196→- idiom recognition
+   197→- reduction recognition
+   198→- interleaved access recognition
+   199→- vector legalization
+   200→- static devirtualization
+   201→- trait impl hierarchy analysis
+   202→- cost-based inlining
+   203→- closure inlining
+   204→- argument specialization when statically proven
+   205→- escape analysis
+   206→- heap-to-stack promotion when proven
+   207→- IRC register allocation or budgeted IRC
+   208→- post-RA cleanup
+   209→- machine peephole
+   210→- machine LICM
+   211→
+   212→Speculation policy:
+   213→
+   214→- static proofs only, or
+   215→- PGO with high confidence and explicit guards
+   216→
+   217→`-O2` should be the default for:
+   218→
+   219→```bash
+   220→jpm build --release
+   221→```
+   222→
+   223→---
+   224→
+   225→## `-O3` — Peak Performance
+   226→
+   227→Purpose:
+   228→
+   229→- maximum runtime performance
+   230→- accept longer compile time
+   231→- accept larger binaries when profitable
+   232→- enable research-grade passes
+   233→- enable guarded speculation with PGO/JIT evidence
+   234→
+   235→Enabled:
+   236→
+   237→- everything in `-O2`
+   238→- aggressive inlining
+   239→- recursive inlining bounding
+   240→- full loop optimization suite
+   241→- loop interchange
+   242→- loop fusion
+   243→- loop fission
+   244→- aggressive unrolling
+   245→- profile-guided unrolling
+   246→- outer-loop vectorization
+   247→- SuperwordPacker
+   248→- shuffle optimization
+   249→- vector width selection
+   250→- AutoSOA transform if proven profitable
+   251→- speculative devirtualization
+   252→- guard insertion/hoisting/weakening/merging
+   253→- assumption tracking
+   254→- partial escape analysis
+   255→- materialization point insertion
+   256→- allocation-site profiling integration
+   257→- inline cache insertion in JIT mode
+   258→- hot/cold splitting
+   259→- full post-RA optimization
+   260→- full machine scheduling/bundling where implemented
+   261→
+   262→`-O3` is for final release builds, performance-sensitive libraries, and benchmarking.
+   263→
+   264→---
+   265→
+   266→## `-Os` — Size-Aware Production
+   267→
+   268→Purpose:
+   269→
+   270→- high optimization, but cost model biased toward smaller code
+   271→- avoid optimizations that grow code unless clearly profitable
+   272→
+   273→Enabled:
+   274→
+   275→- most `-O2` scalar/memory/loop optimizations
+   276→- inlining with smaller budget
+   277→- no aggressive unrolling unless size-neutral
+   278→- vectorization only when size-neutral or clearly profitable
+   279→- no AutoSOA by default
+   280→- no aggressive speculative cloning
+   281→
+   282→Disabled or restricted:
+   283→
+   284→- large loop unrolling
+   285→- excessive inlining
+   286→- code duplication
+   287→- speculative clones unless size cost is justified
+   288→
+   289→---
+   290→
+   291→## `-Oz` — Aggressive Size Reduction
+   292→
+   293→Purpose:
+   294→
+   295→- minimize binary size even at some performance cost
+   296→
+   297→Enabled:
+   298→
+   299→- conservative inlining
+   300→- aggressive dead code elimination
+   301→- shared helper outlining where applicable
+   302→- minimal unrolling
+   303→- minimal vectorization
+   304→- size-first cost model everywhere
+   305→
+   306→Disabled:
+   307→
+   308→- most code-growing transforms
+   309→- aggressive specialization
+   310→- large speculative clones
+   311→
+   312→---
+   313→
+   314→# 3. Do Not Add `-Ofast`
+   315→
+   316→Avoid `-Ofast` as a named level.
+   317→
+   318→The problem with `-Ofast` is that it usually means:
+   319→
+   320→```text
+   321→Break numeric semantics for speed.
+   322→```
+   323→
+   324→For JULES, that violates the core correctness laws.
+   325→
+   326→Instead, use an explicit modifier:
+   327→
+   328→```bash
+   329→--fp=strict        # default
+   330→--fp=fast          # dangerous, explicit, scoped
+   331→--fp=fast=module:math_kernels
+   332→```
+   333→
+   334→Fast floating point must be:
+   335→
+   336→- explicit
+   337→- scoped
+   338→- documented
+   339→- disabled by default
+   340→- never implied by an optimization level
+   341→
+   342→---
+   343→
+   344→# 4. PGO Is Not a Level
+   345→
+   346→PGO is a modifier.
+   347→
+   348→```bash
+   349→--pgo=off
+   350→--pgo=instrument
+   351→--pgo=use=<profile>
+   352→--pgo=sample=<profile>
+   353→--pgo=live       # internal JIT mode
+   354→```
+   355→
+   356→## PGO Modes
+   357→
+   358→| Mode | Meaning |
+   359→|---|---|
+   360→| `--pgo=off` | No profile data |
+   361→| `--pgo=instrument` | Emit counters and profile hooks |
+   362→| `--pgo=use=file.prof` | Use recorded profile data |
+   363→| `--pgo=sample=file.prof` | Use sampled profile data |
+   364→| `--pgo=live` | JIT uses runtime profile directly |
+   365→
+   366→## What PGO Changes
+   367→
+   368→PGO does **not** create new optimization logic. It changes thresholds and confidence.
+   369→
+   370→PGO influences:
+   371→
+   372→- inlining decisions
+   373→- branch probabilities
+   374→- hot/cold splitting
+   375→- loop unroll factors
+   376→- vector width selection
+   377→- speculative devirtualization
+   378→- argument specialization
+   379→- partial escape analysis
+   380→- guard confidence
+   381→- allocation-site assumptions
+   382→- trace scheduling
+   383→- function layout
+   384→- basic block layout
+   385→
+   386→Example:
+   387→
+   388→```text
+   389→Without PGO:
+   390→    speculative devirtualization requires static proof
+   391→
+   392→With PGO:
+   393→    speculative devirtualization allowed if profile confidence > threshold
+   394→    guard required
+   395→    deopt fallback required
+   396→```
+   397→
+   398→This keeps Rule 2 intact:
+   399→
+   400→> Profiles are a force multiplier, not new logic.
+   401→
+   402→---
+   403→
+   404→# 5. FTO, Thin LTO, and Full LTO
+   405→
+   406→These are also not optimization levels. They are **visibility modes**.
+   407→
+   408→They answer:
+   409→
+   410→> How much of the program can the optimizer see at once?
+   411→
+   412→Recommended modes:
+   413→
+   414→```bash
+   415→--lto=none
+   416→--fto
+   417→--lto=thin
+   418→--lto=full
+   419→```
+   420→
+   421→If by FTO you mean a fast thin optimization mode, define it as a distinct mode below ThinLTO.
+   422→
+   423→---
+   424→
+   425→## `--lto=none`
+   426→
+   427→Normal separate compilation.
+   428→
+   429→Each module is compiled independently.
+   430→
+   431→Good for:
+   432→
+   433→- debug builds
+   434→- fast incremental builds
+   435→- development iteration
+   436→
+   437→Limitations:
+   438→
+   439→- no cross-module inlining
+   440→- limited devirtualization
+   441→- limited global constant propagation
+   442→- limited cross-module SROA
+   443→
+   444→---
+   445→
+   446→## `--fto` — Fast Thin Optimization
+   447→
+   448→FTO is summary-assisted separate compilation.
+   449→
+   450→Each module produces:
+   451→
+   452→- optimized object code
+   453→- generic summaries
+   454→- trait impl summaries
+   455→- function effect summaries
+   456→- type layout summaries
+   457→- inline cost summaries
+   458→- comptime export metadata
+   459→
+   460→But the linker does **not** merge IR graphs.
+   461→
+   462→FTO enables:
+   463→
+   464→- better separate compilation of generics
+   465→- smarter local decisions using imported summaries
+   466→- limited cross-module devirtualization when proof is obvious
+   467→- faster incremental builds than ThinLTO
+   468→- lower memory usage than ThinLTO
+   469→
+   470→FTO does **not** enable:
+   471→
+   472→- full cross-module inlining
+   473→- global DCE
+   474→- whole-program trait analysis
+   475→- cross-module SROA
+   476→- global speculative specialization
+   477→
+   478→Recommended default for developer release builds:
+   479→
+   480→```bash
+   481→jpm build --release -O2 --fto
+   482→```
+   483→
+   484→---
+   485→
+   486→## `--lto=thin`
+   487→
+   488→ThinLTO-style link-time optimization.
+   489→
+   490→Two phases:
+   491→
+   492→### Phase 1: Per-Module Preoptimization
+   493→
+   494→Each module is optimized locally and produces summaries.
+   495→
+   496→### Phase 2: Thin Link-Time Optimization
+   497→
+   498→The linker reads summaries and decides:
+   499→
+   500→- which functions to import
+   501→- which calls to inline
+   502→- which trait impls can be devirtualized
+   503→- which constants can be propagated
+   504→- which functions are dead
+   505→- which generic specializations should be materialized
+   506→
+   507→Then imported functions are optimized in the importing module.
+   508→
+   509→ThinLTO enables:
+   510→
+   511→- cross-module inlining
+   512→- cross-module devirtualization
+   513→- cross-module constant propagation
+   514→- better generic specialization
+   515→- global dead function elimination
+   516→- improved hot/cold layout
+   517→
+   518→ThinLTO avoids:
+   519→
+   520→- merging the entire program into one giant graph
+   521→- extreme memory usage
+   522→- catastrophic compile time
+   523→
+   524→Recommended production default:
+   525→
+   526→```bash
+   527→jpm build --release -O3 --lto=thin --pgo=use=profile.prof
+   528→```
+   529→
+   530→---
+   531→
+   532→## `--lto=full`
+   533→
+   534→Full whole-program LTO.
+   535→
+   536→All modules are merged into a whole-program view.
+   537→
+   538→Enables:
+   539→
+   540→- whole-program devirtualization
+   541→- whole-program trait hierarchy analysis
+   542→- global SCCP
+   543→- global DCE
+   544→- cross-module SROA
+   545→- cross-module escape analysis
+   546→- global inlining
+   547→- global argument specialization
+   548→- global PEA where provable
+   549→- global generic specialization
+   550→- global layout optimization
+   551→
+   552→Costs:
+   553→
+   554→- high memory usage
+   555→- slower compile time
+   556→- less incremental friendliness
+   557→- harder debugging
+   558→- larger link-time complexity
+   559→
+   560→Use for:
+   561→
+   562→- final release builds
+   563→- performance-critical binaries
+   564→- embedded firmware
+   565→- HFT
+   566→- game engine shipping builds
+   567→- benchmark submissions
+   568→
+   569→Example:
+   570→
+   571→```bash
+   572→jpm build --release -O3 --lto=full --pgo=use=profile.prof
+   573→```
+   574→
+   575→---
+   576→
+   577→# 6. Recommended Mode Matrix
+   578→
+   579→## Debug
+   580→
+   581→```bash
+   582→jules build -O0
+   583→```
+   584→
+   585→or:
+   586→
+   587→```bash
+   588→jules build -Og
+   589→```
+   590→
+   591→No LTO. No PGO. Full debug info. Verifier enabled.
+   592→
+   593→---
+   594→
+   595→## Developer Iteration
+   596→
+   597→```bash
+   598→jules build -O1
+   599→```
+   600→
+   601→or:
+   602→
+   603→```bash
+   604→jules build -O2 --fto
+   605→```
+   606→
+   607→Fast enough for daily work.
+   608→
+   609→---
+   610→
+   611→## Default Release
+   612→
+   613→```bash
+   614→jules build --release -O2 --fto
+   615→```
+   616→
+   617→Good performance, good compile time, good incremental behavior.
+   618→
+   619→---
+   620→
+   621→## Production Release
+   622→
+   623→```bash
+   624→jules build --release -O3 --lto=thin
+   625→```
+   626→
+   627→If profile data exists:
+   628→
+   629→```bash
+   630→jules build --release -O3 --lto=thin --pgo=use=default.prof
+   631→```
+   632→
+   633→This should be the normal shipping default for performance-sensitive projects.
+   634→
+   635→---
+   636→
+   637→## Peak Release
+   638→
+   639→```bash
+   640→jules build --release -O3 --lto=full --pgo=use=default.prof
+   641→```
+   642→
+   643→Use when compile time and memory are acceptable.
+   644→
+   645→---
+   646→
+   647→## Size Release
+   648→
+   649→```bash
+   650→jules build --release -Os --fto
+   651→```
+   652→
+   653→or:
+   654→
+   655→```bash
+   656→jules build --release -Oz --fto
+   657→```
+   658→
+   659→---
+   660→
+   661→# 7. Pass Availability by Level
+   662→
+   663→This is the important part.
+   664→
+   665→Legend:
+   666→
+   667→```text
+   668→✗   disabled
+   669→~   limited / conservative
+   670→✓   enabled
+   671→✓✓  aggressive
+   672→```
+   673→
+   674→## Phase 0: Frontend Residue Cleanup
+   675→
+   676→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   677→|---|---:|---:|---:|---:|---:|---:|---:|
+   678→| DeadNodeElimination | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   679→| IdentityCollapse | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   680→| ConstantFolding | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   681→| TypeCanonicalization | required | required | required | required | required | required | required |
+   682→| ComptimeResidueFold | required | required | required | required | required | required | required |
+   683→| AssertElision | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   684→| PhiSimplification | required | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   685→
+   686→`TypeCanonicalization` and `ComptimeResidueFold` are required lowering steps, not optional optimizations.
+   687→
+   688→---
+   689→
+   690→## Phase 1: Value and Scalar Optimization
+   691→
+   692→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   693→|---|---:|---:|---:|---:|---:|---:|---:|
+   694→| SCCP | ✗ | ~ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   695→| GlobalValueNumbering | ✗ | ~ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   696→| RedundantPhiElimination | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   697→| CopyPropagation | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   698→| AlgebraicSimplification | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ |
+   699→| Reassociation | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   700→| SignExtensionElimination | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ~ |
+   701→| NarrowingTransform | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ✓ |
+   702→| BitwiseOptimization | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   703→| SelectOptimization | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   704→| OverflowCheckElimination | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   705→
+   706→---
+   707→
+   708→## Phase 2: Memory Optimization
+   709→
+   710→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   711→|---|---:|---:|---:|---:|---:|---:|---:|
+   712→| AliasAnalysisInitialization | ✗ | ~ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   713→| MemoryDependenceAnalysis | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   714→| RedundantLoadElimination | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   715→| StoreToLoadForwarding | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   716→| DeadStoreElimination | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   717→| StoreMerging | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ✓ |
+   718→| LoadHoisting | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   719→| ScalarReplacementOfAggregates | ✗ | ~ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   720→| BitfieldLowering | required | required | required | required | required | required | required |
+   721→| StackSlotColoring | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ✓ |
+   722→| HeapToStackPromotion | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   723→| MemorySSARepair | required after memory transforms | required after memory transforms | required after memory transforms | required after memory transforms | required after memory transforms | required after memory transforms | required after memory transforms |
+   724→
+   725→---
+   726→
+   727→## Phase 3: Escape and Allocation Analysis
+   728→
+   729→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   730→|---|---:|---:|---:|---:|---:|---:|---:|
+   731→| PointsToAnalysis | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   732→| EscapeAnalysis | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   733→| PartialEscapeAnalysis | ✗ | ✗ | ✗ | ~ | ✓ | ~ | ✗ |
+   734→| AllocationSiteProfiling | JIT/profile mode only | JIT/profile mode only | JIT/profile mode only | JIT/profile mode only | JIT/profile mode only | JIT/profile mode only | JIT/profile mode only |
+   735→| MaterializationPointInsertion | ✗ | ✗ | ✗ | with PEA | with PEA | with PEA | ✗ |
+   736→| LockElision | ✗ | ✗ | ✗ | if proven | if proven/provided | if proven | ✗ |
+   737→
+   738→PEA should be conservative at `-O2` unless strong static proof or high-confidence PGO exists.
+   739→
+   740→---
+   741→
+   742→## Phase 4: Loop Analysis and Transforms
+   743→
+   744→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   745→|---|---:|---:|---:|---:|---:|---:|---:|
+   746→| LoopDetection | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   747→| InductionVariableRecognition | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   748→| LoopClassification | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   749→| LoopInvariantCodeMotion | ✗ | ✗ | ~ | ✓ | ✓✓ | ✓ | ~ |
+   750→| LoadLICM | ✗ | ✗ | ~ | ✓ | ✓✓ | ~ | ✗ |
+   751→| LoopUnrolling | ✗ | ✗ | ~ | ✓ | ✓✓ | ~ | ✗ |
+   752→| ProfileGuidedUnrolling | ✗ | ✗ | ✗ | with PGO | with PGO | with PGO | ✗ |
+   753→| LoopPeeling | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   754→| LoopInterchange | ✗ | ✗ | ✗ | ~ | ✓ | ~ | ✗ |
+   755→| LoopFusion | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   756→| LoopFission | ✗ | ✗ | ✗ | ~ | ✓ | ✗ | ✗ |
+   757→| Predication | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   758→| IfConversion | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   759→| TailRecursionElimination | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   760→| BranchProbabilityInference | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   761→| HotPathStraightening | ✗ | ✗ | ~ | ✓ | ✓✓ | ~ | ✗ |
+   762→
+   763→---
+   764→
+   765→## Phase 5: Vectorization and Superword Parallelism
+   766→
+   767→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   768→|---|---:|---:|---:|---:|---:|---:|---:|
+   769→| IdiomRecognition | ✗ | ~ | ~ | ✓ | ✓ | ✓ | ~ |
+   770→| SLPVectorizer | ✗ | ✗ | ✗ | ✓ | ✓✓ | ~ | ✗ |
+   771→| SuperwordPacker | ✗ | ✗ | ✗ | ~ | ✓ | ✗ | ✗ |
+   772→| LoopVectorizer | ✗ | ✗ | ✗ | ✓ | ✓✓ | ~ | ✗ |
+   773→| OuterLoopVectorizer | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ |
+   774→| InterleavedAccessRecognition | ✗ | ✗ | ✗ | ✓ | ✓ | ~ | ✗ |
+   775→| ReductionRecognizer | ✗ | ✗ | ✗ | ✓ | ✓ | ~ | ✗ |
+   776→| VectorLegalization | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing |
+   777→| MaskGeneration | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing |
+   778→| ShuffleOptimization | ✗ | ✗ | ✗ | ✓ | ✓ | ~ | ✗ |
+   779→| AutoSOATransform | ✗ | ✗ | ✗ | ✗ | opt-in | ✗ | ✗ |
+   780→| VectorCostModelEvaluation | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing | if vectorizing |
+   781→| SIMDIntrinsicMatching | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ~ |
+   782→| VectorWidthSelection | ✗ | ✗ | ✗ | ✓ | ✓✓ | ~ | ✗ |
+   783→
+   784→AutoSOA should be opt-in even at `-O3` until it has strong cost modeling and testing.
+   785→
+   786→---
+   787→
+   788→## Phase 6: Devirtualization and Speculation
+   789→
+   790→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   791→|---|---:|---:|---:|---:|---:|---:|---:|
+   792→| TraitImplHierarchyAnalysis | ✗ | ~ | ✓ | ✓ | ✓ | ✓ | ~ |
+   793→| StaticDevirtualization | ✗ | ~ | ✓ | ✓ | ✓✓ | ✓ | ~ |
+   794→| SpeculativeDevirtualization | ✗ | ✗ | ✗ | with PGO | ✓ | with PGO | ✗ |
+   795→| InlineCacheInsertion | JIT only | JIT only | JIT only | JIT only | JIT only | JIT only | JIT only |
+   796→| GuardInsertion | with speculation | with speculation | with speculation | with speculation | with speculation | with speculation | with speculation |
+   797→| GuardHoisting | ✗ | ✗ | ✗ | ~ | ✓ | ~ | ✗ |
+   798→| GuardWeakening | ✗ | ✗ | ✗ | ~ | ✓ | ~ | ✗ |
+   799→| GuardMerging | ✗ | ✗ | ✗ | ~ | ✓ | ~ | ✗ |
+   800→| AssumptionTracking | with speculation | with speculation | with speculation | with speculation | with speculation | with speculation | with speculation |
+   801→
+   802→AOT speculative optimization must be backed by either static proof or PGO. JIT speculative optimization must be backed by live profile evidence and guards.
+   803→
+   804→---
+   805→
+   806→## Phase 7: Inlining and Interprocedural
+   807→
+   808→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   809→|---|---:|---:|---:|---:|---:|---:|---:|
+   810→| InliningCostModel | required if inlining | required if inlining | required if inlining | required if inlining | required if inlining | required if inlining | required if inlining |
+   811→| AlwaysInlineEnforcement | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   812→| CostBasedInlining | ✗ | ~ | ~ | ✓ | ✓✓ | ~ | ✗ |
+   813→| RecursiveInliningBounding | ✗ | ✗ | ~ | ✓ | ✓ | ✓ | ~ |
+   814→| ArgumentSpecialization | ✗ | ✗ | ~ | ✓ | ✓✓ | ~ | ✗ |
+   815→| ClosureInlining | ✗ | ~ | ~ | ✓ | ✓ | ✓ | ~ |
+   816→| LTOSummaryGeneration | FTO/LTO modes | FTO/LTO modes | FTO/LTO modes | FTO/LTO modes | FTO/LTO modes | FTO/LTO modes | FTO/LTO modes |
+   817→
+   818→---
+   819→
+   820→## Phase 8: Lowering and Machine Optimization
+   821→
+   822→| Pass | -O0 | -Og | -O1 | -O2 | -O3 | -Os | -Oz |
+   823→|---|---:|---:|---:|---:|---:|---:|---:|
+   824→| CFGLinearization | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   825→| InstructionSelection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+   826→| RegisterAllocation | simple | simple | linear scan | IRC/budgeted IRC | IRC | IRC/budgeted IRC | linear/budgeted |
+   827→| PostRACleanup | ~ | ✓ | ✓ | ✓ | ✓✓ | ✓ | ~ |
+   828→| MachinePeephole | ~ | ✓ | ✓ | ✓ | ✓✓ | ✓ | ~ |
+   829→| MachineLICM | ✗ | ✗ | ~ | ✓ | ✓ | ~ | ✗ |
+   830→| DeoptMetadataEmission | if speculation/JIT | if speculation/JIT | if speculation/JIT | if speculation/JIT | if speculation/JIT | if speculation/JIT | if speculation/JIT |
+   831→
+   832→---
+   833→
+   834→# 8. Budgets by Level
+   835→
+   836→Do not hard-code magic numbers. But conceptually:
+   837→
+   838→| Budget | -O1 | -O2 | -O3 |
+   839→|---|---:|---:|---:|
+   840→| Inlining budget | small | medium | large |
+   841→| Max inline depth | low | medium | high |
+   842→| Fixpoint iterations | 1 | 2 | 3–4 |
+   843→| Loop unroll factor | tiny | moderate | aggressive |
+   844→| Vectorization aggressiveness | off | normal | high |
+   845→| Speculation budget | none/minimal | conservative | aggressive with evidence |
+   846→| Register allocator | linear scan | budgeted IRC | full IRC |
+   847→| Code size tolerance | low | medium | high |
+   848→| Compile time tolerance | low | medium | high |
+   849→
+   850→Example named constants:
+   851→
+   852→```cpp
+   853→constexpr uint32_t kO1_InlineBudget = 50;
+   854→constexpr uint32_t kO2_InlineBudget = 225;
+   855→constexpr uint32_t kO3_InlineBudget = 600;
+   856→
+   857→constexpr uint32_t kO2_MaxUnrollFactor = 4;
+   858→constexpr uint32_t kO3_MaxUnrollFactor = 8;
+   859→
+   860→constexpr uint32_t kO2_FixpointIterations = 2;
+   861→constexpr uint32_t kO3_FixpointIterations = 4;
+   862→
+   863→constexpr float kPGO_SpeculativeDevirtConfidence = 0.95f;
+   864→constexpr float kPGO_PEA_EscapeConfidence = 0.98f;
+   865→```
+   866→
+   867→These numbers must be tuned empirically.
+   868→
+   869→---
+   870→
+   871→# 9. Pipeline Shape by Level
+   872→
+   873→## `-O0`
+   874→
+   875→```text
+   876→Source
+   877→  → Parse
+   878→  → Sema
+   879→  → HIR
+   880→  → Minimal lowering
+   881→  → MIR
+   882→  → Simple isel
+   883→  → Simple regalloc
+   884→  → Emit
+   885→```
+   886→
+   887→No optimization loop.
+   888→
+   889→---
+   890→
+   891→## `-O1`
+   892→
+   893→```text
+   894→Source
+   895→  → Parse
+   896→  → Sema
+   897→  → HIR
+   898→  → SoN
+   899→  → Cleanup
+   900→  → Basic scalar opts
+   901→  → Small inlining
+   902→  → Basic loop opts
+   903→  → Lowering
+   904→  → Isel
+   905→  → Linear scan
+   906→  → Emit
+   907→```
+   908→
+   909→---
+   910→
+   911→## `-O2`
+   912→
+   913→```text
+   914→Source
+   915→  → Parse
+   916→  → Sema
+   917→  → HIR
+   918→  → SoN
+   919→  → Cleanup
+   920→  → Inline + SCCP/GVN/DCE loop
+   921→  → Memory opts
+   922→  → SROA
+   923→  → Escape analysis
+   924→  → Loop opts
+   925→  → Vectorization
+   926→  → Devirtualization
+   927→  → Late cleanup
+   928→  → Lowering
+   929→  → Isel
+   930→  → IRC
+   931→  → Post-RA opts
+   932→  → Emit
+   933→```
+   934→
+   935→---
+   936→
+   937→## `-O3`
+   938→
+   939→```text
+   940→Source
+   941→  → Parse
+   942→  → Sema
+   943→  → HIR
+   944→  → SoN
+   945→  → Cleanup
+   946→  → Aggressive inline loop
+   947→  → Argument specialization
+   948→  → Memory opts
+   949→  → SROA
+   950→  → Escape analysis
+   951→  → PEA if evidence
+   952→  → Loop opts
+   953→  → Outer-loop vectorization
+   954→  → Superword packing
+   955→  → Speculative devirt
+   956→  → Guard optimization
+   957→  → Hot/cold splitting
+   958→  → Late cleanup
+   959→  → Lowering
+   960→  → Isel
+   961→  → Full IRC
+   962→  → Aggressive post-RA
+   963→  → Emit
+   964→```
+   965→
+   966→---
+   967→
+   968→# 10. PGO Pipeline
+   969→
+   970→## Instrumentation Build
+   971→
+   972→```bash
+   973→jules build -O2 --pgo=instrument
+   974→```
+   975→
+   976→Compiler emits:
+   977→
+   978→- edge counters
+   979→- function counters
+   980→- branch counters
+   981→- call site counters
+   982→- type/trait dispatch profiles
+   983→- value profiles where enabled
+   984→- allocation-site profiles
+   985→- loop trip-count profiles
+   986→
+   987→Rules:
+   988→
+   989→- instrumentation must not change semantics
+   990→- counters must be robust and saturating
+   991→- overhead must be bounded
+   992→- profile format must be versioned
+   993→
+   994→---
+   995→
+   996→## Training Run
+   997→
+   998→```bash
+   999→./my_program --workload=representative
+  1000→jpm profile export --out=default.prof
+  1001→```
+  1002→
+  1003→The profile file must contain:
+  1004→
+  1005→- schema version
+  1006→- compiler version
+  1007→- target hash
+  1008→- module hashes
+  1009→- confidence data
+  1010→- sample counts
+  1011→- decay/age metadata
+  1012→- checksum
+  1013→
+  1014→---
+  1015→
+  1016→## Optimized Build
+  1017→
+  1018→```bash
+  1019→jules build -O3 --pgo=use=default.prof --lto=thin
+  1020→```
+  1021→
+  1022→Compiler consumes profile and applies it to:
+  1023→
+  1024→- branch probability inference
+  1025→- inlining cost model
+  1026→- hot path straightening
+  1027→- unrolling
+  1028→- vector width selection
+  1029→- speculative devirtualization
+  1030→- PEA
+  1031→- guard confidence
+  1032→- function/block layout
+  1033→
+  1034→---
+  1035→
+  1036→# 11. LTO/FTO Pipeline
+  1037→
+  1038→## FTO
+  1039→
+  1040→```text
+  1041→Module A → optimize locally → object + summary
+  1042→Module B → optimize locally → object + summary
+  1043→Module C → optimize locally → object + summary
+  1044→Link:
+  1045→    use summaries for limited cross-module decisions
+  1046→    no full IR merging
+  1047→```
+  1048→
+  1049→Best for:
+  1050→
+  1051→- incremental release builds
+  1052→- fast compile with some cross-module awareness
+  1053→
+  1054→---
+  1055→
+  1056→## ThinLTO
+  1057→
+  1058→```text
+  1059→Module A → preoptimize → object + summary
+  1060→Module B → preoptimize → object + summary
+  1061→Module C → preoptimize → object + summary
+  1062→
+  1063→Thin link phase:
+  1064→    read summaries
+  1065→    compute import list
+  1066→    import hot functions
+  1067→    perform cross-module inlining/devirt/constprop
+  1068→    run backend per merged subset
+  1069→```
+  1070→
+  1071→Best default for production.
+  1072→
+  1073→---
+  1074→
+  1075→## FullLTO
+  1076→
+  1077→```text
+  1078→Module A ─┐
+  1079→Module B ─┼→ whole-program IR graph/partitioned global graph
+  1080→Module C ─┘
+  1081→
+  1082→Whole-program passes:
+  1083→    global DCE
+  1084→    global SCCP
+  1085→    whole-program devirt
+  1086→    global inlining
+  1087→    global argument specialization
+  1088→    global SROA
+  1089→    global escape analysis
+  1090→    global layout
+  1091→
+  1092→Backend:
+  1093→    split into machine units
+  1094→    emit objects
+  1095→```
+  1096→
+  1097→Best for peak builds.
+  1098→
+  1099→---
+  1100→
+  1101→# 12. JIT Optimization Budgets
+  1102→
+  1103→JIT is not a tiered execution model, but it still needs compile-time budgets.
+  1104→
+  1105→Recommended internal JIT budgets:
+  1106→
+  1107→```text
+  1108→JITBudget::Fast
+  1109→JITBudget::Balanced
+  1110→JITBudget::Peak
+  1111→```
+  1112→
+  1113→These are not user-visible execution tiers. They are compilation latency classes.
+  1114→
+  1115→## `JITBudget::Fast`
+  1116→
+  1117→Used when:
+  1118→
+  1119→- function just became hot
+  1120→- compile latency must be very low
+  1121→- function is small
+  1122→
+  1123→Equivalent roughly to:
+  1124→
+  1125→```text
+  1126→-O1 to light -O2, with strict time budget
+  1127→```
+  1128→
+  1129→## `JITBudget::Balanced`
+  1130→
+  1131→Used when:
+  1132→
+  1133→- function is sustained hot
+  1134→- profile confidence is high
+  1135→- compile latency budget is moderate
+  1136→
+  1137→Equivalent roughly to:
+  1138→
+  1139→```text
+  1140→-O2 with profile-guided specialization
+  1141→```
+  1142→
+  1143→## `JITBudget::Peak`
+  1144→
+  1145→Used when:
+  1146→
+  1147→- function is extremely hot
+  1148→- profile is stable
+  1149→- deopt history is clean
+  1150→- compile time can be spent
+  1151→
+  1152→Equivalent roughly to:
+  1153→
+  1154→```text
+  1155→-O3 with live profile evidence
+  1156→```
+  1157→
+  1158→Important:
+  1159→
+  1160→> The user-visible optimization level still applies. JIT budgets only constrain how much work the runtime compiler is allowed to spend at that moment.
+  1161→
+  1162→Example:
+  1163→
+  1164→```bash
+  1165→jules run --jit --opt=O2 --jit-budget=balanced
+  1166→```
+  1167→
+  1168→or:
+  1169→
+  1170→```bash
+  1171→jules run --jit --opt=O3 --jit-budget=peak
+  1172→```
+  1173→
+  1174→---
+  1175→
+  1176→# 13. Default Recommendations
+  1177→
+  1178→## For `jpm build`
+  1179→
+  1180→```text
+  1181→Debug:
+  1182→    -O0
+  1183→    no PGO
+  1184→    no LTO
+  1185→    verifier on
+  1186→    debug info full
+  1187→
+  1188→Dev release:
+  1189→    -O2
+  1190→    --fto
+  1191→    no PGO by default
+  1192→
+  1193→Release:
+  1194→    -O2 or -O3
+  1195→    --lto=thin
+  1196→    PGO if available
+  1197→
+  1198→Peak:
+  1199→    -O3
+  1200→    --lto=full
+  1201→    --pgo=use
+  1202→```
+  1203→
+  1204→## Suggested `jpm` presets
+  1205→
+  1206→```toml
+  1207→[profile.dev]
+  1208→opt = "O0"
+  1209→debug = true
+  1210→lto = "none"
+  1211→pgo = "off"
+  1212→
+  1213→[profile.dev-release]
+  1214→opt = "O2"
+  1215→lto = "fto"
+  1216→pgo = "off"
+  1217→
+  1218→[profile.release]
+  1219→opt = "O3"
+  1220→lto = "thin"
+  1221→pgo = "use-if-available"
+  1222→
+  1223→[profile.peak]
+  1224→opt = "O3"
+  1225→lto = "full"
+  1226→pgo = "use"
+  1227→
+  1228→[profile.size]
+  1229→opt = "Os"
+  1230→lto = "fto"
+  1231→pgo = "off"
+  1232→
+  1233→[profile.tiny]
+  1234→opt = "Oz"
+  1235→lto = "fto"
+  1236→pgo = "off"
+  1237→```
+  1238→
+  1239→---
+  1240→
+  1241→# 14. What to Avoid
+  1242→
+  1243→## Avoid too many levels
+  1244→
+  1245→Bad:
+  1246→
+  1247→```text
+  1248→-O0 -O0.5 -O1 -O1.5 -O2 -O2.5 -O3 -O4 -O5
+  1249→```
+  1250→
+  1251→This creates confusion and impossible support expectations.
+  1252→
+  1253→---
+  1254→
+  1255→## Avoid making PGO a level
+  1256→
+  1257→Bad:
+  1258→
+  1259→```text
+  1260→-O2-pgo
+  1261→-O3-pgo
+  1262→```
+  1263→
+  1264→Good:
+  1265→
+  1266→```text
+  1267→-O2 --pgo=use
+  1268→-O3 --pgo=use
+  1269→```
+  1270→
+  1271→---
+  1272→
+  1273→## Avoid making LTO a level
+  1274→
+  1275→Bad:
+  1276→
+  1277→```text
+  1278→-Olto
+  1279→-Othin
+  1280→-Ofull
+  1281→```
+  1282→
+  1283→Good:
+  1284→
+  1285→```text
+  1286→-O2 --lto=thin
+  1287→-O3 --lto=full
+  1288→```
+  1289→
+  1290→---
+  1291→
+  1292→## Avoid hidden JIT tiers
+  1293→
+  1294→Bad:
+  1295→
+  1296→```text
+  1297→Tier 0 interpreter
+  1298→Tier 1 baseline
+  1299→Tier 2 optimizing
+  1300→Tier 3 AOT
+  1301→```
+  1302→
+  1303→JULES should not do this.
+  1304→
+  1305→Good:
+  1306→
+  1307→```text
+  1308→AOT compiled code
+  1309→JIT compiled code
+  1310→safe fallback variant
+  1311→recompilation without violated assumptions
+  1312→```
+  1313→
+  1314→JIT budget classes are compile-time decisions, not execution tiers.
+  1315→
+  1316→---
+  1317→
+  1318→# 15. Final Recommended Design
+  1319→
+  1320→```text
+  1321→Optimization levels:
+  1322→    -O0
+  1323→    -Og
+  1324→    -O1
+  1325→    -O2
+  1326→    -O3
+  1327→    -Os
+  1328→    -Oz
+  1329→
+  1330→Profile modes:
+  1331→    --pgo=off
+  1332→    --pgo=instrument
+  1333→    --pgo=use=<file>
+  1334→    --pgo=sample=<file>
+  1335→    --pgo=live
+  1336→
+  1337→Visibility modes:
+  1338→    --lto=none
+  1339→    --fto
+  1340→    --lto=thin
+  1341→    --lto=full
+  1342→
+  1343→Floating-point policy:
+  1344→    --fp=strict
+  1345→    --fp=fast
+  1346→    --fp=fast=<scope>
+  1347→
+  1348→JIT compile budgets:
+  1349→    --jit-budget=fast
+  1350→    --jit-budget=balanced
+  1351→    --jit-budget=peak
+  1352→```
+  1353→
+  1354→Best default:
+  1355→
+  1356→```bash
+  1357→jules build --release -O2 --fto
+  1358→```
+  1359→
+  1360→Best production:
+  1361→
+  1362→```bash
+  1363→jules build --release -O3 --lto=thin --pgo=use=default.prof
+  1364→```
+  1365→
+  1366→Best peak:
+  1367→
+  1368→```bash
+  1369→jules build --release -O3 --lto=full --pgo=use=default.prof
+  1370→```
+  1371→
+  1372→This gives you a clean, orthogonal system: levels control aggressiveness, PGO controls evidence, FTO/Thin/Full control visibility, and JIT budgets control runtime compile latency. That is how you keep the pipeline unified without reintroducing tiers.

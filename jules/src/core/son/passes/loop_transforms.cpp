@@ -45,6 +45,21 @@ bool match_counted(Graph& g, LoopInfo& li, DomTree& dom, const Loop& l,
     const Node& h = g.node(header);
     if (h.op != Op::Region || h.n_in != 2) return false;
 
+    // Packed (vectorized) loops are owned by pass 56: the scalar unroller/
+    // peeler would re-thread their phis with scalar-clone seeds and the
+    // double transform corrupts the lane plumbing. Vector loops get their
+    // ILP from the packed width; scalar unrolling adds nothing below 128-bit.
+    for (NodeId u : g.uses_of(header)) {
+        if (g.is_dead(u)) continue;
+        if (ty_is_vector(g.node(u).ty)) return false; // packed phi (vacc etc.)
+    }
+    for (NodeId blk : l.blocks) {
+        for (NodeId u : g.uses_of(blk)) {
+            if (g.is_dead(u) || g.node(u).in[0] != blk) continue;
+            if (ty_is_vector(g.node(u).ty)) return false; // packed body op
+        }
+    }
+
     u8 entry_slot = 2, latch_slot = 2;
     for (u8 i = 0; i < 2; ++i) {
         NodeId p = h.in[i];
@@ -160,7 +175,9 @@ struct Cloner {
     }
 
     NodeId clone_node(NodeId u, NodeId pin) {
-        const Node& un = g.node(u);
+        Node un = g.node(u); // COPY: make_arr below grows nodes_ and would
+                             // invalidate any reference into the vector
+                             // (use-after-free; caught by ASAN on t24)
         NodeId ins[kMaxInputs];
         ins[0] = pin;
         for (u8 i = 1; i < un.n_in; ++i) ins[i] = remap(un.in[i]);
@@ -214,7 +231,7 @@ struct Cloner {
     }
 
     NodeId clone_head(NodeId b) {
-        const Node& bn = g.node(b);
+        Node bn = g.node(b); // copy (vector growth below)
         NodeId ins[kMaxInputs];
         for (u8 i = 0; i < bn.n_in; ++i) ins[i] = remap(bn.in[i]);
         NodeId c = g.make_arr(bn.op, bn.ty, ins, bn.n_in, bn.sub, bn.aux);
@@ -285,12 +302,21 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
     NodeId header_latch = g.node(cl.header).in[cl.latch_slot]; // J_0
     if (header_latch == kNoNode || g.is_dead(header_latch)) return 0;
 
-    // value each phi holds when a new copy starts (copy 1 starts with the
-    // original body's outputs)
+    // Seed bookkeeping: copy m's seed is copy (m-1)'s clone of the phi's
+    // ORIGINAL seed input at the attach slot. Chaining through the original
+    // ids keeps remap() hits (its maps are keyed by original ids): chaining
+    // the live CLONE ids left trailing copies 3+ seeded from copy 1
+    // (observed: 4x-unrolled print loop duplicating its third lane's value
+    // and memory effects skipping a chain link).
     std::vector<NodeId> live = cl.phis;
     std::vector<NodeId> live_vals;
+    std::vector<NodeId> seed_orig;
     u8 seed_slot = at_entry ? cl.entry_slot : cl.latch_slot;
-    for (NodeId phi : live) live_vals.push_back(g.node(phi).in[seed_slot + 1]);
+    for (NodeId phi : live) {
+        NodeId v = g.node(phi).in[seed_slot + 1];
+        live_vals.push_back(v);
+        seed_orig.push_back(v);
+    }
     NodeId prev_latch = at_entry ? g.node(cl.header).in[cl.entry_slot] : header_latch;
 
     for (u32 copy = 1; copy <= extra; ++copy) {
@@ -323,12 +349,10 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
             }
         }
 
-        // this copy's outputs: clones of the phi update values, and the
-        // clone of the latch Jump
-        for (size_t i = 0; i < live.size(); ++i) {
-            NodeId old = live_vals[i];
-            live_vals[i] = c.remap(old);
-        }
+        // next copy's seed: this copy's clone of the ORIGINAL seed value
+        // (remap-of-original: the copy's vmap keys originals)
+        for (size_t i = 0; i < live.size(); ++i)
+            live_vals[i] = c.remap(seed_orig[i]);
         prev_latch = c.remap(header_latch);
     }
 

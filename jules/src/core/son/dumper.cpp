@@ -45,6 +45,7 @@ std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id,
             break;
         case Op::Cast:
             os << " op=" << cast_name(static_cast<CastOp>(n.sub));
+            if (static_cast<CastOp>(n.sub) == CastOp::Extract) os << " lane=" << n.aux;
             break;
         case Op::Alloc:
             if (n.flags & kFlagStackPromoted) os << " [stack-promoted]";

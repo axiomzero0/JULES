@@ -89,9 +89,33 @@ private:
             // this block's head is itself a Jump node: also gather pinned nodes
         }
 
-        // topological schedule: Kahn with data + memory edges inside the block
+        // topological schedule: Kahn with data + memory edges inside the block.
+        //
+        // Memory-ordering rule (soundness): a Load L reads the memory state
+        // of its version input M (in[1]). An effect node E (Store/Call/Alloc)
+        // consuming the SAME version M must execute AFTER every such load:
+        // the graph asserts "L sees the world as of M", and scheduling E
+        // first would let L observe E's writes (observed as loads moved
+        // after free() — tcache-poisoned reads). The rule also protects
+        // ancestor versions transitively: effects wait for same-version
+        // loads, and versions chain, so older loads block the intermediate
+        // effects first.
         FlatMap<NodeId, bool> placed;
         std::vector<NodeId> order;
+        FlatMap<NodeId, std::vector<NodeId>> loads_of_version; // mem version -> loads
+        for (NodeId n : pinned)
+            if (g.node(n).op == Op::Load)
+                loads_of_version[g.node(n).in[1]].push_back(n);
+        auto mem_order_ok = [&](NodeId n) {
+            const Node& nd = g.node(n);
+            if (!is_effect_op(nd.op)) return true;
+            const std::vector<NodeId>* ls = loads_of_version.find(nd.in[1]);
+            if (!ls) return true;
+            for (NodeId l : *ls)
+                if (l != n && !placed.contains(l)) return false;
+            return true;
+        };
+        const bool dbg = getenv("JULES_DEBUG_LIN") != nullptr;
         for (u32 round = 0; round < pinned.size() + 1 && order.size() < pinned.size(); ++round) {
             bool progressed = false;
             for (NodeId n : pinned) {
@@ -104,6 +128,20 @@ private:
                     if (g.node(d).in[0] == b.head && !is_block_head(g.node(d).op) &&
                         d != n && !placed.contains(d))
                         ready = false;
+                }
+                if (ready) ready = mem_order_ok(n);
+                if (dbg && !ready) {
+                    std::fprintf(stderr, "[lin] b%d r%u n%u(%s) blocked by:", b.index, round, n,
+                                 op_name(g.node(n).op));
+                    for (u8 i = 1; i < nd.n_in; ++i) {
+                        NodeId d = nd.in[i];
+                        if (d == kNoNode || g.node(d).op == Op::Dead) continue;
+                        if (g.node(d).in[0] == b.head && !is_block_head(g.node(d).op) &&
+                            d != n && !placed.contains(d))
+                            std::fprintf(stderr, " n%u(%s)", d, op_name(g.node(d).op));
+                    }
+                    if (!mem_order_ok(n)) std::fprintf(stderr, " <mem-order>");
+                    std::fprintf(stderr, "\n");
                 }
                 if (ready) {
                     placed.insert(n, true);
@@ -119,6 +157,12 @@ private:
             }
         }
         b.nodes = order;
+        if (getenv("JULES_DEBUG_LIN")) {
+            std::fprintf(stderr, "[lin] block b%d head n%u:", b.index, b.head);
+            for (NodeId n : b.nodes)
+                std::fprintf(stderr, " n%u(%s)", n, op_name(g.node(n).op));
+            std::fprintf(stderr, "\n");
+        }
     }
 
     void attach_successors(LBlock& b) {

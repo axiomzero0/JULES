@@ -311,9 +311,18 @@ private:
         for (NodeId id = 0; id < g_.size(); ++id) {
             Node& n = g_.node(id);
             if (n.op != Op::Region) continue;
+            // Snapshot the keep-mask BEFORE compaction: compacting n.in[]
+            // first leaves stale (live!) pred ids at positions >= keep, and
+            // the phi realignment below would re-copy them — phis ended up
+            // with MORE inputs than the region has predecessors (observed on
+            // the vectorizer's merge regions: live-pred-before-dead-pred;
+            // regression: t24_vectorize).
+            bool keep_mask[kMaxInputs];
             u8 keep = 0;
-            for (u8 i = 0; i < n.n_in; ++i)
-                if (exec_.contains(n.in[i])) n.in[keep++] = n.in[i];
+            for (u8 i = 0; i < n.n_in; ++i) {
+                keep_mask[i] = exec_.contains(n.in[i]);
+                if (keep_mask[i]) ++keep;
+            }
             if (keep == n.n_in) continue; // nothing dead
             g_.touch(); // pred trim is a real change
             if (keep == 0) {
@@ -331,22 +340,23 @@ private:
                 changed = true;
                 continue;
             }
-            u8 removed = static_cast<u8>(n.n_in - keep);
-            // realign phis: drop input (pred_index + 1) for removed preds.
-            // Recompute mapping on the ORIGINAL order, so do it before trimming.
+            // realign phis: drop input (pred_index + 1) for removed preds,
+            // mapped on the ORIGINAL pred order.
             const SmallVec<NodeId, 4> users = g_.uses_of(id);
             for (NodeId u : users) {
                 Node& phi = g_.node(u);
                 if (phi.op != Op::Phi) continue;
                 u8 pk = 1;
-                for (u8 i = 0; i < n.n_in; ++i) {
-                    if (exec_.contains(n.in[i])) phi.in[pk++] = phi.in[i + 1];
-                }
+                for (u8 i = 0; i < n.n_in; ++i)
+                    if (keep_mask[i]) phi.in[pk++] = phi.in[i + 1];
                 phi.n_in = pk;
             }
+            // compact the region's preds LAST (phi loop reads original slots)
+            u8 k2 = 0;
+            for (u8 i = 0; i < n.n_in; ++i)
+                if (keep_mask[i]) n.in[k2++] = n.in[i];
             n.n_in = keep;
             changed = true;
-            (void)removed;
         }
 
         // 3) constant branches: kill the dead projection

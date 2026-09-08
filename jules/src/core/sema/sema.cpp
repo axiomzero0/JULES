@@ -233,6 +233,30 @@ private:
                 }
                 break;
             }
+            case StmtKind::AssignIndex: {
+                TypeId pt = check_expr(*s.target, ctx);
+                TypeId it = check_expr(*s.to, ctx);
+                TypeId vt = check_expr(*s.value, ctx);
+                if (!ty_is_ptr(pt)) {
+                    diag_.error(s.pos, "indexed assignment requires a pointer base");
+                    return;
+                }
+                TypeId pointee = pointee_of(pt);
+                if (pointee == ty_none()) {
+                    diag_.error(s.pos, "indexed assignment requires a scalar pointee");
+                    return;
+                }
+                if (!ty_is_int(it) || ty_is_bool(it)) {
+                    diag_.error(s.pos, "array index must be an integer");
+                    return;
+                }
+                if (vt != pointee && vt != ty_none()) {
+                    if (!unify_literal(*s.value, pointee))
+                        diag_.error(s.pos, "cannot store " + std::string(ty_name(vt)) +
+                                    " into array of " + std::string(ty_name(pointee)));
+                }
+                break;
+            }
             case StmtKind::Return: {
                 TypeId vt = s.value ? check_expr(*s.value, ctx) : ty_void();
                 if (vt == ty_none()) return;
@@ -485,6 +509,27 @@ private:
                 e.ty = pointee_scalar(t);
                 return e.ty;
             }
+            case ExprKind::Index: {
+                TypeId b = check_expr(*e.lhs, ctx);
+                TypeId i = check_expr(*e.rhs, ctx);
+                if (b == ty_none() || i == ty_none()) return ty_none();
+                if (!ty_is_ptr(b)) {
+                    diag_.error(e.pos, "cannot index non-pointer type " + std::string(ty_name(b)) +
+                                " (arrays are pointers from alloc(T, n))");
+                    return ty_none();
+                }
+                if (!ty_is_int(i) || ty_is_bool(i)) {
+                    diag_.error(e.pos, "array index must be an integer (got " +
+                                std::string(ty_name(i)) + ")");
+                    return ty_none();
+                }
+                e.ty = pointee_scalar(b);
+                if (e.ty == ty_none()) {
+                    diag_.error(e.pos, "cannot index a pointer to a non-scalar element");
+                    return ty_none();
+                }
+                return e.ty;
+            }
             case ExprKind::ComptimeBlock: {
                 FlatMap<std::string, Value> env;
                 steps_ = 0;
@@ -504,7 +549,7 @@ private:
 
     TypeId check_call(Expr& e, FnCtx& ctx) {
         std::string callee = e.name;
-        if (callee == "alloc") return check_alloc(e);
+        if (callee == "alloc") return check_alloc(e, ctx);
         if (callee == "free") return check_free(e, ctx);
         if (callee == "print") return check_print(e, ctx);
 
@@ -548,9 +593,9 @@ private:
         return e.ty;
     }
 
-    TypeId check_alloc(Expr& e) {
-        if (e.args.size() != 1 || e.args[0]->kind != ExprKind::Ident) {
-            diag_.error(e.pos, "alloc expects exactly one type argument, e.g. alloc(i64)");
+    TypeId check_alloc(Expr& e, FnCtx& ctx) {
+        if (e.args.empty() || e.args[0]->kind != ExprKind::Ident) {
+            diag_.error(e.pos, "alloc expects a type argument, e.g. alloc(i64) or alloc(i64, n)");
             return ty_none();
         }
         TypeId pointee = ty_none();
@@ -567,6 +612,19 @@ private:
             return ty_none();
         }
         e.args[0]->cast_target = pointee; // builder reads this
+        if (e.args.size() == 2) {
+            // Sized allocation: alloc(T, n) -> array of n elements.
+            TypeId ct = check_expr(*e.args[1], ctx);
+            if (ct == ty_none()) return ty_none();
+            if (!ty_is_int(ct) || ty_is_bool(ct)) {
+                diag_.error(e.args[1]->pos, "alloc element count must be an integer (got " +
+                            std::string(ty_name(ct)) + ")");
+                return ty_none();
+            }
+        } else if (e.args.size() > 2) {
+            diag_.error(e.pos, "alloc expects a type and an optional count: alloc(T) or alloc(T, n)");
+            return ty_none();
+        }
         e.ty = ty_ptr(pointee);
         return e.ty;
     }
@@ -963,6 +1021,13 @@ const char* ty_name(TypeId t) {
     }
     if (d.ty == Ty::Mem) return "<mem>";
     if (d.ty == Ty::Ctrl) return "<ctrl>";
+    switch (d.ty) {
+        case Ty::V2F64: return "v2f64";
+        case Ty::V2I64: return "v2i64";
+        case Ty::V4I32: return "v4i32";
+        case Ty::V4F32: return "v4f32";
+        default: break;
+    }
     return "<bad>";
 }
 

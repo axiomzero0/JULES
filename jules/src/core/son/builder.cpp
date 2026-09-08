@@ -128,6 +128,17 @@ private:
                 cur_mem_ = g_.make(Op::Store, ty_mem(), {cur_ctrl_, cur_mem_, addr, v});
                 break;
             }
+            case StmtKind::AssignIndex: {
+                // base[idx] = value — address arithmetic lowered to
+                // i64 (ptr reinterpret via bit-exact Ptr casts), scaled by
+                // the element size, then back to a typed pointer.
+                NodeId base = emit_expr(*s.target);
+                NodeId idx = emit_expr(*s.to);
+                NodeId v = emit_expr(*s.value);
+                NodeId addr = index_address(base, idx, s.to->ty, s.target->ty);
+                cur_mem_ = g_.make(Op::Store, ty_mem(), {cur_ctrl_, cur_mem_, addr, v});
+                break;
+            }
             case StmtKind::Return: {
                 NodeId v = s.value ? emit_expr(*s.value) : kNoNode;
                 NodeId r = v == kNoNode
@@ -364,6 +375,12 @@ private:
                 NodeId addr = emit_expr(*e.lhs);
                 return g_.make(Op::Load, e.ty, {cur_ctrl_, cur_mem_, addr});
             }
+            case ExprKind::Index: {
+                NodeId base = emit_expr(*e.lhs);
+                NodeId idx = emit_expr(*e.rhs);
+                NodeId addr = index_address(base, idx, e.rhs->ty, e.lhs->ty);
+                return g_.make(Op::Load, e.ty, {cur_ctrl_, cur_mem_, addr});
+            }
             case ExprKind::Call:
                 return emit_call(e);
             case ExprKind::ComptimeBlock:
@@ -372,6 +389,40 @@ private:
                 return zero_of(ty_i32(), cur_ctrl_);
         }
         return zero_of(ty_i32(), cur_ctrl_);
+    }
+
+    // Address of element `idx` in the array at `base` (pointer of type
+    // `base_ty`): base + idx * elem_size, all in i64 with bit-exact Ptr
+    // casts at the boundaries. Scaling uses Shl for power-of-two element
+    // sizes (1/2/4/8 bytes) so the LEA formation in pass 87 fires.
+    NodeId index_address(NodeId base, NodeId idx, TypeId idx_ty, TypeId base_ty) {
+        // widen/normalize the index to i64 (SExt for i32, bit-cast for u64,
+        // identity for i64)
+        if (idx_ty != ty_i64()) {
+            CastOp k = ty_is_signed(idx_ty) ? CastOp::SExt : CastOp::Ptr;
+            idx = g_.make(Op::Cast, ty_i64(), {cur_ctrl_, idx}, static_cast<u8>(k));
+        }
+        u32 esz = ty_store_bytes(ty_pointee(base_ty));
+        NodeId base64 = g_.make(Op::Cast, ty_i64(), {cur_ctrl_, base},
+                                static_cast<u8>(CastOp::Ptr));
+        NodeId addr64 = base64;
+        if (esz == 1) {
+            addr64 = g_.make(Op::Bin, ty_i64(), {cur_ctrl_, base64, idx},
+                             static_cast<u8>(BinOp::Add));
+        } else {
+            // esz in {2,4,8}: shl by log2(esz)
+            u8 sh = esz == 2 ? 1 : esz == 4 ? 2 : 3;
+            NodeId off = idx;
+            if (sh != 0) {
+                NodeId k = make_int_const(sh, ty_i64(), cur_ctrl_);
+                off = g_.make(Op::Bin, ty_i64(), {cur_ctrl_, idx, k},
+                              static_cast<u8>(BinOp::Shl));
+            }
+            addr64 = g_.make(Op::Bin, ty_i64(), {cur_ctrl_, base64, off},
+                             static_cast<u8>(BinOp::Add));
+        }
+        return g_.make(Op::Cast, base_ty, {cur_ctrl_, addr64},
+                       static_cast<u8>(CastOp::Ptr));
     }
 
     static CastOp pick_cast(TypeId from, TypeId to) {
@@ -437,9 +488,32 @@ private:
     NodeId emit_call(const Expr& e) {
         if (e.name == "alloc") {
             TypeId pointee = e.args[0]->cast_target;
-            NodeId size = make_int_const(ty_store_bytes(pointee), ty_i64(), cur_ctrl_);
             TypeId res_ty = ty_ptr(pointee);
             if (res_ty == ty_none()) res_ty = ty_ptr(ty_i64()); // no ptr-to-ptr in MVP lattice
+            NodeId size;
+            if (e.args.size() >= 2) {
+                // alloc(T, n): byte size = n * elem_size (computed at runtime
+                // when n is dynamic; constant-folded when n is a literal).
+                NodeId count = emit_expr(*e.args[1]);
+                u32 esz = ty_store_bytes(pointee);
+                if (g_.node(count).op == Op::Const) {
+                    size = make_int_const(static_cast<u64>(g_.node(count).ival) * esz,
+                                          ty_i64(), cur_ctrl_);
+                } else {
+                    NodeId cnt64 = count;
+                    TypeId cty = g_.node(count).ty;
+                    if (cty != ty_i64()) {
+                        CastOp k = ty_is_signed(cty) ? CastOp::SExt : CastOp::Ptr;
+                        cnt64 = g_.make(Op::Cast, ty_i64(), {cur_ctrl_, count},
+                                        static_cast<u8>(k));
+                    }
+                    NodeId esz_c = make_int_const(esz, ty_i64(), cur_ctrl_);
+                    size = g_.make(Op::Bin, ty_i64(), {cur_ctrl_, cnt64, esz_c},
+                                   static_cast<u8>(BinOp::Mul));
+                }
+            } else {
+                size = make_int_const(ty_store_bytes(pointee), ty_i64(), cur_ctrl_);
+            }
             cur_mem_ = g_.make(Op::Alloc, res_ty, {cur_ctrl_, cur_mem_, size});
             return cur_mem_;
         }

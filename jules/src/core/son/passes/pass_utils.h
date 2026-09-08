@@ -129,6 +129,12 @@ inline bool eval_cast_const(CastOp op, const ConstVal& a, TypeId target, ConstVa
     out.ty = target;
     out.is_fp = ty_is_float(target);
     switch (op) {
+        case CastOp::Broadcast:
+        case CastOp::Extract:
+            // Vector casts never constant-fold: a vector Const cannot exist
+            // in the MVP (no constexpr vector surface; SCCP must leave
+            // broadcasts/extracts as runtime values).
+            return false;
         case CastOp::ZExt:
             out.iv = static_cast<i64>(static_cast<u64>(a.iv) &
                                       (ty_bits(a.ty) == 32 ? 0xFFFFFFFFull : 0xFFull));

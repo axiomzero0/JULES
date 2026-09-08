@@ -52,7 +52,12 @@ enum class Op : u8 {
 enum class BinOp : u8 { Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr };
 enum class CmpOp : u8 { Eq, Ne, Lt, Le, Gt, Ge };
 enum class UnOp  : u8 { Neg, Not, BNot };
-enum class CastOp : u8 { ZExt, SExt, Trunc, SiToFp, FpToSi, FpExt, FpTrunc, Ptr };
+enum class CastOp : u8 {
+    ZExt, SExt, Trunc, SiToFp, FpToSi, FpExt, FpTrunc, Ptr,
+    // Vector-only casts (passes 54-66; never appear in user source):
+    Broadcast, // scalar -> vector, every lane = the scalar
+    Extract,   // vector -> scalar lane; aux = lane index
+};
 
 // Node flags (bit positions; keep under 8 bits).
 enum : u8 {
@@ -60,6 +65,9 @@ enum : u8 {
     kFlagStackPromoted = 1u << 0, // Alloc: heap->stack promoted (pass 29)
     kFlagTailCall      = 1u << 1, // Call: marked as tail call (pass 50)
     kFlagGuardSite     = 1u << 2, // future: deopt guard location
+    kFlagProfile       = 1u << 3, // Store/Call: profile counter op (PGO);
+                                   // immune to DSE/mem-chain pruning
+    kFlagVecEpilogue   = 1u << 4, // Store: vectorizer remainder-loop store
 };
 
 constexpr u8 kMaxInputs = 16; // node input arity (MVP limit, diagnosed upstream)

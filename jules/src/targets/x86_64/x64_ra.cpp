@@ -1468,12 +1468,19 @@ struct Allocator {
         // same exact live ranges the register assignment used. Address-
         // taken slots never share: distinct allocations must keep distinct
         // addresses. Multi-def slots use their hull (conservative).
+        // Wide (128-bit vector) slots are excluded: they need 16-byte
+        // slots and get their own aligned area below the scalar one.
+        auto is_wide = [&](i32 s) {
+            const bool* w = lf.slot_wide.find(s);
+            return w && *w;
+        };
         std::vector<i32> color_of(static_cast<size_t>(lf.slot_count), -1);
         i32 distinct_slots = 0;
         {
             struct Hole { i32 slot; size_t first, last; };
             std::vector<Hole> holes;
             for (i32 s = 0; s < lf.slot_count; ++s) {
+                if (is_wide(s)) continue; // 16-byte area, own offsets
                 if (color_of[static_cast<size_t>(s)] != -1) continue; // (none yet)
                 const LiveRange& r = range(s);
                 if (r.promoted || !r.needs_memory() || r.addr_taken) continue;
@@ -1505,6 +1512,7 @@ struct Allocator {
             // its own offset beyond the colored ones
             i32 extra = 0;
             for (i32 s = 0; s < lf.slot_count; ++s) {
+                if (is_wide(s)) continue;
                 if (color_of[static_cast<size_t>(s)] != -1) continue;
                 const LiveRange& r = range(s);
                 if (r.promoted || !r.needs_memory()) continue;
@@ -1525,7 +1533,18 @@ struct Allocator {
                     : 0);
         }
         i32 slot_area = 8 * distinct_slots;
-        i32 total = callee_area + slot_area;
+        // ---- wide (vector) slot area: 16-byte stride, 16-aligned base ----
+        i32 wide_base = (callee_area + slot_area + 15) & ~15;
+        i32 wide_count = 0;
+        for (i32 s = 0; s < lf.slot_count; ++s) {
+            if (!is_wide(s)) continue;
+            const LiveRange& r = range(s);
+            if (r.promoted || !r.needs_memory()) continue;
+            lf.slot_offset[static_cast<size_t>(s)] =
+                -(wide_base + 16 * (wide_count + 1));
+            ++wide_count;
+        }
+        i32 total = wide_base + 16 * wide_count;
         i32 frame = (total + 15) & ~15;          // keep rsp 16-byte aligned
         i32 frame_sub = frame - callee_area;     // pushes already moved rsp
 

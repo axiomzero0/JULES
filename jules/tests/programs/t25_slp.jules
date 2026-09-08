@@ -1,0 +1,26 @@
+// SLP: straight-line adjacent store pairs pack into 128-bit ops
+//   * copy2:  a[0]=b[0]; a[1]=b[1]            -> one movups load + store
+//   * scale2: a[0]=b[0]*7; a[1]=b[1]*7        -> packed mul by broadcast
+//   * mixed sizes rejected honestly (i32 lanes not 16-byte with 2 stores)
+fn copy2(a: *mut i64, b: *mut i64) -> i64 {
+    a[0] = b[0];
+    a[1] = b[1];
+    return a[0] * 100 + a[1];
+}
+fn scale2(a: *mut i64, b: *mut i64) -> i64 {
+    a[0] = b[0] * 7;
+    a[1] = b[1] * 7;
+    return a[0] + a[1];
+}
+fn main() -> i64 {
+    let a: *mut i64 = alloc(i64, 2);
+    let b: *mut i64 = alloc(i64, 2);
+    b[0] = 3;
+    b[1] = 4;
+    print(copy2(a, b));       // 304
+    print(a[0] + a[1]);       // 7
+    print(scale2(a, b));      // 49
+    free(a);
+    free(b);
+    return 0 as i64;
+}
