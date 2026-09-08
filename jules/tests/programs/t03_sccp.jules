@@ -1,12 +1,21 @@
-// SCCP: constant branch kills the else path
+// SCCP: constant branch kills the else path; the merge phi's value is only
+// constant through EXECUTABLE-INPUT meet — phi(5, 9) resolves to 5 once the
+// else edge is proven unreachable, and the second branch folds from that.
+// (No other pass reasons about edge executability: PhiSimplification only
+// collapses identical inputs, ConstantFolding only folds pure ops.)
 fn main() -> i64 {
-    let mode: i64 = 3;
-    var r: i64 = 0;
-    if mode < 10 {
-        r = 100;
+    let a: i64 = 2;
+    let b: i64 = 10;
+    var x: i64 = 0;
+    if a * b > 15 {
+        x = 5;
     } else {
-        r = 200;
+        x = 9;
     }
-    print(r);
+    if x < 7 {
+        print(100);
+        return 0 as i64;
+    }
+    print(200);
     return 0 as i64;
 }

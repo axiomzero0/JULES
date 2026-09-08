@@ -49,7 +49,15 @@ enum class Op : u8 {
     Dead,       // killed node; no inputs; skipped by every pass
 };
 
-enum class BinOp : u8 { Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr };
+enum class BinOp : u8 {
+    Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr,
+    // FP-only min/max (pass 65 idiom matching: Select over a relational
+    // Cmp of the same FP operands). x86 minsd/maxsd return the DST operand
+    // on unordered — the matcher keeps the operand order that reproduces
+    // the select's NaN behavior exactly, and machine passes must NOT
+    // commute them (min/max are commutative only in the absence of NaN).
+    Min, Max,
+};
 enum class CmpOp : u8 { Eq, Ne, Lt, Le, Gt, Ge };
 enum class UnOp  : u8 { Neg, Not, BNot };
 enum class CastOp : u8 {

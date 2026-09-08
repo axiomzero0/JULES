@@ -1,0 +1,48 @@
+// LoopInterchange: column-major walk becomes row-major after the swap.
+//   col_sum: a[j*W+i] with i outer, j inner (inner stride W) -> interchanged
+//     so i is the inner loop: unit stride + the i-scale folds into the
+//     inner IV update; the j*W term becomes invariant in the inner body
+//   row_sum: already stride-1 in the inner loop -> NO interchange (the
+//     i-coefficients gate requires a wide j stride to gain anything)
+#[no_inline]
+fn col_sum(a: *mut i64, w: i64, h: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < w {
+        var j: i64 = 0;
+        while j < h {
+            s = s + a[j * w + i];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+#[no_inline]
+fn row_sum(a: *mut i64, w: i64, h: i64) -> i64 {
+    var s: i64 = 0;
+    var j: i64 = 0;
+    while j < h {
+        var i: i64 = 0;
+        while i < w {
+            s = s + a[j * w + i];
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    let a: *mut i64 = alloc(i64, 12);
+    var k: i64 = 0;
+    while k < 12 {
+        a[k] = (k + 1) as i64;
+        k = k + 1;
+    }
+    print(col_sum(a, 4 as i64, 3 as i64));  // sum 1..12 = 78
+    print(row_sum(a, 4 as i64, 3 as i64));  // 78
+    free(a);
+    return 0 as i64;
+}

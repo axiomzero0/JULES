@@ -52,6 +52,19 @@ const char* rname32(R r) {
     }
 }
 
+// Byte-register names (setcc targets, andb/orb operands).
+const char* rname8(R r) {
+    switch (r) {
+        case R::Rax: return "al";  case R::Rcx: return "cl";
+        case R::Rdx: return "dl";  case R::Rbx: return "bl";
+        case R::R8:  return "r8b"; case R::R9:  return "r9b";
+        case R::R10: return "r10b"; case R::R11: return "r11b";
+        case R::R12: return "r12b"; case R::R13: return "r13b";
+        case R::R14: return "r14b"; case R::R15: return "r15b";
+        default: return rname(r); // no byte form: full name (should not happen)
+    }
+}
+
 const char* cc(Cond c) {
     switch (c) {
         case Cond::E: return "e";  case Cond::NE: return "ne";
@@ -59,6 +72,7 @@ const char* cc(Cond c) {
         case Cond::G: return "g";  case Cond::GE: return "ge";
         case Cond::B: return "b";  case Cond::BE: return "be";
         case Cond::A: return "a";  case Cond::AE: return "ae";
+        case Cond::P: return "p";  case Cond::NP: return "np";
     }
     return "e";
 }
@@ -90,7 +104,9 @@ Cond mirror_cond(Cond c) {
         case Cond::A:  return Cond::B;
         case Cond::AE: return Cond::BE;
         case Cond::E:
-        case Cond::NE: return c;
+        case Cond::NE:
+        case Cond::P:
+        case Cond::NP: return c;
     }
     return c;
 }
@@ -509,8 +525,15 @@ struct Emitter {
         const Node& nd = g_.node(n);
         BinOp op = static_cast<BinOp>(nd.sub);
         u8 lane = static_cast<u8>(ty_store_bytes(ty_lane_type(nd.ty)));
-        load_fp(nd.in[1], R::Xmm0);
-        load_fp(nd.in[2], R::Xmm1);
+        // Min/Max pack per lane with the same src-on-NaN contract as the
+        // scalar forms (minpd src=b dst=a / maxpd src=a dst=b).
+        if (op == BinOp::Max) {
+            load_fp(nd.in[2], R::Xmm0);
+            load_fp(nd.in[1], R::Xmm1);
+        } else {
+            load_fp(nd.in[1], R::Xmm0);
+            load_fp(nd.in[2], R::Xmm1);
+        }
         IOp kind;
         switch (nd.ty) {
             case ty_v2f64(): kind = IOp::VecBinF64; break;
@@ -534,10 +557,22 @@ struct Emitter {
     void emit_fp_bin(NodeId n) {
         const Node& nd = g_.node(n);
         u8 size = sz_of(nd.ty);
-        load_fp(nd.in[1], R::Xmm0);
-        load_fp(nd.in[2], R::Xmm1);
+        BinOp op = static_cast<BinOp>(nd.sub);
+        // x86 minsd/maxsd: result = (src REL dst) ? src : dst; on unordered
+        // (NaN) the SRC operand — the AT&T FIRST operand — is returned.
+        // Canonical IR forms:
+        //   Min(a,b) = Select(Lt(a,b), a, b)  -> minsd src=b, dst=a (normal)
+        //   Max(a,b) = Select(Lt(a,b), b, a)  -> maxsd src=a, dst=b (swapped)
+        // Operand order is load-bearing for NaN — never commute.
+        if (op == BinOp::Max) {
+            load_fp(nd.in[2], R::Xmm0);
+            load_fp(nd.in[1], R::Xmm1);
+        } else {
+            load_fp(nd.in[1], R::Xmm0);
+            load_fp(nd.in[2], R::Xmm1);
+        }
         Inst& i = emit(IOp::FpBin);
-        i.bin = static_cast<BinOp>(nd.sub);
+        i.bin = op;
         i.size = size;
         i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0; // dst (accumulates)
         i.b.k = Operand::K::Reg; i.b.reg = R::Xmm1; // src
@@ -557,8 +592,32 @@ struct Emitter {
         u8 size = sz_of(an.ty);
         Cond cond = cmp_cond(static_cast<CmpOp>(nd.sub), ty_is_signed(an.ty));
         if (fp_of(an.ty)) {
-            load_fp(nd.in[1], R::Xmm0);
-            load_fp(nd.in[2], R::Xmm1);
+            // NaN-exact relational compares off ucomis flags. Unordered
+            // sets ZF=PF=CF=1, so B/BE/L/LE test TRUE on NaN (wrong: every
+            // ordered relation is false) while A/AE test false (correct).
+            // Remap: compare the operands SWAPPED and use the above/below
+            // family — Lt(a,b) = A on ucomis(b,a); Le(a,b) = AE on
+            // ucomis(b,a); Gt/Ge use the normal order. Eq/Ne return the raw
+            // E/NE cond; their NaN exactness is qualified by the parity
+            // bit in emit_cmp (materialized form) and rejected in the
+            // fused-branch matcher.
+            CmpOp rel = static_cast<CmpOp>(nd.sub);
+            bool swap = false;
+            switch (rel) {
+                case CmpOp::Lt: swap = true;  cond = Cond::A;  break;
+                case CmpOp::Le: swap = true;  cond = Cond::AE; break;
+                case CmpOp::Gt: swap = false; cond = Cond::A;  break;
+                case CmpOp::Ge: swap = false; cond = Cond::AE; break;
+                case CmpOp::Eq: swap = false; cond = Cond::E;  break;
+                case CmpOp::Ne: swap = false; cond = Cond::NE; break;
+            }
+            if (swap) {
+                load_fp(nd.in[2], R::Xmm0);
+                load_fp(nd.in[1], R::Xmm1);
+            } else {
+                load_fp(nd.in[1], R::Xmm0);
+                load_fp(nd.in[2], R::Xmm1);
+            }
             Inst& c = emit(IOp::FpCmp);
             c.size = sz_of(an.ty);
             c.a.k = Operand::K::Reg; c.a.reg = R::Xmm0;
@@ -614,9 +673,32 @@ struct Emitter {
     }
 
     void emit_cmp(NodeId n) {
+        const Node& nd = g_.node(n);
+        const Node& an = g_.node(nd.in[1]);
+        CmpOp rel = static_cast<CmpOp>(nd.sub);
+        if (fp_of(an.ty) && (rel == CmpOp::Eq || rel == CmpOp::Ne)) {
+            // NaN-exact equality needs the parity bit: unordered sets PF=1
+            // (and ZF=1), so E alone is true on NaN and NE alone is false.
+            //   eq: (E && !PF)   ne: (NE || P)
+            (void)emit_cmp_flags(n); // emits ucomis, returns E/NE
+            Inst& s1 = emit(IOp::Setcc);
+            s1.cond = rel == CmpOp::Eq ? Cond::E : Cond::NE;
+            s1.a.k = Operand::K::Reg; s1.a.reg = R::Rax;
+            Inst& s2 = emit(IOp::Setcc);
+            s2.cond = rel == CmpOp::Eq ? Cond::NP : Cond::P;
+            s2.a.k = Operand::K::Reg; s2.a.reg = R::Rcx;
+            Inst& comb = reg2(IOp::ArithRR, R::Rax, R::Rcx, 1);
+            comb.bin = rel == CmpOp::Eq ? BinOp::And : BinOp::Or;
+            Inst& zx = emit(IOp::MovZX);
+            zx.a.k = Operand::K::Reg;
+            zx.a.reg = R::Rax;
+            store_result(n, 8);
+            return;
+        }
         Cond cond = emit_cmp_flags(n);
         Inst& sc = emit(IOp::Setcc);
         sc.cond = cond;
+        sc.a.k = Operand::K::Reg; sc.a.reg = R::Rax;
         Inst& zx = emit(IOp::MovZX);
         zx.a.k = Operand::K::Reg;
         zx.a.reg = R::Rax;
@@ -776,6 +858,15 @@ struct Emitter {
         bool fp = fp_of(nd.ty);
         u8 size = sz_of(nd.ty);
         load_value(c, R::Rdx, 8);
+        // The condition is an i1 VALUE (slot/reg), not live flags: test it
+        // before the cmov/jcc reads them (the producing compare's flags
+        // may be long dead by scheduling time — the bool took the round
+        // trip through its slot).
+        {
+            Inst& ts = emit(IOp::Test);
+            ts.a.k = Operand::K::Reg; ts.a.reg = R::Rdx;
+            ts.size = 8;
+        }
         if (!fp) {
             // cmovcc src, dst: dst = cond ? src : dst — so the FALSE value
             // lives in the destination and the TRUE value in the source.
@@ -839,6 +930,43 @@ struct Emitter {
             i.b.k = Operand::K::Reg; i.b.reg = R::Xmm0;
             i.size = 16;
             return;
+        }
+        // Constant stores: the bit pattern is an immediate — no register
+        // round trip. GP constants need a sign-extended imm32 for 8-byte
+        // stores (movq $imm, m64 has no imm64 form); f32 constants store
+        // their 32 bits as movl $bits (bit-exact, one instruction); f64
+        // constants only when the 64-bit pattern is imm32-reproducible
+        // (e.g. +0.0). StoreMerging's combined patterns already passed
+        // this gate at the IR level.
+        {
+            ConstVal c;
+            if (const_of(g_, val, c) && !ty_is_vector(c.ty)) {
+                i64 bits = 0;
+                bool ok = false;
+                if (!c.is_fp) {
+                    bits = c.iv;
+                    ok = (size < 8) ||
+                         static_cast<i64>(static_cast<i32>(static_cast<u32>(c.iv))) == c.iv;
+                } else if (c.ty == ty_f32()) {
+                    f32 f = static_cast<f32>(c.fv);
+                    u32 b;
+                    std::memcpy(&b, &f, sizeof(b));
+                    bits = static_cast<i64>(b);
+                    ok = true; // movl $imm32: any bit pattern
+                } else {
+                    u64 b;
+                    std::memcpy(&b, &c.fv, sizeof(b));
+                    bits = static_cast<i64>(b);
+                    ok = static_cast<i64>(static_cast<i32>(static_cast<u32>(b))) == bits;
+                }
+                if (ok) {
+                    Inst& i = emit(IOp::StoreMem);
+                    i.a.k = Operand::K::Reg; i.a.reg = R::Rcx;
+                    i.b.k = Operand::K::Imm; i.b.imm = bits;
+                    i.size = size;
+                    return;
+                }
+            }
         }
         if (fp) {
             load_fp(val, R::Xmm0);
@@ -1056,6 +1184,13 @@ struct Emitter {
         if (nd.op == Op::Cmp) {
             if (live_uses(n) != 1) return false;   // value read elsewhere
             if (!in_blk.contains(n)) return false; // emitted in an earlier block
+            // FP eq/ne: the ucomis flags alone cannot express NaN-exact
+            // equality (needs the parity bit) — keep the materialized bool
+            // form (setcc pair + and/or, then test).
+            if (fp_of(g_.node(nd.in[1]).ty)) {
+                CmpOp cr = static_cast<CmpOp>(nd.sub);
+                if (cr == CmpOp::Eq || cr == CmpOp::Ne) return false;
+            }
             suppress_.insert(n, true);
             sc_leaves_.push_back(ScLeaf{n, true});
             return true;
@@ -1355,6 +1490,8 @@ Cond inv_cond(Cond c) {
         case Cond::BE: return Cond::A;
         case Cond::A:  return Cond::BE;
         case Cond::AE: return Cond::B;
+        case Cond::P:  return Cond::NP;
+        case Cond::NP: return Cond::P;
     }
     return Cond::E;
 }
@@ -2481,6 +2618,7 @@ namespace {
 void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, u32 fid) {
     auto r = [&](R reg) { return std::string("%") + rname(reg); };
     auto rs = [&](R reg, u8 size) {
+        if (size == 1) return std::string("%") + rname8(reg);
         return std::string("%") + (size == 4 ? rname32(reg) : rname(reg));
     };
     auto lbl = [&](int id) {
@@ -2510,10 +2648,20 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::MovZX: os << "\tmovzbq %al, " << r(i.a.reg) << "\n"; break;
         case IOp::LoadMem:
             if (i.size == 16) os << "\tmovups (" << r(i.b.reg) << "), " << r(i.a.reg) << "\n";
+            else if (reg_is_xmm(i.a.reg)) // scalar FP memory form: movss/movsd
+                os << "\tmov" << fpsz(i.size) << " (" << r(i.b.reg) << "), " << r(i.a.reg) << "\n";
             else os << "\tmov" << ssz(i.size) << " (" << r(i.b.reg) << "), " << rs(i.a.reg, i.size) << "\n";
             break;
         case IOp::StoreMem:
-            if (i.size == 16) os << "\tmovups " << r(i.b.reg) << ", (" << r(i.a.reg) << ")\n";
+            if (i.b.k == Operand::K::Imm) {
+                // immediate store: movq $imm / movl $imm / movb $imm (the
+                // imm is the exact bit pattern; 8-byte forms are imm32-sign-
+                // extended by construction at emission)
+                os << "\tmov" << ssz(i.size) << " $" << i.b.imm
+                   << ", (" << r(i.a.reg) << ")\n";
+            } else if (i.size == 16) os << "\tmovups " << r(i.b.reg) << ", (" << r(i.a.reg) << ")\n";
+            else if (reg_is_xmm(i.b.reg)) // scalar FP memory form: movss/movsd
+                os << "\tmov" << fpsz(i.size) << " " << r(i.b.reg) << ", (" << r(i.a.reg) << ")\n";
             else os << "\tmov" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", (" << r(i.a.reg) << ")\n";
             break;
         case IOp::LeaSlot: os << "\tleaq " << slotstr(i.b) << ", " << r(i.a.reg) << "\n"; break;
@@ -2584,7 +2732,12 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
                 os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n";
             break;
         case IOp::Test: os << "\ttestq " << r(i.a.reg) << ", " << r(i.a.reg) << "\n"; break;
-        case IOp::Setcc: os << "\tset" << cc(i.cond) << " %al\n"; break;
+        case IOp::Setcc: {
+            // setcc target: a.reg byte register (al when unset)
+            R dst = (i.a.k == Operand::K::Reg) ? i.a.reg : R::Rax;
+            os << "\tset" << cc(i.cond) << " " << rs(dst, 1) << "\n";
+            break;
+        }
         case IOp::Cmov: os << "\tcmov" << cc(i.cond) << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
         case IOp::Jcc: os << "\tj" << cc(i.cond) << " " << lbl(i.a.label) << "\n"; break;
         case IOp::Jmp: os << "\tjmp " << lbl(i.a.label) << "\n"; break;
@@ -2599,6 +2752,8 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
                 case BinOp::Sub: mn = "sub"; break;
                 case BinOp::Mul: mn = "mul"; break;
                 case BinOp::Div: mn = "div"; break;
+                case BinOp::Min: mn = "min"; break;
+                case BinOp::Max: mn = "max"; break;
                 default: break;
             }
             os << "\t" << mn << fpsz(i.size) << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
@@ -2650,6 +2805,8 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
                 case BinOp::Sub: mn = "subpd"; break;
                 case BinOp::Mul: mn = "mulpd"; break;
                 case BinOp::Div: mn = "divpd"; break;
+                case BinOp::Min: mn = "minpd"; break;
+                case BinOp::Max: mn = "maxpd"; break;
                 default: break;
             }
             os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
@@ -2672,6 +2829,8 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
                 case BinOp::Sub: mn = "subps"; break;
                 case BinOp::Mul: mn = "mulps"; break;
                 case BinOp::Div: mn = "divps"; break;
+                case BinOp::Min: mn = "minps"; break;
+                case BinOp::Max: mn = "maxps"; break;
                 default: break;
             }
             os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";

@@ -53,6 +53,11 @@ private:
                 bool ba = const_of(g_, a, ca);
                 bool bb = const_of(g_, b, cb);
                 bool fp = ty_is_float(n.ty);
+                if (op == BinOp::Min || op == BinOp::Max) {
+                    // min(x,x) = max(x,x) = x (NaN: both arms identical)
+                    if (a == b) return replace(id, a);
+                    return false;
+                }
                 if (op == BinOp::Add) {
                     if (bb && int_zero(cb)) return replace(id, a);
                     if (ba && int_zero(ca)) return replace(id, b);

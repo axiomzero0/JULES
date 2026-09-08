@@ -155,7 +155,7 @@ bool PassManager::run() {
         // IPSCCP, Graal) re-run conditional propagation after inlining.
         if (ctx_.opts.post_inline_cleanup && p->order() == 82 && p->stage() == Stage::Son) {
             u32 rounds = level_budgets(ctx_.opts.level).cleanup_rounds;
-            static const int kCleanupOrders[] = {26, 30, 23, 1, 2, 3, 7, 8, 9, 44, 42};
+            static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42};
             for (u32 r = 0; r < rounds; ++r) {
                 std::vector<Pass*> again = PassRegistry::instance().create_all();
                 FlatMap<int, Pass*> by_order;

@@ -37,6 +37,9 @@ inline TypeId vector_ty_for(TypeId scalar) {
 inline bool packed_bin_legal(TypeId scalar, BinOp op) {
     if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor)
         return ty_is_int(scalar) && !ty_is_bool(scalar);
+    // minpd/maxpd: FP lanes only (SSE2); operand order is load-bearing
+    // (dst operand returned on unordered) — never commute these.
+    if (op == BinOp::Min || op == BinOp::Max) return ty_is_float(scalar);
     if (ty_is_float(scalar)) return op <= BinOp::Div;
     if (scalar == ty_i64() || scalar == ty_i32()) return op == BinOp::Add || op == BinOp::Sub;
     return false;

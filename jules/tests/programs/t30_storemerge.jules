@@ -1,0 +1,44 @@
+// StoreMerging: adjacent 4-byte const stores -> one 8-byte store when the
+// combined pattern fits a sign-extended imm32 (the profitable x86 form).
+//   * (0,0) and (1,0) pairs merge; (1,2) does not (0x0000000200000001 has
+//     no imm64-from-imm32 encoding) — gate proven by correct output
+//   * a load between the pair blocks the merge (it must observe the
+//     pre-store value of the second element)
+//   * unrolled constant fill: the cleanup re-run merges the pairs
+// Stores are kept live by an escaping read (sumup is no_inline: otherwise
+// StoreToLoadForwarding + DSE would fold the whole scene at pass 22).
+#[no_inline]
+fn sumup(a: *mut i32, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + (a[i] as i64);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    let a: *mut i32 = alloc(i32, 8);
+    a[0] = 0; a[1] = 0;   // (0,0)          -> one movq $0
+    a[2] = 1; a[3] = 0;   // (1,0) = 0x1    -> one movq $1
+    a[4] = 1; a[5] = 2;   // 0x0000000200000001: no imm32 form -> stays split
+    a[7] = 0;             // pre-init: the read below is deterministic
+    a[6] = 0;             // s1
+    let x: i32 = a[7];    // load between the pair -> merge must NOT fire
+    a[7] = 3;             // s2
+    print(sumup(a, 8 as i64) + (x as i64));  // 7 + 0
+    free(a);
+
+    let b: *mut i32 = alloc(i32, 8);
+    var i: i64 = 0;
+    while i < 8 {
+        b[i] = 0;
+        i = i + 1;
+    }
+    b[3] = 5;
+    b[7] = 9;
+    print(sumup(b, 8 as i64));               // 5 + 9
+    free(b);
+    return 0 as i64;
+}

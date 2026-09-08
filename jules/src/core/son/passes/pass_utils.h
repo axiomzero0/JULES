@@ -47,6 +47,9 @@ inline bool eval_bin_const(BinOp op, const ConstVal& a, const ConstVal& b, Const
             case BinOp::Sub: out.fv = x - y; return true;
             case BinOp::Mul: out.fv = x * y; return true;
             case BinOp::Div: if (y == 0.0) return false; out.fv = x / y; return true;
+            // min/max fold with the exact select semantics (NaN -> y / x)
+            case BinOp::Min: out.fv = x < y ? x : y; return true;
+            case BinOp::Max: out.fv = x < y ? y : x; return true;
             default: return false; // no fp mod/bitwise in MVP
         }
     }
@@ -69,6 +72,15 @@ inline bool eval_bin_const(BinOp op, const ConstVal& a, const ConstVal& b, Const
         case BinOp::Xor: out.iv = x ^ y; return true;
         case BinOp::Shl: out.iv = x << (y & 63); return true;
         case BinOp::Shr: out.iv = sgn ? x >> (y & 63) : static_cast<i64>(static_cast<u64>(x) >> (y & 63)); return true;
+        case BinOp::Min:
+            // exact select semantics: Lt(x,y) ? x : y (NaN -> y for fp)
+            if (a.is_fp || b.is_fp) return false; // handled on the fp path above
+            out.iv = (sgn ? x < y : static_cast<u64>(x) < static_cast<u64>(y)) ? x : y;
+            return true;
+        case BinOp::Max:
+            if (a.is_fp || b.is_fp) return false;
+            out.iv = (sgn ? x < y : static_cast<u64>(x) < static_cast<u64>(y)) ? y : x;
+            return true;
     }
     return false;
 }

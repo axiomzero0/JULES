@@ -68,7 +68,7 @@ inline constexpr bool reg_is_alloc_xmm(R r) {
 // (SysV vector args use xmm0-7), never allocator-assigned.
 inline constexpr bool reg_is_const_pool_xmm(R r) { return r >= R::Xmm8; }
 
-enum class Cond : u8 { E, NE, L, LE, G, GE, B, BE, A, AE };
+enum class Cond : u8 { E, NE, L, LE, G, GE, B, BE, A, AE, P, NP };
 
 enum class IOp : u16 {
     Nop,

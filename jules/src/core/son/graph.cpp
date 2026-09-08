@@ -36,6 +36,7 @@ const char* bin_name(BinOp b) {
         case BinOp::Mod: return "mod"; case BinOp::And: return "and";
         case BinOp::Or:  return "or";  case BinOp::Xor: return "xor";
         case BinOp::Shl: return "shl"; case BinOp::Shr: return "shr";
+        case BinOp::Min: return "min"; case BinOp::Max: return "max";
     }
     return "<bin>";
 }

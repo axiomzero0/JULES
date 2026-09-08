@@ -1,0 +1,84 @@
+// SIMDIntrinsicMatching: FP min/max idioms -> minsd/maxsd (and minss/maxss)
+//   * all four source shapes: Lt-true-arm, Lt-false-arm, Gt, Le
+//   * f32 + f64 lanes
+//   * NaN arm is locked: Select(Lt(NaN,1), NaN, 1.0) -> 1.0 (the false arm
+//     — x86 minsd returns the DST operand on unordered; the matcher keeps
+//     that exact arm order)
+fn min_f64(a: f64, b: f64) -> f64 {
+    var r: f64 = a;
+    if a < b { r = a; } else { r = b; }
+    return r;
+}
+
+fn max_f64(a: f64, b: f64) -> f64 {
+    var r: f64 = a;
+    if a < b { r = b; } else { r = a; }
+    return r;
+}
+
+fn max_gt(a: f64, b: f64) -> f64 {
+    var r: f64 = b;
+    if a > b { r = a; } else { r = b; }
+    return r;
+}
+
+fn min_le(a: f64, b: f64) -> f64 {
+    var r: f64 = b;
+    if a <= b { r = a; } else { r = b; }
+    return r;
+}
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    var r: f32 = a;
+    if a < b { r = b; } else { r = a; }
+    return r;
+}
+
+// realistic loop: clamp an array into a band (two min/max per element).
+// no_inline: keep the loop a runtime shape (the caller's constant stores
+// would otherwise store-forward through the inlined copy and fold the
+// whole computation at compile time — also correct, but this keeps the
+// per-element minsd/max visible in the emitted asm).
+#[no_inline]
+fn clamp_sum(a: *mut f64, n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < n {
+        var v: f64 = a[i];
+        if v < -1.0 { v = -1.0; } else { v = v; }
+        if v > 2.0 { v = 2.0; } else { v = v; }
+        s = s + v;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    print(min_f64(1.5, 2.5));     // 1.5
+    print(min_f64(2.5, 1.5));     // 1.5
+    print(max_f64(1.5, 2.5));     // 2.5
+    print(max_gt(3.25, 3.5));     // 3.5
+    print(max_gt(3.5, 3.25));     // 3.5
+    print(min_le(0.5, 0.5));      // 0.5
+    print(min_le(0.75, 0.5));     // 0.5
+    print(max_f32(1.5 as f32, 2.5 as f32)); // 2.5
+    print(min_f64(0.0 / 0.0, 1.0)); // NaN select: false arm -> 1.0
+
+    let a: *mut f64 = alloc(f64, 6);
+    a[0] = -5.0; a[1] = 0.0; a[2] = 1.25;
+    a[3] = 2.75; a[4] = 1.0;  a[5] = 9.0;
+    // clamped: -1, 0, 1.25, 2, 1, 2 -> sum 5.25
+    print(clamp_sum(a, 6 as i64));
+    free(a);
+
+    // NaN compare semantics (branchy and if-converted paths): every
+    // ordered relation is false on NaN; eq is false; ne is true.
+    let nn: f64 = 0.0 / 0.0;
+    if nn < 1.0 { print(1); } else { print(0); }
+    if nn <= 1.0 { print(1); } else { print(0); }
+    if nn > 1.0 { print(1); } else { print(0); }
+    if nn >= 1.0 { print(1); } else { print(0); }
+    if nn == 1.0 { print(1); } else { print(0); }
+    if nn != 1.0 { print(1); } else { print(0); }
+    return 0 as i64;
+}

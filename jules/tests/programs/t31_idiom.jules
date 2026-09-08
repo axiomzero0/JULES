@@ -1,0 +1,59 @@
+// IdiomRecognition: small constant-trip FILL/COPY loops become straight
+// lines at the loop entry (the unroller refuses trips < 6; the vectorizer
+// would keep a guard + remainder loop):
+//   * fill T=4 with a constant  -> 4 immediate stores, loop guard dead
+//   * fill3: fill T=3 with an invariant argument value
+//   * copy T=5 (NoAlias src/dst) -> 5 loads + 5 stores (SLP packs pairs)
+//   * dynamic-trip fill stays a loop (vectorizer territory)
+#[no_inline]
+fn sumup(a: *mut i32, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + (a[i] as i64);
+        i = i + 1;
+    }
+    return s;
+}
+
+#[no_inline]
+fn fill3(a: *mut i32, v: i32) -> i64 {
+    var i: i64 = 0;
+    while i < 3 {
+        a[i] = v;
+        i = i + 1;
+    }
+    return (a[0] + a[1] + a[2]) as i64;
+}
+
+fn main() -> i64 {
+    let a: *mut i32 = alloc(i32, 4);
+    var i: i64 = 0;
+    while i < 4 {
+        a[i] = 7;
+        i = i + 1;
+    }
+    print(sumup(a, 4 as i64));   // 28
+
+    let s: *mut i32 = alloc(i32, 5);
+    let d: *mut i32 = alloc(i32, 5);
+    i = 0;
+    while i < 5 {
+        s[i] = (i + 1) as i32;   // iv-dependent value: NOT a fill idiom
+        i = i + 1;
+    }
+    i = 0;
+    while i < 5 {
+        d[i] = s[i];             // copy idiom
+        i = i + 1;
+    }
+    print(sumup(d, 5 as i64));   // 15
+
+    let f: *mut i32 = alloc(i32, 3);
+    print(fill3(f, 9 as i32));   // 27
+    free(a);
+    free(s);
+    free(d);
+    free(f);
+    return 0 as i64;
+}

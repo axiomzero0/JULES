@@ -125,6 +125,7 @@ private:
 
     bool clean_arm(NodeId proj, NodeId region) {
         for (NodeId u : g_.uses_of(proj)) {
+            if (u == region) continue; // the merge edge itself — not arm content
             const Node& un = g_.node(u);
             if (un.in[0] != proj) continue; // used as region pred etc.
             switch (un.op) {
@@ -146,15 +147,23 @@ private:
         return true;
     }
 
-    // arm value must be pure with all inputs available before the branch
+    // arm value must be available before the branch. Two cases:
+    //   * defined IN the arm: must be pure so it can be hoisted to the
+    //     branching block (loads/stores/calls never move);
+    //   * defined BEFORE the branch (including pinned at the branching
+    //     block itself): any non-control value is fine — the Select only
+    //     READS it at the branch point; e.g. `if v < c { r = c } else
+    //     { r = v }` where v is a load from the loop body.
     bool arm_value_ok(NodeId v, NodeId arm_proj, NodeId h) {
         if (v == kNoNode || g_.node(v).op == Op::Dead) return false;
         const Node& vn = g_.node(v);
-        if (!is_pure_op(vn.op)) return false;
         if (is_block_head(vn.op)) return false;
+        if (is_control_op(vn.op)) return false;
         NodeId vb = vn.in[0];
+        if (vb == kNoNode) return false;
         if (vb == arm_proj) {
             // defined in the arm: its own inputs must dominate the branch
+            if (!is_pure_op(vn.op)) return false;
             for (u8 i = 1; i < vn.n_in; ++i) {
                 NodeId d = vn.in[i];
                 if (d == kNoNode || g_.node(d).op == Op::Dead) continue;

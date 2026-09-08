@@ -111,6 +111,12 @@ assert_pass_active t19_predication Predication
 assert_pass_active t24_vectorize LoopVectorizer
 assert_pass_active t25_slp SLPVectorizer
 assert_pass_active t20_accumulator TailRecursionElimination
+assert_pass_active t29_minmax SIMDIntrinsicMatching
+assert_pass_active t29_minmax IfConversion
+assert_pass_active t31_idiom IdiomRecognition
+assert_pass_active t32_fusion LoopFusion
+assert_pass_active t33_interchange LoopInterchange
+assert_pass_active t30_storemerge StoreMerging
 
 echo
 echo "results: $pass passed, $fail failed"
