@@ -45,11 +45,20 @@ private:
                         fprintf(stderr, "[sroa] n%u non-promotable: %s n%u uses it as value\n",
                                 alloc, op_name(un.op), u);
                     return false; // used as a VALUE (e.g. stored pointer)
-                case Op::Call:
-                    if (un.in[1] == alloc) continue; // memory-chain use only
+                case Op::Call: {
+                    // memory-chain use only — the alloc must not ALSO be an
+                    // argument (free's chain after DSE rethreading is the
+                    // alloc itself while passing it as the argument: the
+                    // arg slot is an escape and masks as a chain use if
+                    // checked first)
+                    bool arg_use = false;
+                    for (u8 i = 2; i < un.n_in; ++i)
+                        if (un.in[i] == alloc) arg_use = true;
+                    if (un.in[1] == alloc && !arg_use) continue;
                     if (getenv("JULES_DEBUG_SROA"))
                         fprintf(stderr, "[sroa] n%u non-promotable: Call n%u passes it\n", alloc, u);
                     return false;                    // passed as an argument: escapes
+                }
                 case Op::Phi:
                     // memory phi carrying the allocation as a memory version
                     // (loop backedge chains are full of these). A data phi

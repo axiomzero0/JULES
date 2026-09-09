@@ -24,6 +24,7 @@ public:
         lf.name = fg_.name;
         lf.ret = fg_.ret;
         lf.params = fg_.param_types;
+        cur_lf_ = &lf;
 
         // blocks in RPO of control heads
         FlatMap<NodeId, bool> seen;
@@ -177,9 +178,7 @@ private:
                 Op po = g.node(p).op;
                 if (po == Op::IfTrue || po == Op::IfFalse) add(p);
             }
-            return;
-        }
-        if (g.node(b.head).op == Op::Jump) {
+        } else if (g.node(b.head).op == Op::Jump) {
             // falls to regions using this jump as pred
             for (NodeId u : g.uses_of(b.head)) {
                 if (g.node(u).op == Op::Region && g.node(u).op != Op::Dead) {
@@ -191,16 +190,36 @@ private:
                     if (is_pred) add(u);
                 }
             }
-            return;
+        } else {
+            // plain block: falls to regions using head as pred
+            for (NodeId u : g.uses_of(b.head)) {
+                if (g.node(u).op != Op::Region) continue;
+                const Node& r = g.node(u);
+                for (u8 i = 0; i < r.n_in; ++i)
+                    if (r.in[i] == b.head) { add(u); break; }
+            }
         }
-        // plain block: falls to regions using head as pred
-        for (NodeId u : g.uses_of(b.head)) {
-            if (g.node(u).op != Op::Region) continue;
-            const Node& r = g.node(u);
-            for (u8 i = 0; i < r.n_in; ++i)
-                if (r.in[i] == b.head) { add(u); break; }
+        // FALLTHROUGH EDGE (all cases above): a block whose successor list
+        // came out EMPTY still transfers control — the emitter emits no
+        // jump for empty succs (plain blocks, Jump heads whose region
+        // users died, and If terminators whose projections died after
+        // inlining — the leftover If records no edges and the block simply
+        // falls through to the next one in the layout). Without the edge
+        // here the register allocator's liveness dataflow loses the path:
+        // values used after the fallthrough (a loop-exit reader) are not
+        // live around the loop backedge, and the loop body redefines their
+        // registers — the classic miscompile: a value defined before a
+        // loop, read after it, clobbered by the body (found by the pass
+        // audit: always-inlined copy loops over loop-filled arrays
+        // segfaulted on the stale base pointer).
+        if (b.succs.empty()) {
+            LFunction& lf = *cur_lf_;
+            if (b.index + 1 < static_cast<i32>(lf.blocks.size()))
+                b.succs.push_back(b.index + 1);
         }
     }
+
+    LFunction* cur_lf_ = nullptr;
 
     FunctionGraph& fg_;
     DomTree& dom_;

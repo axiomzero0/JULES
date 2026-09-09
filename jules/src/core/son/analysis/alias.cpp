@@ -1,5 +1,7 @@
 // Type/base-based alias analysis (MVP): distinct non-escaping allocations
 // provably do not alias; everything else is MayAlias.
+#include <functional>
+
 #include "core/son/analysis/analysis.h"
 
 namespace jules {
@@ -13,31 +15,90 @@ std::unique_ptr<AliasInfo> AliasInfo::compute(Graph& g) {
         if (g.node(id).op != Op::Dead) (void)aa->base_of(id);
     }
 
-    // local allocations: value used only as load/store addresses or as the
-    // memory chain (alloc node itself), never as data escaping to calls,
-    // returns, stores-as-value or arithmetic.
+    // local allocations: the pointer VALUE flows only to load/store
+    // ADDRESSES — directly, or through the address-arithmetic grammar
+    // (ptrcast casts, base+offset adds: the shapes match_addr recognizes) —
+    // to the memory chain (allocs/loads consume it as a version), or to
+    // free(); never to calls, returns, stores-as-value, phis or data
+    // arithmetic. Offsets past the allocation are source-level UB, so
+    // distinct live allocations stay NoAlias (malloc semantics).
     for (NodeId id = 0; id < g.size(); ++id) {
         const Node& n = g.node(id);
         if (n.op != Op::Alloc) continue;
-        bool local = true;
-        for (NodeId u : g.uses_of(id)) {
-            const Node& un = g.node(u);
-            switch (un.op) {
-                case Op::Load:
-                case Op::Store:
-                    if (un.in[2] == id || un.in[1] == id) break; // addr or mem-chain use
-                    local = false;
-                    break;
-                case Op::Call:
-                    if (un.in[1] == id) break; // mem-chain use only
-                    local = false;
-                    break;
-                default:
-                    local = false;
-                    break;
+        FlatMap<NodeId, bool> visiting;
+        // all uses of `id` (and, through transparent address nodes, of its
+        // derived values) must be address/chain/free forms
+        std::function<bool(NodeId)> uses_addr_only = [&](NodeId v) -> bool {
+            for (NodeId u : g.uses_of(v)) {
+                if (g.is_dead(u)) continue;
+                const Node& un = g.node(u);
+                switch (un.op) {
+                    case Op::Load:
+                    case Op::Store:
+                        if (un.in[2] == v || un.in[1] == v) break; // addr / mem chain
+                        return false;
+                        break;
+                    case Op::Alloc:
+                        if (un.in[1] == v) break; // chained allocation (mem)
+                        return false;
+                        break;
+                    case Op::Phi: {
+                        // memory-state phi (loop header / region merge): the
+                        // alloc's VERSION flows as the loop's initial memory
+                        // — a chain use, not a pointer escape. Value phis of
+                        // the pointer itself stay escapes (conservative).
+                        if (un.ty != ty_mem()) return false;
+                        bool is_input = false;
+                        for (u8 i = 1; i < un.n_in; ++i)
+                            if (un.in[i] == v) is_input = true;
+                        if (!is_input) return false;
+                        break;
+                    }
+                    case Op::Call: {
+                        if (un.in[1] == v) break; // mem-chain use only
+                        // free(ptr): lifetime end, not an escape — pass 29's
+                        // own escape classifier applies the same rule.
+                        if (un.aux == kFnFree) {
+                            bool freed_here = false;
+                            for (u8 i = 2; i < un.n_in; ++i)
+                                if (un.in[i] == v) freed_here = true;
+                            if (freed_here) break;
+                        }
+                        return false;
+                    }
+                    case Op::Cast: {
+                        // address arithmetic: ptrcast of the derived value;
+                        // the result must itself be address-only
+                        CastOp cs = static_cast<CastOp>(un.sub);
+                        if (un.in[1] != v) return false; // pin slot only
+                        if (cs != CastOp::Ptr) return false;
+                        if (visiting.contains(u)) continue; // cycle guard
+                        visiting.insert(u, true);
+                        bool ok = uses_addr_only(u);
+                        visiting.erase(u);
+                        if (!ok) return false;
+                        break;
+                    }
+                    case Op::Bin: {
+                        // base + offset: the derived pointer-ish value stays
+                        // address-only (the offset operand's own uses are
+                        // not the alloc's business)
+                        if (static_cast<BinOp>(un.sub) != BinOp::Add) return false;
+                        if (un.in[1] != v && un.in[2] != v) return false;
+                        if (visiting.contains(u)) continue;
+                        visiting.insert(u, true);
+                        bool ok = uses_addr_only(u);
+                        visiting.erase(u);
+                        if (!ok) return false;
+                        break;
+                    }
+                    default:
+                        return false; // phi / return / value use: escapes
+                }
             }
-            if (!local) break;
-        }
+            return true;
+        };
+        bool local = uses_addr_only(id);
         aa->alloc_local_.insert(id, local);
     }
     return aa;
@@ -89,11 +150,15 @@ AliasResult AliasInfo::alias(NodeId a, NodeId b) const {
     NodeId bb = base_of(b);
     if (ba == kNoNode || bb == kNoNode) return AliasResult::MayAlias;
     if (ba == bb) return AliasResult::MustAlias;
-    // Two distinct local allocations cannot alias.
-    bool la = false, lbb = false;
-    if (const bool* v = alloc_local_.find(ba)) la = *v;
-    if (const bool* v = alloc_local_.find(bb)) lbb = *v;
-    if (la && lbb) return AliasResult::NoAlias;
+    // Two distinct allocation sites never alias (malloc semantics: live
+    // allocations from distinct sites hold disjoint memory; stale access
+    // after free is source-level UB — LLVM's malloc-based NoAlias). This
+    // holds even when a pointer ESCAPES into a call: escape matters for
+    // "who can read this memory" (DSE's never-read reasoning and load
+    // hoisting consult is_alloc_local, which stays escape-conservative),
+    // not for "can two distinct sites overlap".
+    if (g_->node(ba).op == Op::Alloc && g_->node(bb).op == Op::Alloc)
+        return AliasResult::NoAlias;
     return AliasResult::MayAlias;
 }
 

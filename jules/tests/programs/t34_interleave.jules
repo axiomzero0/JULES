@@ -1,0 +1,66 @@
+// InterleavedAccessRecognition (58): stride-2/interleaved element pairs with
+// a SHARED SYMBOLIC index — a[2i], a[2i+1] (the shape an AoS struct-of-two
+// walk compiles to; with no structs in the language, stride-2 indexing IS
+// the interleaved access) — pack into one shuffle-free 128-bit access: the
+// pair addresses 16 CONTIGUOUS bytes at the first element, so the packed
+// load/store spans exactly them (movups), no deinterleave shuffles needed.
+//   * deint:   a[2i] = b[2i] + 7; a[2i+1] = b[2i+1] + 7  on distinct local
+//              allocations (NoAlias) -> packed load+broadcast add+store
+//   * inplace: c[2i] = c[2i] + 1; same array, element-disjoint lanes
+//              (MustAlias base, the intervening store writes lane 0's
+//              element only) -> packs
+//   * params:  #[no_inline] loop over param pointers — honestly NOT packed:
+//              MayAlias bases (a caller could pass offset-overlapping
+//              pointers; the packed load would read the pre-store lane 1)
+#[no_inline]
+fn deint_params(a: *mut i64, b: *mut i64, h: i64) -> i64 {
+    var i: i64 = 0;
+    while i < h {
+        a[2*i] = b[2*i] + 7;
+        a[2*i+1] = b[2*i+1] + 7;
+        i = i + 1;
+    }
+    return a[1];
+}
+fn main() -> i64 {
+    let a: *mut i64 = alloc(i64, 64);
+    let b: *mut i64 = alloc(i64, 64);
+    var i: i64 = 0;
+    while i < 32 {           // loop-filled: the source loads stay live
+        b[2*i] = i;
+        b[2*i+1] = 100 + i;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 32 {
+        a[2*i] = b[2*i] + 7;
+        a[2*i+1] = b[2*i+1] + 7;
+        i = i + 1;
+    }
+    print(a[0]);             // 7
+    print(a[1]);             // 107
+    print(a[62]);            // 38
+    print(a[63]);            // 138
+    let c: *mut i64 = alloc(i64, 64);
+    i = 0;
+    while i < 32 {
+        c[2*i] = 100 + i;
+        c[2*i+1] = 200 + i;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 32 {
+        c[2*i] = c[2*i] + 1;
+        c[2*i+1] = c[2*i+1] + 1;
+        i = i + 1;
+    }
+    print(c[0]);             // 101
+    print(c[1]);             // 201
+    print(c[62]);            // 132
+    print(c[63]);            // 232
+    print(deint_params(a, b, 32)); // 107 (scalar loop: param pair rejected)
+    free(a);
+    free(b);
+    free(c);
+    return 0 as i64;
+}

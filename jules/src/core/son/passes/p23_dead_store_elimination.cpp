@@ -43,10 +43,16 @@ private:
 
         // Case 1: local allocation with no remaining loads.
         if (aa_.is_alloc_local(base)) {
+            // any load that MAY read this base (through the full address
+            // grammar: direct base or Cast/Add-computed addresses — the
+            // slot-shape-only scan killed stores that array-indexed loads
+            // still read; found by the pass audit on t23)
             bool any_load = false;
-            for (NodeId u : g_.uses_of(base)) {
-                const Node& un = g_.node(u);
-                if (un.op == Op::Load && un.in[2] == base) { any_load = true; break; }
+            for (NodeId q = 0; q < g_.size() && !any_load; ++q) {
+                if (g_.is_dead(q)) continue;
+                const Node& qn = g_.node(q);
+                if (qn.op != Op::Load) continue;
+                if (aa_.base_of(qn.in[2]) == base) any_load = true;
             }
             if (!any_load) return true;
         }

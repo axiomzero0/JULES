@@ -396,12 +396,19 @@ private:
         }
 
         // stored values: mapped loads, mapped pure ops, or broadcastable
+        // LOOP-INVARIANT leaves. The invariance half is load-bearing: the
+        // raw IV as a stored value (`a[i] = i`) is elem-typed (broadcastable
+        // by type) but loop-VARYING — broadcasting a header phi reads a
+        // stale merged value into every lane (the fill miscompiled: each
+        // element got the same value; found by the fission test's dependent
+        // companion). The header comment's "iv-derived stored values are
+        // rejected" contract now actually holds for the raw-phi form.
         for (NodeId s : stores_) {
             NodeId v = g_.node(s).in[3];
             if (v == kNoNode || g_.is_dead(v)) return false;
             if (loads_.end() != std::find(loads_.begin(), loads_.end(), v)) continue;
             if (pure_.end() != std::find(pure_.begin(), pure_.end(), v)) continue;
-            if (!broadcastable(v)) {
+            if (!broadcastable(v) || !loop_invariant(v, vl)) {
                 skip_reason_ = "stored-value-unmappable";
                 return false;
             }

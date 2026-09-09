@@ -116,6 +116,8 @@ assert_pass_active t29_minmax IfConversion
 assert_pass_active t31_idiom IdiomRecognition
 assert_pass_active t32_fusion LoopFusion
 assert_pass_active t33_interchange LoopInterchange
+assert_pass_active t34_interleave InterleavedAccessRecognition
+assert_pass_active t35_fission LoopFission
 assert_pass_active t30_storemerge StoreMerging
 
 echo

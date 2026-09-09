@@ -2,24 +2,49 @@
 //   * copy2:  a[0]=b[0]; a[1]=b[1]            -> one movups load + store
 //   * scale2: a[0]=b[0]*7; a[1]=b[1]*7        -> packed mul by broadcast
 //   * mixed sizes rejected honestly (i32 lanes not 16-byte with 2 stores)
+// The helpers are #[inline(always)] so the pairs pack in the INLINED bodies
+// (distinct local allocations: NoAlias). Outlined param-based pairs are
+// rejected by the soundness gate — a caller could pass overlapping
+// pointers and the packed load would read the pre-store lane (regression
+// shape: a[1]=a[0]+7; a[2]=a[1]+7 packed across the a[1] store and read
+// the stale element; locked below in overlap()).
+#[inline(always)]
 fn copy2(a: *mut i64, b: *mut i64) -> i64 {
     a[0] = b[0];
     a[1] = b[1];
     return a[0] * 100 + a[1];
 }
+#[inline(always)]
 fn scale2(a: *mut i64, b: *mut i64) -> i64 {
     a[0] = b[0] * 7;
     a[1] = b[1] * 7;
     return a[0] + a[1];
 }
+// BUG-19 regression: the (a[1],a[2]) store pair fed by the (a[0],a[1])
+// load pair must NOT pack — the intervening a[1] store writes lane 1's
+// element (packed lane would read the stale 100, not 8; O0 prints 15).
+fn overlap(a: *mut i64) -> i64 {
+    a[0] = 1;
+    a[1] = 100;
+    a[2] = 200;
+    a[1] = a[0] + 7;
+    a[2] = a[1] + 7;
+    return a[2];
+}
 fn main() -> i64 {
-    let a: *mut i64 = alloc(i64, 2);
-    let b: *mut i64 = alloc(i64, 2);
-    b[0] = 3;
-    b[1] = 4;
+    let a: *mut i64 = alloc(i64, 4);
+    let b: *mut i64 = alloc(i64, 4);
+    // loop-carried stores are not forwardable: the b-loads below stay LIVE
+    // so the pairs exercise the real load -> store path
+    var i: i64 = 0;
+    while i < 2 {
+        b[i] = i + 3;
+        i = i + 1;
+    }
     print(copy2(a, b));       // 304
     print(a[0] + a[1]);       // 7
     print(scale2(a, b));      // 49
+    print(overlap(a));        // 15
     free(a);
     free(b);
     return 0 as i64;

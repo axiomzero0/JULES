@@ -48,10 +48,18 @@ private:
                 case Op::Store:
                     if (un.in[2] == alloc || un.in[1] == alloc) break;
                     return false; // stored as a value: escapes
-                case Op::Call:
+                case Op::Call: {
+                    // memory-chain use only — the alloc must not ALSO be an
+                    // argument in another slot (same masking shape as SROA's
+                    // Call case: a call chained on the alloc while passing it
+                    // as an argument is an escape)
+                    bool arg_use = false;
+                    for (u8 i = 2; i < un.n_in; ++i)
+                        if (un.in[i] == alloc) arg_use = true;
                     if (un.aux == kFnFree && un.in[2] == alloc) break; // free is fine
-                    if (un.in[1] == alloc) break; // memory chain only
+                    if (un.in[1] == alloc && !arg_use) break;          // chain only
                     return false;                 // passed to a function: escapes
+                }
                 case Op::Return:
                     if (un.in[1] == alloc) break;
                     return un.n_in < 3 || un.in[2] != alloc ? true : false;

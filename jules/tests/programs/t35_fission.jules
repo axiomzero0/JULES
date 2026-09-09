@@ -1,0 +1,66 @@
+// LoopFission (47): a counted loop carrying TWO INDEPENDENT reduction
+// clusters splits into two loops, one per cluster — register pressure
+// halves AND each split loop is the single-reduction shape the LOOP
+// VECTORIZER requires (a two-reduction loop is rejected there with
+// `second-loop-carried-phi`; fission is the enabler, the same interaction
+// production compilers get from loop distribution before vectorization).
+//   * two_red: s = s + a[i]; h = h ^ b[i]  over distinct local arrays
+//     (NoAlias clusters, dynamic trip: the unroller refuses param bounds,
+//     so the loop reaches fission with its single body block intact) ->
+//     split; BOTH halves then vectorize (paddq / pxor lanes)
+//   * dependent: y = y + x — the second cluster's feed reads the FIRST
+//     accumulator -> the clusters are NOT independent -> honestly NOT
+//     split (one loop stays)
+//   * const-trip two-reduction loops are taken by the UNROLLER first
+//     (pass 42 flattens them before fission's slot) — the dynamic-trip
+//     family is fission's complementary territory; documented scope.
+#[no_inline]
+fn two_red(n: i64) -> i64 {
+    let a: *mut i64 = alloc(i64, n);
+    let b: *mut i64 = alloc(i64, n);
+    var i: i64 = 0;
+    while i < n {
+        a[i] = i;
+        b[i] = 1000 + i;
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    var h: i64 = 0;
+    i = 0;
+    while i < n {
+        s = s + a[i];
+        h = h ^ b[i];
+        i = i + 1;
+    }
+    print(s);
+    print(h);
+    free(a);
+    free(b);
+    return 0 as i64;
+}
+#[no_inline]
+fn dependent(n: i64) -> i64 {
+    let a: *mut i64 = alloc(i64, n);
+    var i: i64 = 0;
+    while i < n {
+        a[i] = i;
+        i = i + 1;
+    }
+    var x: i64 = 0;
+    var y: i64 = 0;
+    i = 0;
+    while i < n {
+        x = x + a[i];
+        y = y + x;
+        i = i + 1;
+    }
+    print(x);
+    print(y);
+    free(a);
+    return 0 as i64;
+}
+fn main() -> i64 {
+    print(two_red(1024 as i64));   // s=523776 h=0 (xor of 1024 consecutive)
+    print(dependent(8 as i64));    // x=28 y=84 (y = sum of prefix sums)
+    return 0 as i64;
+}

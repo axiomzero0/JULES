@@ -325,6 +325,19 @@ private:
 
         g_.kill(s2.header);
         g_.kill(s2.guard_if);
+        // the old guard's Cmp: its only user was the killed If; leave it
+        // and the verifier flags "Cmp uses a killed node" (the IV phi it
+        // compared is dead) — dead-code hygiene, found by --verify on t32
+        {
+            NodeId old_cmp = g_.node(s2.guard_if).in[1];
+            if (old_cmp != kNoNode && !g_.is_dead(old_cmp) &&
+                g_.node(old_cmp).op == Op::Cmp) {
+                bool live_user = false;
+                for (NodeId cu : g_.uses_of(old_cmp))
+                    if (!g_.is_dead(cu)) live_user = true;
+                if (!live_user) g_.kill(old_cmp);
+            }
+        }
         g_.kill(s2.exit_proj);
         g_.kill(b2_first);
         g_.kill(s2.iv_phi);
