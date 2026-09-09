@@ -138,6 +138,8 @@ enum class IOp : u16 {
                     // sar = lane is float (f64: unpckhpd, i64: psrldq, 32: pshufd)
     VecBcast,       // broadcast low scalar to all lanes: size = lane size
                     // (8: punpcklqdq, 4: pshufd $0)
+    PgoInc,         // incq jules_pgo_counters+OFF(%rip) — PGO counter bump
+                    // (pass 43 instrument mode; a.slot = byte offset)
 };
 
 struct Operand {
@@ -196,6 +198,9 @@ struct LFunction {
     std::vector<StringConst> strings;   // printf formats owned by this fn
     int label_counter = 0;
     bool is_main = false;
+    u32 pgo_count = 0;                  // PGO: highest counter index + 1 seen
+                                        // by the isel (module total = max;
+                                        // the serializer sizes the .bss table)
 };
 
 struct LinearModule {

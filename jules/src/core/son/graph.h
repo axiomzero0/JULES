@@ -73,6 +73,8 @@ private:
 using FnId = u32;
 inline constexpr FnId kFnPrint = 0xFFFFFF01u; // builtin pseudo-targets in Call.aux
 inline constexpr FnId kFnFree  = 0xFFFFFF02u;
+inline constexpr FnId kFnPgoBump = 0xFFFFFF03u; // PGO counter increment (pass 43);
+                                               // ival = counter index; in = {ctrl, mem}
 inline constexpr FnId kNoFn    = 0xFFFFFFFFu;
 inline constexpr FnId kMaxUserFn = 0xFFFFFF00u;
 

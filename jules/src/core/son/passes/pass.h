@@ -14,6 +14,8 @@
 #include "core/son/analysis/analysis.h"
 #include "core/son/passes/opt_levels.h"
 
+#include <vector>
+
 namespace jules {
 
 struct LinearModule; // codegen/linear.h (fwd decl to avoid a dependency edge)
@@ -40,6 +42,10 @@ struct PassOptions {
     bool post_inline_cleanup = true;
     FlatMap<std::string, bool> disabled; // kill switches (name -> true)
     std::vector<std::string> only;       // if non-empty: run only these
+    // PGO profile data (--pgo=use=<f>): raw counters from jules.prof, pairs
+    // (entry, header) per instrumented loop, enumerated in the same
+    // deterministic (fn, loop) order pass 43 re-derives at compile time.
+    std::vector<u64> pgo_counters;
 };
 
 struct PassStats {

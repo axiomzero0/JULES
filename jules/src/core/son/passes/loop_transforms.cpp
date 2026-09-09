@@ -114,7 +114,15 @@ bool match_counted(Graph& g, LoopInfo& li, DomTree& dom, const Loop& l,
         case CmpOp::Le: case CmpOp::Ge: lt_form = false; break;
         default: return false;
     }
-    i64 span = bound_c.iv - init_c.iv - (lt_form ? 0 : 1);
+    // Trip count. Lt (i < B, i += k): iterations = (B - init)/k. Le
+    // (i <= B, i += k): iterations = (B - init)/k + 1 — the span must
+    // count the inclusive bound, i.e. bound - init + step, NOT bound -
+    // init - 1 (the old formula under-counted by two iterations and
+    // every const-trip `<=` loop that unrolled executed its body two
+    // extra times — sumle(9) returned 66, not 45; found by the PGO
+    // session's Le-relation test, regression-locked by t37). Gt/Ge are
+    // the countdown forms: span goes negative and the clamp rejects.
+    i64 span = bound_c.iv - init_c.iv + (lt_form ? 0 : step);
     if (span < 0) span = 0;
     if (span % step != 0) return false;
 

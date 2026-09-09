@@ -120,6 +120,84 @@ assert_pass_active t34_interleave InterleavedAccessRecognition
 assert_pass_active t35_fission LoopFission
 assert_pass_active t30_storemerge StoreMerging
 
+# PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
+# Asserts: the instrumented binary's output is UNCHANGED (instrumentation
+# must not alter semantics), the profile exists and is non-trivial, the
+# use build reports ProfileGuidedUnrolling activity, and the use binary's
+# output matches the expected file.
+run_pgo_test() {
+    local name=$1
+    local src="tests/programs/${name}.jules"
+    local exp="tests/expected/${name}.txt"
+    local dir="$WORK/${name}_pgo"
+    mkdir -p "$dir"
+
+    if ! timeout 30 $JULESC --pgo=instrument "$src" -o "$dir/inst.bin" > "$dir/inst.log" 2>&1; then
+        echo "FAIL $name (pgo instrument compile)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    (cd "$dir" && timeout 30 ./inst.bin > inst.out 2>&1)
+    if ! diff -q "$exp" "$dir/inst.out" > /dev/null; then
+        echo "FAIL $name (pgo instrument output)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if [ ! -s "$dir/jules.prof" ]; then
+        echo "FAIL $name (pgo profile not written)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    # profile sanity: magic JPG1 + a counter count > 0
+    local n
+    n=$(od -An -t u4 -j 4 -N 4 "$dir/jules.prof" | tr -d ' ')
+    if [ -z "$n" ] || [ "$n" = "0" ]; then
+        echo "FAIL $name (pgo profile empty)"
+        fail=$((fail + 1))
+        return 1
+    fi
+
+    local changes
+    changes=$(timeout 30 $JULESC --pgo=use="$dir/jules.prof" --stats "$src" -o "$dir/use.bin" 2>/dev/null |
+              awk -v p="ProfileGuidedUnrolling" '$2 == p {v += $4} END {print v + 0}')
+    if [ -z "$changes" ] || [ "$changes" = "0" ]; then
+        echo "FAIL $name (pass 'ProfileGuidedUnrolling' reported no changes in use mode)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    timeout 30 "$dir/use.bin" > "$dir/use.out" 2>&1
+    if ! diff -q "$exp" "$dir/use.out" > /dev/null; then
+        echo "FAIL $name (pgo use output)"
+        fail=$((fail + 1))
+        return 1
+    fi
+
+    # negative: a malformed profile must warn, not break the build, and the
+    # output must still be correct (the driver degrades to no-profile mode)
+    echo "JUNK" > "$dir/bad.prof"
+    if timeout 30 $JULESC --pgo=use="$dir/bad.prof" "$src" -o "$dir/bad.bin" > "$dir/bad.log" 2>&1; then
+        timeout 30 "$dir/bad.bin" > "$dir/bad.out" 2>&1
+        if ! diff -q "$exp" "$dir/bad.out" > /dev/null; then
+            echo "FAIL $name (pgo bad-profile output)"
+            fail=$((fail + 1))
+            return 1
+        fi
+        if ! rg -q 'warning: profile' "$dir/bad.log"; then
+            echo "FAIL $name (pgo bad-profile warning missing)"
+            fail=$((fail + 1))
+            return 1
+        fi
+    else
+        echo "FAIL $name (pgo bad-profile compile)"
+        fail=$((fail + 1))
+        return 1
+    fi
+
+    echo "PASS $name [ProfileGuidedUnrolling changes=$changes, profile counters=$n]"
+    pass=$((pass + 1))
+}
+run_pgo_test t36_pgo
+
 echo
 echo "results: $pass passed, $fail failed"
 [ $fail -eq 0 ]

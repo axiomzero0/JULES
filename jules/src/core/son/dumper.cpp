@@ -29,6 +29,7 @@ std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id,
             // aux as a raw symbol index mislabels every call by one.
             if (n.aux == kFnPrint) os << "print";
             else if (n.aux == kFnFree) os << "free";
+            else if (n.aux == kFnPgoBump) os << "pgobump#" << n.ival;
             else if (fn_syms && n.aux < fn_syms->size() && (*fn_syms)[n.aux] != kNoSymbol)
                 os << syms.name((*fn_syms)[n.aux]);
             else if (n.aux != kNoFn) os << "fn" << n.aux;

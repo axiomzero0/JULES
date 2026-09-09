@@ -1,0 +1,37 @@
+// Le-relation counted loops (`while i <= n`): the unroller's trip formula
+// regression. The old span computation (bound - init - 1) under-counted a
+// `<=` loop's iterations by two: sumle(9) — true trip 10 (i = 0..9) — was
+// computed as trip 8, "exact" 4x unrolled, and the loop body executed
+// iterations 10 and 11 past the bound (printed 66, not 45). The shape
+// below is the one that triggered it: one fn, three const call sites
+// (positive / zero / negative bounds), so the first call's inlined copy
+// takes the exact-unroll path instead of being folded away entirely.
+fn sumle(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sumle2(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 2;
+    while i <= n {
+        s = s + i * 2;
+        i = i + 3;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    print(sumle(9 as i64));    // 45  (0+1+...+9)
+    print(sumle(0 as i64));    // 0   (one iteration: 0 <= 0)
+    print(sumle(-3 as i64));   // 0   (zero iterations)
+    print(sumle(100 as i64));  // 5050
+    print(sumle2(14 as i64));  // 2*2 + 2*5 + 2*8 + 2*11 + 2*14 = 80
+    print(sumle2(1 as i64));   // 0   (2 > 1: zero iterations)
+    return 0 as i64;
+}

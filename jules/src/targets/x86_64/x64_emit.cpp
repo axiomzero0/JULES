@@ -1004,6 +1004,17 @@ struct Emitter {
 
     void emit_call(NodeId n) {
         const Node& nd = g_.node(n);
+        if (nd.aux == kFnPgoBump) {
+            // PGO counter increment: one incq against the .bss table; no
+            // registers, no clobbers, no FP const invalidation.
+            Inst& i = emit(IOp::PgoInc);
+            i.a.k = Operand::K::Sym;
+            i.a.sym = "jules_pgo_counters";
+            i.a.slot = static_cast<i32>(nd.ival * 8); // byte offset (idx * 8)
+            if (nd.ival >= 0 && static_cast<u64>(nd.ival) + 1 > lf_.pgo_count)
+                lf_.pgo_count = static_cast<u32>(nd.ival) + 1;
+            return;
+        }
         invalidate_fp_consts(); // all XMMs are caller-saved across calls
         if (nd.aux == kFnPrint) {
             emit_print(n);
@@ -2742,6 +2753,12 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::Jcc: os << "\tj" << cc(i.cond) << " " << lbl(i.a.label) << "\n"; break;
         case IOp::Jmp: os << "\tjmp " << lbl(i.a.label) << "\n"; break;
         case IOp::CallSym: os << "\tcall " << i.a.sym << "@PLT\n"; break;
+        case IOp::PgoInc: {
+            os << "\tincq jules_pgo_counters";
+            if (i.a.slot != 0) os << "+" << i.a.slot;
+            os << "(%rip)\n";
+            break;
+        }
         case IOp::CallFn: os << "\tcall .L" << i.a.label << "_E\n"; break;
         case IOp::TailCallFn: os << "\tleave\n\tjmp .L" << i.a.label << "_E\n"; break;
         case IOp::XorEax: os << "\txorl %eax, %eax\n"; break;
@@ -2906,6 +2923,43 @@ std::string serialize_module_asm(const LinearModule& lin, SymbolTable& syms) {
             }
             os << s.label << ":\n\t.string \"" << esc << "\"\n";
         }
+    }
+    // ---- PGO runtime (instrument builds only) ------------------------------
+    // .bss counter table + an .init_array constructor registering an atexit
+    // dump: the instrumented program writes "JPG1" magic, the counter count,
+    // and the raw u64 counters to jules.prof in its working directory when
+    // it exits. The driver's --pgo=use=<f> reads that file back.
+    u32 pgo_total = 0;
+    for (const LFunction& lf : lin.fns)
+        if (lf.pgo_count > pgo_total) pgo_total = lf.pgo_count;
+    if (pgo_total > 0) {
+        os << "\t.bss\n\t.align 8\njules_pgo_counters:\n\t.zero " << (pgo_total * 8)
+           << "\n";
+        os << "\t.section .rodata\n";
+        os << ".Ljules_pgo_hdr:\n\t.long 0x3150474a\n\t.long " << pgo_total << "\n";
+        os << ".Ljules_pgo_path:\n\t.string \"jules.prof\"\n";
+        os << ".Ljules_pgo_mode:\n\t.string \"wb\"\n";
+        os << "\t.text\n";
+        // Stack stays 16-byte aligned at every call: atexit invokes the
+        // handler with rsp ≡ 8 (mod 16); push rbp + subq $16 restores it.
+        os << "jules_pgo_dump:\n\tpushq %rbp\n\tmovq %rsp, %rbp\n\tsubq $16, %rsp\n";
+        os << "\tleaq .Ljules_pgo_path(%rip), %rdi\n";
+        os << "\tleaq .Ljules_pgo_mode(%rip), %rsi\n";
+        os << "\tcall fopen@PLT\n";
+        os << "\ttestq %rax, %rax\n\tje .Ljules_pgo_done\n";
+        os << "\tmovq %rax, -16(%rbp)\n";
+        os << "\tleaq .Ljules_pgo_hdr(%rip), %rdi\n\tmovl $1, %esi\n\tmovl $8, %edx\n";
+        os << "\tmovq -16(%rbp), %rcx\n\tcall fwrite@PLT\n";
+        os << "\tleaq jules_pgo_counters(%rip), %rdi\n\tmovl $1, %esi\n";
+        os << "\tmovl $" << (pgo_total * 8) << ", %edx\n";
+        os << "\tmovq -16(%rbp), %rcx\n\tcall fwrite@PLT\n";
+        os << "\tmovq -16(%rbp), %rdi\n\tcall fclose@PLT\n";
+        os << ".Ljules_pgo_done:\n\tleave\n\tret\n";
+        os << "jules_pgo_init:\n\tpushq %rbp\n\tmovq %rsp, %rbp\n";
+        os << "\tleaq jules_pgo_dump(%rip), %rdi\n\tcall atexit@PLT\n";
+        os << "\tpopq %rbp\n\txorl %eax, %eax\n\tret\n";
+        os << "\t.section .init_array,\"aw\",@init_array\n";
+        os << "\t.quad jules_pgo_init\n";
     }
     return os.str();
 }

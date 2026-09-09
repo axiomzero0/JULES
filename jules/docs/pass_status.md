@@ -87,9 +87,48 @@ forms, with parity-qualified eq/ne via setcc pairs). Min/max operand
 order is load-bearing for NaN (src operand returned on unordered) and
 is never commuted.
 
+This session (the PGO round) converted the last high-value scaffold —
+p43 profile-guided unrolling — into the full PROFILE-GUIDED pipeline
+(instrument -> run -> jules.prof -> use), the project's first
+feedback-driven optimization loop. INSTRUMENT builds give every
+counted-shape loop two counters (entry: pinned at the loop's entry
+predecessor; header: at the guard's body projection) as
+Call{kFnPgoBump} effects chained into the memory phi (no version
+forks; self-latching phis are read, never rewired — rewiring would
+cycle); the isel lowers each to one `incq jules_pgo_counters+idx*8(%rip)`,
+and an .init_array constructor registers an atexit dump that writes the
+raw counters to jules.prof at process exit. Instrumented functions are
+marked no-inline (the inliner's clone is demand-driven from the
+Return — dangling bumps would be dropped and counts would under-report;
+the same policy pass 56 applies to vectorized functions; trip counts
+are inlining-invariant, and counter indices are assigned at p43's slot
+BEFORE the inliner runs, so instrument and use builds derive the
+identical enumeration). USE builds read the profile in the driver,
+pick the factor from the profiled average trip (largest power of two
+<= min(avg, level budget); loops that never ran, or average < 2, are
+skipped), and split dynamic-trip loops into the GUARDED-EPILOGUE form:
+the F-unrolled main loop guarded by the LAST COPY's test
+(`iv + (F-1)*step <rel> bound` — the unrolled body only runs when all
+F scalar iterations would have; correctness NEVER depends on the
+profile, only the factor does) plus a fresh scalar epilogue entered
+from the main exit; post-loop readers retarget to the epilogue's
+phis/exit. Writing the Le-relation test the new matcher needed found
+BUG-24: the unroller's trip formula for `<=` counted loops was off by
+two iterations (span = bound-init-1 instead of bound-init+step) —
+every const-trip `while i <= n` loop that took the exact-unroll path
+executed its body two iterations past the bound (sumle(9) returned 66,
+not 45; the suite only ever tested `<` loops, and t04's shape happened
+to fall into the peel path, whose re-match fails on the non-const
+post-peel entry — masked, not fixed). Regression-locked by t37
+(Le at positive/zero/negative bounds, step-3 variant, all levels).
+Round-trip locked by t36: the instrument binary's output must equal
+the plain build's, the profile must be non-empty, the use build must
+report ProfileGuidedUnrolling activity, the use binary must match, and
+a malformed profile must warn and degrade to no-profile mode.
+
 Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or MIR.; `SIMPLIFIED` — Real but reduced: core mechanism present, documented reductions.; `VACUOUS` — Complete for the current IR: the constructs it targets do not exist in the MVP subset.; `SCAFFOLD` — Not yet implemented: contract, modes and telemetry in place; honest no-op.
 
-Status roll-up: 64 IMPLEMENTED, 4 SIMPLIFIED, 9 VACUOUS, 12 SCAFFOLD.
+Status roll-up: 65 IMPLEMENTED, 4 SIMPLIFIED, 9 VACUOUS, 11 SCAFFOLD.
 
 | # | Pass | Status | Notes |
 |---|------|--------|-------|
@@ -134,8 +173,8 @@ Status roll-up: 64 IMPLEMENTED, 4 SIMPLIFIED, 9 VACUOUS, 12 SCAFFOLD.
 | 39 | LoopClassification | IMPLEMENTED | Counted/uncounted/early-exit/nested tagging. |
 | 40 | LoopInvariantCodeMotion | IMPLEMENTED | Hoist invariant pure ops to preheaders. |
 | 41 | LoadLICM | IMPLEMENTED | LICM for loads with alias proofs. |
-| 42 | LoopUnrolling | IMPLEMENTED | Body-duplication unrolling for counted loops with compile-time-constant trip counts (shared cloner in passes/loop_transforms.cpp): match IV phi + Add(phi,+k) + const bound + no early exits; factor from the level budget (O2:4, O3:8); remainder peeled first when T%F!=0; F-1 copies chained behind the body (per-copy seeds remap every header phi to the previous copy's update so copy m sees iteration base+m); the header latch and phi backedges retarget to the last copy; IV steps F*k per unrolled iteration. Runs in the main pipeline and again in the post-inline cleanup (inlining propagates const bounds). Dynamic-trip guarded epilogue unrolling = documented roadmap. Fires on t18_unroll. |
-| 43 | ProfileGuidedUnrolling | SCAFFOLD (honest no-op) | Unroll from profiled trip counts. Needs the PGO profile format + counters (not in this MVP); pass 42 already consumes the static-const trip counts. |
+| 42 | LoopUnrolling | IMPLEMENTED | Body-duplication unrolling for counted loops with compile-time-constant trip counts (shared cloner in passes/loop_transforms.cpp): match IV phi + Add(phi,+k) + const bound + no early exits; factor from the level budget (O2:4, O3:8); remainder peeled first when T%F!=0; F-1 copies chained behind the body (per-copy seeds remap every header phi to the previous copy's update so copy m sees iteration base+m); the header latch and phi backedges retarget to the last copy; IV steps F*k per unrolled iteration. Trip formula: Lt span = bound-init; Le span = bound-init+step (the inclusive bound — BUG-24, fixed with t37). Runs in the main pipeline and again in the post-inline cleanup (inlining propagates const bounds). Dynamic-trip loops are pass 43's (the guarded-epilogue form). Fires on t18_unroll/t37. |
+| 43 | ProfileGuidedUnrolling | IMPLEMENTED | The PGO pipeline's consumer. INSTRUMENT (`--pgo=instrument`): every counted-shape loop (const OR dynamic bound, canonicalized Lt/Le — the builder emits the reversed `Cmp gt(bound, iv)` form) gets two Call{kFnPgoBump} counter effects (entry pred + guard body projection, the rotation-stable pins; memory-phi-chained with a self-latch read to avoid cycles) lowering to one incq against a .bss table; an .init_array constructor registers an atexit fwrite of magic+count+counters to jules.prof. Counter pairs indexed in deterministic (fn, loop) order BEFORE mutation (identical enumeration in both modes); instrumented fns marked no-inline (the inliner's Return-demand clone would drop dangling bumps — under-counting); const-trip unroll/peel duplicates bumps but totals stay = trip; every other loop transform rejects call-carrying loops, so trip structure is preserved. USE (`--pgo=use=<f>`): factor = largest pow2 <= min(profiled avg trip H/E, level budget); E=0/H=0/avg<2 loops skipped. The transform: guarded-epilogue split of DYNAMIC-trip loops — F-unrolled main loop with the LAST-COPY guard `iv+(F-1)*step <rel> bound` (sound for every runtime trip; the profile only picks F) + a fresh scalar epilogue (p47-style fresh loop: Region/guard/projections, phis taking the main's phis as entries, body deep-cloned with phi remap, post-loop control+value users retargeted). Single-block bodies only (v1 family); countdown loops out of scope. The epilogue is the counted shape the VECTORIZER can take. Fires on t36 (changes=3, 6 counters, round-trip: instrument output == plain output == use output; bad-profile warning + degrade). |
 | 44 | LoopPeeling | IMPLEMENTED | Remainder peeling at the loop ENTRY: r = T mod F peeled copies chain from the entry predecessor (each executes unconditionally — T is an exact constant, so those iterations always ran), every header phi's entry input becomes the last peeled copy's value (the IV starts at init + r*k), and the residual loop trips T-r, divisible by F so pass 42 unrolls it exactly. Fires on t18_unroll (sumsq(101)). |
 | 45 | LoopInterchange | IMPLEMENTED | Perfect-nest swap for strided walks: `while i<W { while j<H { s += a[j*W+i] } }` becomes the j-outer/i-inner form — unit inner stride, the `j*W` term invariant in the inner body (hoisted by LICM/machine LICM), one IV update per swapped role. Gates: read-only nest (loads + pure ops), trivial self-thread phis collapsed first (SROA's per-version threads — including the memory phis, which are self-latching in effect-free nests), carried pairs in the standard (X_o = Phi(ext, X_i)) shape with accumulating updates restricted to integer commutative reductions whose feed never reads the accumulator (FP gated on --fp=fast: the fold order changes), and an address analysis that extracts how each load's index depends on each IV (Unit/Wide/Absent — coefficients may be runtime values like the width param): every address must use the OUTER iv with unit coefficient and at least one must scale the INNER iv wide. Mechanics: control edges re-thread (entry into the new outer; the old outer's body projection becomes the new inner's body entry), carried phi pairs ROTATE inputs, the IV updates move to their new loops' blocks (i++ into the inner body, j++ onto the outer latch path), post-nest readers re-target to the new outer phis. Guards keep testing their own IVs. Fires on t33 (column-major sum; the already-stride-1 row-major twin is correctly left alone). |
 | 46 | LoopFusion | IMPLEMENTED | Adjacent loops over the SAME iteration sequence (same IV entry value and constant step, same guard relation against the same bound node — GVN unifies constants, param bounds work, back-to-back entry: L2's entry pred is L1's exit projection) merge into one loop: one header/guard/IV update instead of two, a body SLP/LICM/the vectorizer can see whole. Safety: base-level write/read independence both directions via alias analysis (writes of one never touch what the other accesses), no calls, carried values available before L1's entry (anything derived from L1's RESULTS rejects — the dependent a[i]=a[i]*2 then sum(a) pair stays two loops), and pure nodes LICM parked between the loops (the gap block) are hoisted ahead of the fused loop when their inputs allow. Mechanics: iv2 RAUs to iv1; L2's header phis split into trivial self-latch threads (collapse), the memory phi (inside-B2 users rethreaded to B1's last effect, post-loop users to the fused loop's phi), and real carried phis rebuilt at header1; the guard's exit projection RAUs to L1's; B2's first block contents join B1's last block; the fused backedge comes from B2's last block. Fires on t32 (two disjoint sum loops fuse; the dependent pair does not). |

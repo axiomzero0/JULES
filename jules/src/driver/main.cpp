@@ -80,12 +80,55 @@ int run(int argc, char** argv) {
             if (v == "off") opts.pgo = PgoMode::Off;
             else if (v == "instrument") opts.pgo = PgoMode::Instrument;
             else if (v == "live") opts.pgo = PgoMode::Live;
-            else if (v.compare(0, 4, "use=") == 0) opts.pgo = PgoMode::Use;
+            else if (v.compare(0, 4, "use=") == 0) {
+                opts.pgo = PgoMode::Use;
+                // read the profile written by an --pgo=instrument build:
+                // "JPG1" magic, u32 counter count, count u64 counters.
+                std::string path = v.substr(4);
+                std::FILE* pf = std::fopen(path.c_str(), "rb");
+                bool ok = false;
+                if (pf) {
+                    u32 magic = 0, count = 0;
+                    if (std::fread(&magic, 4, 1, pf) == 1 &&
+                        std::fread(&count, 4, 1, pf) == 1 && magic == 0x3150474Au) {
+                        opts.pgo_counters.resize(count);
+                        ok = count == 0 ||
+                             std::fread(opts.pgo_counters.data(), 8, count, pf) == count;
+                    }
+                    std::fclose(pf);
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "warning: profile '%s' missing or malformed "
+                                 "(bad magic/truncated) — building without "
+                                 "profile data\n",
+                                 path.c_str());
+                    opts.pgo = PgoMode::Off;
+                } else if (opts.pgo_counters.empty()) {
+                    std::fprintf(stderr,
+                                 "warning: profile '%s' contains no counters — "
+                                 "building without profile data\n",
+                                 path.c_str());
+                    opts.pgo = PgoMode::Off;
+                } else {
+                    std::fprintf(stderr, "note: using PGO profile '%s' (%zu counters)\n",
+                                 path.c_str(), opts.pgo_counters.size());
+                }
+            }
             else if (v.compare(0, 7, "sample=") == 0) opts.pgo = PgoMode::Sample;
             else { std::fprintf(stderr, "unknown --pgo mode '%s' (off|instrument|use=<f>|sample=<f>|live)\n", v.c_str()); return 2; }
-            if (opts.pgo == PgoMode::Instrument || opts.pgo == PgoMode::Use ||
-                opts.pgo == PgoMode::Sample) {
-                std::fprintf(stderr, "note: --pgo=%s accepted; profile plumbing (counters, profile format, evidence thresholds) is not implemented yet — building without profile data\n", v.c_str());
+            if (opts.pgo == PgoMode::Instrument) {
+                std::fprintf(stderr,
+                             "note: --pgo=instrument: loop trip counters emitted; the "
+                             "program writes jules.prof to its working directory on "
+                             "exit (recompile with --pgo=use=jules.prof to consume it)\n");
+            }
+            if (opts.pgo == PgoMode::Sample || opts.pgo == PgoMode::Live) {
+                std::fprintf(stderr,
+                             "note: --pgo=%s accepted; perf-counter sampling / live "
+                             "profiles are not implemented — building without "
+                             "profile data\n",
+                             v.c_str());
             }
         }
         else if (parse_kv(a, "--lto=", v)) {
