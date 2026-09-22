@@ -39,6 +39,26 @@ public:
                         ++removed_;
                     }
                     break;
+                case Op::Cmp:
+                    // packed compare: same vector type on both operands and
+                    // a lane kind SSE2 can produce (v2i64 has no pcmpgtq /
+                    // pcmpeqq below SSE4.x — killed here, the scalar loop
+                    // covers it)
+                    if (g_.node(n.in[1]).ty != n.ty || g_.node(n.in[2]).ty != n.ty ||
+                        !vecx::packed_cmp_legal(n.ty)) {
+                        g_.kill(id);
+                        ++removed_;
+                    }
+                    break;
+                case Op::Select:
+                    // packed select: mask condition of the same lane count,
+                    // t/f matching the result vector
+                    if (ty_lanes(g_.node(n.in[1]).ty) != ty_lanes(n.ty) ||
+                        g_.node(n.in[2]).ty != n.ty || g_.node(n.in[3]).ty != n.ty) {
+                        g_.kill(id);
+                        ++removed_;
+                    }
+                    break;
                 case Op::Load:
                 case Op::Phi:
                 case Op::Store: // vector stores carry the VALUE type

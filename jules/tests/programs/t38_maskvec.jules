@@ -1,0 +1,113 @@
+// masked vectorization (pass 61 mask generation): conditional packed
+// values over lane masks — the loop vectorizer packs if-converted
+// bodies, the packed Select lowers into the SSE2 and/andn/or blend
+//   * masked_sum: i32 reduction whose feed is Select(v > 0, v, 0)
+//     (V4I32 lane masks: pcmpgtd + pcmpeqd compositions)
+//   * masked_fill: i32 element-wise stores of Select(v > 0, v, 0) + 1
+//   * masked_f64: f64 element-wise stores through Select(v > 0.0, v, 0.0)
+//     (V2F64: cmppd ordered predicate + pand/pandn/por — bitwise blend,
+//     NaN-exact, safe under strict FP: no arithmetic reassociation)
+//   * masked_i64: i64 masked sum — NO packed compare exists below SSE4.2
+//     (pcmpgtq); the loop vectorizer skips it honestly and the scalar
+//     loop computes it
+//   * odd/short/zero trips exercise the guard + scalar remainder
+fn masked_sum(a: *mut i32, n: i64) -> i64 {
+    var s: i32 = 0;
+    var i: i64 = 0;
+    while i < n {
+        let v: i32 = a[i];
+        var x: i32 = 0;
+        if v > 0 { x = v; } else { x = 0; }
+        s = s + x;
+        i = i + 1;
+    }
+    return (s as i64);
+}
+
+fn masked_fill(a: *mut i32, b: *mut i32, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        let v: i32 = a[i];
+        var x: i32 = 0;
+        if v > 0 { x = v; } else { x = 0; }
+        b[i] = x + 1;
+        i = i + 1;
+    }
+    var s: i32 = 0;
+    i = 0;
+    while i < n {
+        s = s + b[i];
+        i = i + 1;
+    }
+    return (s as i64);
+}
+
+fn masked_f64(x: *mut f64, y: *mut f64, n: i64) -> f64 {
+    var i: i64 = 0;
+    while i < n {
+        let v: f64 = x[i];
+        var w: f64 = 0.0;
+        if v > 0.0 { w = v; } else { w = 0.0; }
+        y[i] = w + 1.0;
+        i = i + 1;
+    }
+    var s: f64 = 0.0;
+    i = 0;
+    while i < n {
+        s = s + y[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn masked_i64(a: *mut i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        let v: i64 = a[i];
+        var x: i64 = 0;
+        if v > 0 { x = v; } else { x = 0; }
+        s = s + x;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    let a: *mut i32 = alloc(i32, 12);
+    let b: *mut i32 = alloc(i32, 12);
+    var i: i64 = 0;
+    while i < 12 {
+        a[i] = (i as i32) * 3 - 10;   // -10 -7 -4 -1 | 2 5 8 11 | 14 17 20 23
+        i = i + 1;
+    }
+    print(masked_sum(a, 12 as i64));  // 100 (2+5+8+11+14+17+20+23)
+    print(masked_sum(a, 7 as i64));   // 15  (odd trip: 1 vector + 3 scalar)
+    print(masked_sum(a, 1 as i64));   // 0   (trip < VF: scalar only)
+    print(masked_sum(a, 0 as i64));   // 0   (never entered)
+    print(masked_fill(a, b, 12 as i64)); // 112 (100 + 1s: 4 negative lanes -> 1)
+    free(a);
+    free(b);
+
+    let x: *mut f64 = alloc(f64, 12);
+    let y: *mut f64 = alloc(f64, 12);
+    i = 0;
+    while i < 12 {
+        x[i] = (i as f64) - 6.0;      // -6 .. 0.0 | 1 .. 5
+        i = i + 1;
+    }
+    print(masked_f64(x, y, 12 as i64)); // 27 (7*1 + 2+3+4+5+6)
+    print(masked_f64(x, y, 5 as i64));  // 5 (odd trip; 5 * 1.0)
+    free(x);
+    free(y);
+
+    let c: *mut i64 = alloc(i64, 12);
+    i = 0;
+    while i < 12 {
+        c[i] = i * 2 - 15;            // -15 .. -1 | 1 3 5 7
+        i = i + 1;
+    }
+    print(masked_i64(c, 12 as i64));  // 16 (1+3+5+7; scalar — no v2i64 cmp)
+    free(c);
+    return 0 as i64;
+}

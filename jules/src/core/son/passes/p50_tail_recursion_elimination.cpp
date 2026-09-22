@@ -37,6 +37,18 @@
 //    recursion took; where the original terminated, C eventually holds.
 //    Integer-only: reassociating a float sum changes results.
 //
+//    SPINE-TAIL BASE WIDENING: when the base region partially evaluates —
+//    f(k) constant-folds for every k in [0..K] — and the recursion is
+//    structurally descending (g2 = x - c, c >= 1) with a constant-bounded
+//    base (C = x <s d / x <=s d, d <= K+1), the loop exits at w <= K
+//    through the folded table instead of running the spine down to C:
+//        loop { if x <= K { return TBL[x] + acc; }
+//               acc = acc + f(g1(x));  x = x - c; }
+//    Every f(k <= K) subtree collapses to its constant (calls only fire
+//    with non-table arguments — on fib(39) that is a ~75x executed-call
+//    reduction). TBL's default arm keeps B(x) for negative x, where C
+//    holds by the gate; see the soundness notes above eval_subst.
+//
 // Runs before inlining/loop opts per the catalog ordering contract.
 #include "core/son/passes/pass_utils.h"
 #include "core/son/passes/inline.h"
@@ -394,6 +406,7 @@ public:
     }
 
 private:
+    static constexpr int kWidenCap = 10; // folded-table entries max
     // Purity for transform inputs: no memory effects, no phis (a phi input
     // would make the expression loop-dependent in unsound ways).
     bool pure_subtree(NodeId root) {
@@ -442,6 +455,115 @@ private:
                 g_.set_input(n, 0, blk);
             for (u8 i = 1; i < nd.n_in; ++i) stack.push_back(nd.in[i]);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Spine-tail base widening (partial evaluation of the base region).
+    //
+    // The accumulator identity says the loop's remaining contribution from
+    // spine value w is exactly f(w): unroll f(w) = f(g1(w)) + f(g2(w)) down
+    // to C-leaves and the call terms line up with the spine's per-step
+    // calls one-to-one. If f(k) CONSTANT-FOLDS for every k in [0..K], the
+    // loop may therefore exit at w <= K returning tbl[w] + acc instead of
+    // running the spine down to C — every f(k<=K) subtree is replaced by
+    // its folded constant (calls only fire with "real-work" arguments).
+    //
+    // Soundness gates (all structural, checked in match()):
+    //   * single parameter (the fold substitutes one concrete value);
+    //   * g2 = x - c with constant c >= 1 — the spine strictly descends and
+    //     its first value <= K lands in [K-c+1, K], inside the table;
+    //   * C = x <s d (0 <= d <= K+1) or x <=s d (-1 <= d <= K) — every
+    //     negative w is a C-true base case (the exit's default arm returns
+    //     the ORIGINAL B(w) there) and no C-true w sits above the table.
+    // The widened head is a single signed `w <= K` compare — same shape
+    // and cost as the original base check.
+    // ------------------------------------------------------------------
+
+    // Evaluate a pure subtree with the parameter bound to a constant.
+    bool eval_subst(NodeId n, const ConstVal& x, ConstVal& out) {
+        const Node& nd = g_.node(n);
+        switch (nd.op) {
+            case Op::Const: return const_of(g_, n, out);
+            case Op::Param:
+                if (n == param_) { out = x; return true; }
+                return false;
+            case Op::Bin: {
+                ConstVal a, b;
+                if (!eval_subst(nd.in[1], x, a) || !eval_subst(nd.in[2], x, b))
+                    return false;
+                return eval_bin_const(static_cast<BinOp>(nd.sub), a, b, out);
+            }
+            case Op::Cmp: {
+                ConstVal a, b;
+                if (!eval_subst(nd.in[1], x, a) || !eval_subst(nd.in[2], x, b))
+                    return false;
+                return eval_cmp_const(static_cast<CmpOp>(nd.sub), a, b, out);
+            }
+            case Op::Un: {
+                ConstVal a;
+                if (!eval_subst(nd.in[1], x, a)) return false;
+                return eval_un_const(static_cast<UnOp>(nd.sub), a, out);
+            }
+            case Op::Cast: {
+                ConstVal a;
+                if (!eval_subst(nd.in[1], x, a)) return false;
+                return eval_cast_const(static_cast<CastOp>(nd.sub), a, nd.ty, out);
+            }
+            case Op::Select: {
+                ConstVal c;
+                if (!eval_subst(nd.in[1], x, c)) return false;
+                return eval_subst(c.iv != 0 ? nd.in[2] : nd.in[3], x, out);
+            }
+            default: return false;
+        }
+    }
+
+    // f(k): C(k) ? B(k) : f(g1(k)) + f(g2(k)), constant-folded. Failure
+    // (or a float) stops the table; the depth/budget caps bound the
+    // evaluation of wildly branching shapes.
+    bool fold_arg(i64 k, int depth, u32& budget, ConstVal& out) {
+        if (depth > 24 || budget == 0) return false;
+        --budget;
+        ConstVal x;
+        x.is_fp = false;
+        x.ty = pty_;
+        x.iv = k;
+        ConstVal cv;
+        if (!eval_subst(g_.node(ifn_).in[1], x, cv)) return false;   // C(k)
+        if (cv.iv != 0) {
+            ConstVal bv;
+            if (!eval_subst(g_.node(r_base_).in[2], x, bv)) return false; // B(k)
+            if (bv.is_fp) return false;
+            out = bv;
+            return true;
+        }
+        ConstVal a1, a2;
+        if (!eval_subst(g_.node(c1_).in[2], x, a1)) return false;   // g1(k)
+        if (!eval_subst(g_.node(c2_).in[2], x, a2)) return false;   // g2(k)
+        if (a1.is_fp || a2.is_fp) return false;
+        ConstVal f1, f2;
+        if (!fold_arg(a1.iv, depth + 1, budget, f1)) return false;
+        if (!fold_arg(a2.iv, depth + 1, budget, f2)) return false;
+        return eval_bin_const(BinOp::Add, f1, f2, out);
+    }
+
+    // Fold f(0..K) for the longest all-constants prefix up to kWidenCap.
+    bool fold_table() {
+        K_ = -1;
+        u32 budget = 8192;
+        for (int k = 0; k <= kWidenCap; ++k) {
+            ConstVal fv;
+            if (!fold_arg(k, 0, budget, fv) || fv.is_fp) break;
+            tbl_[k] = fv.iv;
+            K_ = k;
+        }
+        return K_ >= 2;
+    }
+
+    NodeId iconst(NodeId pin, TypeId ty, i64 v) {
+        NodeId n = g_.make(Op::Const, ty, {pin});
+        g_.node(n).ival = v;
+        return n;
     }
 
     bool match() {
@@ -537,6 +659,49 @@ private:
         c2_ = c2;
         body_proj_ = body_proj;
         acc_ty_ = an.ty;
+
+        // Spine-tail widening: structural gates + folded table (see the
+        // block comment above eval_subst). Failure of any gate leaves the
+        // plain accumulator transform in place.
+        wide_ = false;
+        K_ = 0;
+        param_ = kNoNode;
+        {
+            u32 nparam = 0;
+            for (NodeId n = 0; n < g_.size(); ++n) {
+                const Node& nd = g_.node(n);
+                if (nd.op == Op::Param) { ++nparam; param_ = n; }
+            }
+            bool gates = (nparam == 1);
+            i64 c = 0, d = 0;
+            bool lt = false;
+            if (gates) {
+                pty_ = g_.node(param_).ty;
+                const Node& gw = g_.node(g_.node(c2_).in[2]);       // g2 root
+                gates = gw.op == Op::Bin &&
+                        gw.sub == static_cast<u8>(BinOp::Sub) &&
+                        gw.in[1] == param_ &&
+                        g_.node(gw.in[2]).op == Op::Const &&
+                        (c = g_.node(gw.in[2]).ival) >= 1;
+            }
+            if (gates) {
+                const Node& cw = g_.node(g_.node(ifn_).in[1]);      // C root
+                gates = cw.op == Op::Cmp && cw.in[1] == param_ &&
+                        g_.node(cw.in[2]).op == Op::Const;
+                if (gates) {
+                    d = g_.node(cw.in[2]).ival;
+                    lt = (cw.sub == static_cast<u8>(CmpOp::Lt));
+                    gates = lt ? (d >= 0)
+                               : (cw.sub == static_cast<u8>(CmpOp::Le) && d >= -1);
+                }
+            }
+            if (gates && fold_table()) {
+                // d must not let a C-true value sit above the table, and the
+                // spine's landing zone [K-c+1, K] must be inside it.
+                i64 dmax = lt ? K_ + 1 : K_;
+                if (d <= dmax && K_ >= 2 && K_ >= c - 1) wide_ = true;
+            }
+        }
         return true;
     }
 
@@ -580,9 +745,33 @@ private:
         // the If moves under the header
         g_.set_input(ifn_, 0, hdr);
 
-        // base return: return B + acc, memory = loop phi
+        // widened head: exit at w <= K (signed, one compare — same shape
+        // as the original base check). Table covers [0..K]; negatives are
+        // C-true base cases and take the B(w) default arm; w > K is C-false
+        // by the d <= K+1 gate.
+        NodeId wphi = phis[0];
+        if (wide_) {
+            NodeId ck = iconst(hdr, pty_, K_);
+            NodeId widecond = g_.make(Op::Cmp, ty_i1(), {hdr, wphi, ck},
+                                      static_cast<u8>(CmpOp::Le));
+            g_.set_input(ifn_, 1, widecond);
+        }
+
+        // base return: return B + acc, memory = loop phi. Widened: the
+        // exit value is the folded table TBL(w) for w in [0..K]; the
+        // innermost default keeps B(w) for the C-covered negatives.
         NodeId b = g_.node(r_base_).in[2];
-        NodeId baseadd = g_.make(Op::Bin, acc_ty_, {base_proj_, b, accphi},
+        NodeId base_val = b;
+        if (wide_) {
+            for (int j = K_; j >= 0; --j) {
+                NodeId cj = iconst(base_proj_, pty_, j);
+                NodeId ej = g_.make(Op::Cmp, ty_i1(), {base_proj_, wphi, cj},
+                                    static_cast<u8>(CmpOp::Eq));
+                NodeId vj = iconst(base_proj_, acc_ty_, tbl_[j]);
+                base_val = g_.make(Op::Select, acc_ty_, {base_proj_, ej, vj, base_val});
+            }
+        }
+        NodeId baseadd = g_.make(Op::Bin, acc_ty_, {base_proj_, base_val, accphi},
                                  static_cast<u8>(BinOp::Add));
         g_.set_input(r_base_, 1, mphi);
         g_.set_input(r_base_, 2, baseadd);
@@ -621,6 +810,12 @@ private:
     NodeId r_base_ = kNoNode, r_rec_ = kNoNode, addv_ = kNoNode;
     NodeId c1_ = kNoNode, c2_ = kNoNode;
     TypeId acc_ty_ = ty_i64();
+    // spine-tail widening state
+    bool wide_ = false;
+    int K_ = 0;
+    NodeId param_ = kNoNode;
+    TypeId pty_ = ty_none();
+    i64 tbl_[kWidenCap + 1] = {};
 };
 } // namespace
 

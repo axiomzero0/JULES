@@ -542,7 +542,9 @@ struct Emitter {
             case ty_v4f32(): kind = IOp::VecBinF32; break;
             default: kind = IOp::VecLogical; break;
         }
-        if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor) kind = IOp::VecLogical;
+        if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor ||
+            op == BinOp::AndNot)
+            kind = IOp::VecLogical;
         Inst& i = emit(kind);
         i.bin = op;
         i.size = lane;
@@ -672,9 +674,35 @@ struct Emitter {
         return cond;
     }
 
+    // Packed relational compare (pass 56 mask): operands and result all the
+    // same vector type; the mask is all-ones/all-zeros per lane. Emits the
+    // SSE2 lane-compare (cmppd/cmpps ordered predicates are NaN-exact; the
+    // i32 compositions live in the serializer) and stores the mask home.
+    void emit_vec_cmp(NodeId n) {
+        const Node& nd = g_.node(n);
+        TypeId vt = g_.node(nd.in[1]).ty;
+        load_fp(nd.in[1], R::Xmm0);
+        load_fp(nd.in[2], R::Xmm1);
+        IOp kind = vt == ty_v4i32() ? IOp::VecCmpI32
+                  : vt == ty_v4f32() ? IOp::VecCmpF32
+                                     : IOp::VecCmpF64;
+        Inst& i = emit(kind);
+        i.bin = static_cast<BinOp>(nd.sub); // CmpOp relation (both u8 enums)
+        i.a.k = Operand::K::Reg; i.a.reg = R::Xmm0; // dst: mask lands here
+        i.b.k = Operand::K::Reg; i.b.reg = R::Xmm1; // src
+        Inst& st = emit(IOp::MovFpS);
+        st.a.k = Operand::K::Reg; st.a.reg = R::Xmm0;
+        st.b.k = Operand::K::Slot; st.b.slot = slot(n);
+        st.size = 16;
+    }
+
     void emit_cmp(NodeId n) {
         const Node& nd = g_.node(n);
         const Node& an = g_.node(nd.in[1]);
+        if (ty_is_vector(an.ty)) {
+            emit_vec_cmp(n);
+            return;
+        }
         CmpOp rel = static_cast<CmpOp>(nd.sub);
         if (fp_of(an.ty) && (rel == CmpOp::Eq || rel == CmpOp::Ne)) {
             // NaN-exact equality needs the parity bit: unordered sets PF=1
@@ -857,6 +885,32 @@ struct Emitter {
         NodeId c = nd.in[1], t = nd.in[2], f = nd.in[3];
         bool fp = fp_of(nd.ty);
         u8 size = sz_of(nd.ty);
+        if (ty_is_vector(nd.ty)) {
+            // packed select (pass 61 normally lowers this to And/AndNot/Or
+            // at the SoN level; this is the --disable 61 safety net): emit
+            // the identical mask blend. The node's own slot doubles as the
+            // intermediate for the And(m, t) half.
+            load_fp(c, R::Xmm0);
+            load_fp(t, R::Xmm1);
+            Inst& a1 = reg2(IOp::VecLogical, R::Xmm0, R::Xmm1);
+            a1.bin = BinOp::And;
+            Inst& st1 = emit(IOp::MovFpS);
+            st1.a.k = Operand::K::Reg; st1.a.reg = R::Xmm0;
+            st1.b.k = Operand::K::Slot; st1.b.slot = slot(n);
+            st1.size = 16;
+            load_fp(c, R::Xmm0);
+            load_fp(f, R::Xmm1);
+            Inst& a2 = reg2(IOp::VecLogical, R::Xmm0, R::Xmm1);
+            a2.bin = BinOp::AndNot; // xmm0 = ~mask & f
+            load_fp(n, R::Xmm1);    // And(m, t) half from its slot
+            Inst& a3 = reg2(IOp::VecLogical, R::Xmm0, R::Xmm1);
+            a3.bin = BinOp::Or;
+            Inst& st2 = emit(IOp::MovFpS);
+            st2.a.k = Operand::K::Reg; st2.a.reg = R::Xmm0;
+            st2.b.k = Operand::K::Slot; st2.b.slot = slot(n);
+            st2.size = 16;
+            return;
+        }
         load_value(c, R::Rdx, 8);
         // The condition is an i1 VALUE (slot/reg), not live flags: test it
         // before the cmov/jcc reads them (the producing compare's flags
@@ -2355,6 +2409,148 @@ bool x64_machine_peephole(LFunction& lf) {
         return j;
     };
 
+    // ---- register liveness over the CFG ------------------------------------
+    // Needed by boundary-crossing dead checks: a loop's last body op is
+    // followed by the backedge, so linear scans always abort there. The
+    // analysis models READS conservatively-complete (every real read is
+    // seen; over-reading is safe) and WRITES only where certain
+    // (under-writing is safe — fewer kills means more liveness). Calls
+    // are transparent: clobbered caller-saved registers are irrelevant
+    // because the consumer of this analysis asks "is D ever read later",
+    // and a read is a read regardless of intervening clobbers. Computed
+    // ONCE at entry: peephole rewrites only remove or redirect reads, so
+    // entry liveness stays a safe over-approximation as rules fire.
+    std::vector<u32> live_after(code.size(), 0);
+    {
+        auto bit = [](R r) { return 1u << static_cast<unsigned>(r); };
+        // pure-write ops (a is NOT a read for these)
+        auto a_is_write_only = [](IOp o) {
+            switch (o) {
+                case IOp::MovRR: case IOp::MovFpFp: case IOp::MovSR:
+                case IOp::MovFpR: case IOp::MovRImm: case IOp::Setcc:
+                case IOp::LeaRR: case IOp::LeaSlot: case IOp::LeaSym:
+                case IOp::RestoreCal: case IOp::LoadMem:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        auto w_writes = [](IOp o) {
+            switch (o) {
+                case IOp::MovRR: case IOp::MovFpFp: case IOp::MovSR:
+                case IOp::MovFpR: case IOp::MovRImm: case IOp::Setcc:
+                case IOp::LeaRR: case IOp::LeaSlot: case IOp::LeaSym:
+                case IOp::RestoreCal: case IOp::LoadMem:
+                case IOp::ArithRR: case IOp::ArithRImm: case IOp::FpBin:
+                case IOp::VecBinF64: case IOp::VecBinI64: case IOp::VecBinI32:
+                case IOp::VecBinF32: case IOp::FpNeg: case IOp::Neg:
+                case IOp::Not: case IOp::Cmov: case IOp::MovZX:
+                case IOp::ShiftImm: case IOp::ShiftCl:
+                case IOp::CvtToFp: case IOp::CvtToInt:
+                case IOp::MovFpFromGpr: case IOp::MovFpFromGpr32:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        auto inst_reads = [&](const Inst& q, u32& mask) {
+            if (q.op == IOp::Nop || q.op == IOp::Comment) return;
+            if (q.b.k == Operand::K::Reg) mask |= bit(q.b.reg);
+            if (q.a.k == Operand::K::Reg && !a_is_write_only(q.op)) mask |= bit(q.a.reg);
+            if (q.op == IOp::IDiv || q.op == IOp::UDiv || q.op == IOp::Cqo)
+                mask |= bit(R::Rax) | bit(R::Rdx);
+            if (q.op == IOp::ShiftCl) mask |= bit(R::Rcx);
+        };
+        auto inst_writes = [&](const Inst& q, u32& mask) {
+            if (q.a.k == Operand::K::Reg && w_writes(q.op)) mask |= bit(q.a.reg);
+            if (q.op == IOp::IDiv || q.op == IOp::UDiv)
+                mask |= bit(R::Rax) | bit(R::Rdx);
+            if (q.op == IOp::Cqo) mask |= bit(R::Rdx);
+        };
+
+        // block segmentation: labels start blocks; control transfers end them
+        std::vector<size_t> block_of_inst(code.size(), 0);
+        FlatMap<int, size_t> label_block;
+        std::vector<std::vector<size_t>> succs;
+        {
+            size_t nb = 0;
+            for (size_t i = 0; i < code.size(); ++i) {
+                if (i > 0 && (code[i].op == IOp::Label)) ++nb;
+                block_of_inst[i] = nb;
+                if (code[i].op == IOp::Label)
+                    label_block.insert(code[i].a.label, nb);
+                if (i + 1 < code.size()) {
+                    IOp o = code[i].op;
+                    if (o == IOp::Jmp || o == IOp::Jcc || o == IOp::Ret ||
+                        o == IOp::RetNaked || o == IOp::TailCallFn ||
+                        o == IOp::TailCallNaked)
+                        ++nb; // terminator ends the block
+                }
+            }
+            succs.resize(nb + 1);
+            for (size_t i = 0; i < code.size(); ++i) {
+                size_t b = block_of_inst[i];
+                IOp o = code[i].op;
+                if (o == IOp::Jmp || o == IOp::Jcc) {
+                    const size_t* t = label_block.find(code[i].a.label);
+                    if (t) succs[b].push_back(*t);
+                    if (o == IOp::Jcc && i + 1 < code.size())
+                        succs[b].push_back(block_of_inst[i + 1]);
+                } else if (i + 1 < code.size() && o != IOp::Ret &&
+                           o != IOp::RetNaked && o != IOp::TailCallFn &&
+                           o != IOp::TailCallNaked && o != IOp::Jmp) {
+                    succs[b].push_back(block_of_inst[i + 1]);
+                }
+            }
+            succs.resize(nb + 1 > succs.size() ? nb + 1 : succs.size());
+        }
+        size_t nb = succs.size();
+        if (nb == 0) nb = 1;
+        // backward fixpoint: live_in/live_out per block
+        std::vector<u32> live_in(nb, 0), live_out(nb, 0);
+        {
+            bool fix = true;
+            std::vector<u32> rin(nb, 0); // accumulated use-before-def per block
+            for (size_t b = 0; b < nb; ++b) {
+                u32 live = 0;
+                for (size_t i = code.size(); i-- > 0;) {
+                    if (block_of_inst[i] != b) continue;
+                    u32 rd = 0, wr = 0;
+                    inst_reads(code[i], rd);
+                    inst_writes(code[i], wr);
+                    live = (live & ~wr) | rd;
+                }
+                rin[b] = live;
+            }
+            while (fix) {
+                fix = false;
+                for (size_t b = nb; b-- > 0;) {
+                    u32 out = 0;
+                    for (size_t s : succs[b]) out |= live_in[s];
+                    if (out != live_out[b]) { live_out[b] = out; fix = true; }
+                    // live_in = upward-exposed uses | live_out: NOT masking
+                    // live_out by in-block defs keeps the result an
+                    // over-approximation (safe for "is D read later" checks;
+                    // it can only cost rewrite opportunities, never soundness)
+                    u32 in2 = rin[b] | out;
+                    if (in2 != live_in[b]) { live_in[b] = in2; fix = true; }
+                }
+            }
+        }
+        // per-instruction live-after
+        for (size_t b = nb; b-- > 0;) {
+            u32 live = live_out[b];
+            for (size_t i = code.size(); i-- > 0;) {
+                if (block_of_inst[i] != b) continue;
+                live_after[i] = live;
+                u32 rd = 0, wr = 0;
+                inst_reads(code[i], rd);
+                inst_writes(code[i], wr);
+                live = (live & ~wr) | rd;
+            }
+        }
+    }
+
     // ---- movzx destination retarget -------------------------------------
     // [movzbq %al, %rax][mov X, %rax] -> [movzbq %al, %X]: the extended
     // byte lands in its home directly. Sound when nothing reads rax
@@ -2382,6 +2578,58 @@ bool x64_machine_peephole(LFunction& lf) {
         zx.a.reg = mv.a.reg;
         mv.op = IOp::Nop;
         changed = true;
+    }
+
+    // ---- operand-copy elimination for two-operand SSE ops ----------------
+    // [MovFpFp D <- S][op b=D] -> [op b=S] with the move deleted: the
+    // pair-fold promotes a load's slot round-trip into a copy, but the
+    // consumer's operand register is fungible — pointing it at the copy's
+    // SOURCE is strictly cheaper (found on vecsum: movaps xmm0,xmm3; the
+    // movups result could feed paddq directly). Same shape for GP
+    // [MovRR D <- S][ArithRR/CmpRR b=D]. Sound when (a) the op's other
+    // operand is not S (a two-operand op reading S twice changes the
+    // computation), and (b) D is dead after the op per the CFG register
+    // liveness above — the copy's definition disappears, so any later
+    // reader of D would see a stale register.
+    {
+        auto is_b_reader = [](const Inst& q) {
+            switch (q.op) {
+                case IOp::VecBinF64: case IOp::VecBinI64:
+                case IOp::VecBinI32: case IOp::VecBinF32:
+                case IOp::FpBin: case IOp::FpCmp:
+                case IOp::ArithRR: case IOp::CmpRR:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        auto bit = [](R r) { return 1u << static_cast<unsigned>(r); };
+        for (size_t i = 0; i + 1 < code.size(); ++i) {
+            Inst& mv = code[i];
+            bool fp = (mv.op == IOp::MovFpFp);
+            if (mv.op != IOp::MovRR && !fp) continue;
+            if (mv.a.k != Operand::K::Reg || mv.b.k != Operand::K::Reg) continue;
+            if (mv.a.reg == mv.b.reg) continue; // no-op copy
+            R d = mv.a.reg, s = mv.b.reg;
+            size_t oi = next_live(i + 1);
+            if (oi >= code.size()) continue;
+            Inst& op = code[oi];
+            if (!is_b_reader(op)) continue;
+            if (op.b.k != Operand::K::Reg || op.b.reg != d) continue;
+            if (op.a.k != Operand::K::Reg) continue;
+            if (op.a.reg == s) continue;         // would read S twice
+            bool fp_op = op.op == IOp::VecBinF64 || op.op == IOp::VecBinI64 ||
+                         op.op == IOp::VecBinI32 || op.op == IOp::VecBinF32 ||
+                         op.op == IOp::FpBin || op.op == IOp::FpCmp;
+            if (fp != fp_op) continue;           // FP moves feed FP ops only
+            // D dead after the op (CFG liveness — the op is its last read;
+            // entry liveness is an over-approximation, and rewrites only
+            // remove or redirect reads, so it stays one as rules fire)
+            if (live_after[oi] & bit(d)) continue;
+            op.b.reg = s;
+            mv.op = IOp::Nop;
+            changed = true;
+        }
     }
 
     // ---- producer destination retarget ----------------------------------
@@ -2742,7 +2990,16 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             else
                 os << "\tcmp" << ssz(i.size) << " $" << i.b.imm << ", " << rs(i.a.reg, i.size) << "\n";
             break;
-        case IOp::Test: os << "\ttestq " << r(i.a.reg) << ", " << r(i.a.reg) << "\n"; break;
+        case IOp::Test:
+            // The cmp-$0 -> test fold keeps the compare's SIZE: a 32-bit
+            // value must test 32 bits. movl zero-extends, so testq on an
+            // i32-defined register reads a huge POSITIVE 64-bit value for
+            // every negative i32 — setg/jg went true on -10 (BUG-25, found
+            // by t38's masked i32 loop). The isel's bool tests are size 8
+            // and stay testq.
+            os << "\ttest" << ssz(i.size) << " " << rs(i.a.reg, i.size) << ", "
+               << rs(i.a.reg, i.size) << "\n";
+            break;
         case IOp::Setcc: {
             // setcc target: a.reg byte register (al when unset)
             R dst = (i.a.k == Operand::K::Reg) ? i.a.reg : R::Rax;
@@ -2854,8 +3111,71 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             break;
         }
         case IOp::VecLogical: {
-            const char* mn = i.bin == BinOp::Or ? "por" : i.bin == BinOp::Xor ? "pxor" : "pand";
+            const char* mn = i.bin == BinOp::Or      ? "por"
+                             : i.bin == BinOp::Xor   ? "pxor"
+                             : i.bin == BinOp::AndNot ? "pandn"
+                                                      : "pand";
             os << "\t" << mn << " " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecCmpF64:
+        case IOp::VecCmpF32: {
+            // Ordered, NaN-exact predicates: eq=0 ne=4 lt=1 le=2 gt=6(nle)
+            // ge=5(nlt). AT&T: cmpXX $imm, src, dst -> dst = dst REL src.
+            int imm = 0;
+            switch (static_cast<CmpOp>(i.bin)) {
+                case CmpOp::Eq: imm = 0; break;
+                case CmpOp::Ne: imm = 4; break;
+                case CmpOp::Lt: imm = 1; break;
+                case CmpOp::Le: imm = 2; break;
+                case CmpOp::Gt: imm = 6; break;
+                case CmpOp::Ge: imm = 5; break;
+            }
+            os << "\t" << (i.op == IOp::VecCmpF64 ? "cmppd" : "cmpps") << " $" << imm
+               << ", " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::VecCmpI32: {
+            // SSE2 integer lane masks. Base relations in one instruction
+            // (AT&T: op src, dst -> dst = dst OP src):
+            //   Eq: pcmpeqd (dst==src)      Gt: pcmpgtd (dst>src, signed)
+            // Compositions with the all-ones flip (pcmpeqd reg,reg on the
+            // DEAD src register — the compare consumed it already):
+            //   Ne = ~Eq, Le = ~Gt, Ge = ~(src>dst) via swapped pcmpgtd
+            const CmpOp rel = static_cast<CmpOp>(i.bin);
+            switch (rel) {
+                case CmpOp::Eq:
+                    os << "\tpcmpeqd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+                case CmpOp::Gt:
+                    os << "\tpcmpgtd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+                case CmpOp::Ne:
+                    os << "\tpcmpeqd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    os << "\tpcmpeqd " << r(i.b.reg) << ", " << r(i.b.reg) << "\n";
+                    os << "\tpxor " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+                case CmpOp::Le:
+                    os << "\tpcmpgtd " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    os << "\tpcmpeqd " << r(i.b.reg) << ", " << r(i.b.reg) << "\n";
+                    os << "\tpxor " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+                case CmpOp::Ge: {
+                    // ~(B > A): compare swapped (mask lands in src reg), then
+                    // flip with ones built in the DEAD dst register
+                    os << "\tpcmpgtd " << r(i.a.reg) << ", " << r(i.b.reg) << "\n";
+                    os << "\tpcmpeqd " << r(i.a.reg) << ", " << r(i.a.reg) << "\n";
+                    os << "\tpxor " << r(i.a.reg) << ", " << r(i.b.reg) << "\n";
+                    os << "\tmovdqa " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+                }
+                case CmpOp::Lt:
+                    // B > A: swapped compare, mask lands in the src register
+                    // then moves home
+                    os << "\tpcmpgtd " << r(i.a.reg) << ", " << r(i.b.reg) << "\n";
+                    os << "\tmovdqa " << r(i.b.reg) << ", " << r(i.a.reg) << "\n";
+                    break;
+            }
             break;
         }
         case IOp::VecExtract: {

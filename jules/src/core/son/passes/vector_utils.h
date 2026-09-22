@@ -33,16 +33,33 @@ inline TypeId vector_ty_for(TypeId scalar) {
 //   f64/f32: add/sub/mul/div        (addpd/subpd/mulpd/divpd)
 //   i64:     add/sub only           (paddq/psubq — no SIMD i64 mul)
 //   i32:     add/sub only           (paddd/psubd — pmulld needs SSE4.1)
-// and/or/xor are legal for every integer lane kind.
+// and/or/xor/andnot are legal for every lane kind: pand/por/pxor/pandn are
+// BITWISE — lane typing is irrelevant (all-ones/all-zeros masks in an
+// fp-typed vector are exactly the compare result shape; fp lanes gain
+// logicals only through pass 61 mask blends, never from user source).
 inline bool packed_bin_legal(TypeId scalar, BinOp op) {
-    if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor)
-        return ty_is_int(scalar) && !ty_is_bool(scalar);
+    if (op == BinOp::And || op == BinOp::Or || op == BinOp::Xor ||
+        op == BinOp::AndNot)
+        return !ty_is_bool(scalar);
     // minpd/maxpd: FP lanes only (SSE2); operand order is load-bearing
     // (dst operand returned on unordered) — never commute these.
     if (op == BinOp::Min || op == BinOp::Max) return ty_is_float(scalar);
     if (ty_is_float(scalar)) return op <= BinOp::Div;
     if (scalar == ty_i64() || scalar == ty_i32()) return op == BinOp::Add || op == BinOp::Sub;
     return false;
+}
+
+// Packed relational compares (pass 56 mask path, pass 60 legalization):
+//   v4i32: all six relations — pcmpeqd + pcmpgtd compositions
+//   v4f32/v2f64: all six — cmpps/cmppd immediate predicates (ordered,
+//               NaN-exact: eq=0 ne=4 lt=1 le=2 gt=6(=nle) ge=5(=nlt))
+//   v2i64: NONE — pcmpgtq needs SSE4.2, pcmpeqq needs SSE4.1; i64-element
+//          masked loops are skipped honestly (documented reduction)
+inline bool packed_cmp_legal(TypeId vec_ty) {
+    switch (vec_ty) {
+        case ty_v4i32(): case ty_v4f32(): case ty_v2f64(): return true;
+        default: return false;
+    }
 }
 
 // ---- cost model (pass 64 semantics) ---------------------------------------

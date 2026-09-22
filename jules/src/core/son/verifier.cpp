@@ -104,7 +104,15 @@ struct VCheck {
             }
             case Op::Cmp: {
                 if (n.n_in != 3) fail(id, "Cmp must have {ctrl, a, b}");
-                else if (n.ty != ty_i1()) fail(id, "Cmp result must be bool");
+                else if (n.ty != ty_i1() && !ty_is_vector(n.ty))
+                    fail(id, "Cmp result must be bool");
+                else if (ty_is_vector(n.ty)) {
+                    // packed compare (pass 56 mask): operands and result all
+                    // the SAME vector type — the mask is all-ones/all-zeros
+                    // bits in that type (x86 cmpps/pcmpeqd result shape)
+                    if (g.node(n.in[1]).ty != n.ty || g.node(n.in[2]).ty != n.ty)
+                        fail(id, "packed Cmp operand/result type mismatch");
+                }
                 break;
             }
             case Op::Un:
@@ -114,6 +122,17 @@ struct VCheck {
             }
             case Op::Select: {
                 if (n.n_in != 4) fail(id, "Select must have {ctrl, cond, t, f}");
+                else if (ty_is_vector(n.ty)) {
+                    // packed select (pass 56): per-lane select over a mask
+                    // vector of the same lane count (mask may carry the
+                    // t/f type itself — compare result — or the sibling
+                    // lane-typed family: v4f32 select over a v4i32 mask)
+                    const Node& c = g.node(n.in[1]);
+                    if (!ty_is_vector(c.ty) || ty_lanes(c.ty) != ty_lanes(n.ty))
+                        fail(id, "packed Select condition is not a same-width mask");
+                    if (g.node(n.in[2]).ty != n.ty || g.node(n.in[3]).ty != n.ty)
+                        fail(id, "packed Select operand type mismatch");
+                }
                 break;
             }
             case Op::Load: {

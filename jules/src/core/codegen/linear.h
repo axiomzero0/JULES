@@ -133,7 +133,12 @@ enum class IOp : u16 {
     VecBinI64,      // paddq/psubq (Add/Sub only — no SIMD i64 mul below AVX512DQ)
     VecBinI32,      // paddd/psubd (Add/Sub only — pmulld needs SSE4.1)
     VecBinF32,      // addps/subps/mulps/divps
-    VecLogical,     // pand/por/pxor (any lane kind; bin encodes And/Or/Xor)
+    VecLogical,     // pand/por/pxor/pandn (any lane kind; bin encodes
+                    // And/Or/Xor/AndNot — AndNot(a,b) = ~a & b)
+    VecCmpI32,      // pcmpeqd/pcmpgtd lane mask: a=xmm0(dst), b=xmm1(src);
+                    // bin encodes CmpOp; relation composition per emitter
+    VecCmpF32,      // cmpps $imm, xmm1, xmm0 (ordered, NaN-exact)
+    VecCmpF64,      // cmppd $imm, xmm1, xmm0 (ordered, NaN-exact)
     VecExtract,     // lane extraction to scalar: b.imm = lane; size = lane size;
                     // sar = lane is float (f64: unpckhpd, i64: psrldq, 32: pshufd)
     VecBcast,       // broadcast low scalar to all lanes: size = lane size

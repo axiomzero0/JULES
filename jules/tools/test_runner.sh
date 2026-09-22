@@ -82,6 +82,33 @@ assert_pass_active() {
     pass=$((pass + 1))
 }
 
+# Kill-switch assertion (2026-09-18 audit): --disable must isolate a pass
+# EVERYWHERE — including the post-inline cleanup re-run, which previously
+# bypassed the gate (a disabled SROA/GVN/etc. silently ran again in the
+# cleanup sweep). The `changes` sum across all stat tables must be 0 AND
+# the pass must show at least one skipped(disabled) row.
+assert_pass_disabled() {
+    local name=$1
+    local pass_name=$2
+    local stats skipped
+    stats=$(timeout 30 $JULESC --stats --disable "$pass_name" "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
+            awk -v p="$pass_name" '$2 == p {v += $4} END {print v + 0}')
+    skipped=$(timeout 30 $JULESC --stats --disable "$pass_name" "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
+              awk -v p="$pass_name" '$2 == p && $3 ~ /^skipped/ {n++} END {print n + 0}')
+    if [ -n "$stats" ] && [ "$stats" != "0" ]; then
+        echo "FAIL $name (pass '$pass_name' reported changes=$stats despite --disable)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if [ -z "$skipped" ] || [ "$skipped" = "0" ]; then
+        echo "FAIL $name (pass '$pass_name' never showed skipped(disabled))"
+        fail=$((fail + 1))
+        return 1
+    fi
+    echo "PASS $name [$pass_name fully disabled]"
+    pass=$((pass + 1))
+}
+
 # Level matrix: every program must produce its expected output at every
 # optimization level (levels are budget presets, never semantic changes).
 # t08_tco is exempt at -O0/-Og: its 1M-deep tail recursion requires TCO,
@@ -119,6 +146,20 @@ assert_pass_active t33_interchange LoopInterchange
 assert_pass_active t34_interleave InterleavedAccessRecognition
 assert_pass_active t35_fission LoopFission
 assert_pass_active t30_storemerge StoreMerging
+# Masked vectorization (pass 61): the if-converted selects must pack and
+# the mask blend must lower (i32 lane masks + f64 cmppd masks)
+assert_pass_active t38_maskvec IfConversion
+assert_pass_active t38_maskvec LoopVectorizer
+assert_pass_active t38_maskvec MaskGeneration
+# Spine-tail base widening: the accumulator transform must fire on the
+# canonical descending shapes (fibrec widens through the folded table).
+assert_pass_active t39_widenbase TailRecursionElimination
+
+# Kill-switch hold across the post-inline cleanup re-run (audit fix):
+# cleanup-set passes must stay dead when disabled.
+assert_pass_disabled t04_sroa ScalarReplacementOfAggregates
+assert_pass_disabled t02_gvn GlobalValueNumbering
+assert_pass_disabled t30_storemerge StoreMerging
 
 # PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
 # Asserts: the instrumented binary's output is UNCHANGED (instrumentation

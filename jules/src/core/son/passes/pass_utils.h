@@ -70,6 +70,9 @@ inline bool eval_bin_const(BinOp op, const ConstVal& a, const ConstVal& b, Const
         case BinOp::And: out.iv = x & y; return true;
         case BinOp::Or:  out.iv = x | y; return true;
         case BinOp::Xor: out.iv = x ^ y; return true;
+        // vector-only (pass 61 blends); the scalar fold exists for
+        // exhaustiveness — AndNot never appears on scalar IR
+        case BinOp::AndNot: out.iv = ~x & y; return true;
         case BinOp::Shl: out.iv = x << (y & 63); return true;
         case BinOp::Shr: out.iv = sgn ? x >> (y & 63) : static_cast<i64>(static_cast<u64>(x) >> (y & 63)); return true;
         case BinOp::Min:

@@ -1,9 +1,3 @@
-You are absolutely correct. A systems language targeting C/C++ performance with explicit memory control, raw pointers, and no mandatory safety system does not have a garbage collector. References to GC, write barriers, read barriers, stack maps for managed references, and TLABs were inappropriate carryover from the B-2 Java specification and have no place in JULES.
-
-Below is the **corrected, uncompressed** specification with all GC/managed-runtime assumptions removed. Every rule has been audited for static-systems-language fidelity.
-
----
-
 # JULES Compiler Laws & Architecture Specification
 
 **Status:** Stable

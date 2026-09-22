@@ -1,3 +1,13 @@
 skills/
 node_modules/
 release/
+
+# home-directory working artifacts - never push these
+/.env
+/tmp/
+/tool-results/
+/download/
+/upload/
+/worklog.md
+/scripts/
+/TODO

@@ -57,6 +57,11 @@ enum class BinOp : u8 {
     // the select's NaN behavior exactly, and machine passes must NOT
     // commute them (min/max are commutative only in the absence of NaN).
     Min, Max,
+    // VECTOR-ONLY bitwise and-not (pass 61 mask blends): AndNot(a, b) =
+    // ~a & b — the SSE2 pandn shape (dst = ~dst & src). Never appears in
+    // user source and never on scalar types: p61 lowers packed selects
+    // into Or(And(m, t), AndNot(m, f)), the exact pandn/por/pand triple.
+    AndNot,
 };
 enum class CmpOp : u8 { Eq, Ne, Lt, Le, Gt, Ge };
 enum class UnOp  : u8 { Neg, Not, BNot };

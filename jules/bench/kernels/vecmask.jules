@@ -1,0 +1,43 @@
+// bench: vecmask — f64 element-wise masked blend (if-conversion -> packed
+// Select -> SSE2 blend chain: cmppd + pand/pandn/por under strict FP,
+// bitwise-exact). The checksum reduction stays scalar (strict FP: no lane
+// reassociation) in every compiler — same code shape gcc -O3 vectorizes
+// with the same and/andn/or blend on the SSE2 baseline.
+fn vecmask(x: *mut f64, y: *mut f64, n: i64, rounds: i64) -> f64 {
+    var total: f64 = 0.0;
+    var r: i64 = 0;
+    while r < rounds {
+        var i: i64 = 0;
+        while i < n {
+            let v: f64 = x[i];
+            var w: f64 = 0.0;
+            if v > 0.0 { w = v; } else { w = 0.0; }
+            y[i] = w;
+            i = i + 1;
+        }
+        var chk: f64 = 0.0;
+        i = 0;
+        while i < n {
+            chk = chk + y[i];
+            i = i + 1;
+        }
+        total = total + chk;
+        r = r + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    let n: i64 = 100000;
+    let x: *mut f64 = alloc(f64, n);
+    let y: *mut f64 = alloc(f64, n);
+    var i: i64 = 0;
+    while i < n {
+        x[i] = ((i % 2001) - 1000) as f64 * 0.5;
+        i = i + 1;
+    }
+    print(vecmask(x, y, n, 2000));
+    free(x);
+    free(y);
+    return 0;
+}

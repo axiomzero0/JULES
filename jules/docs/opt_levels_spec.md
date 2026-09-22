@@ -1,8 +1,13 @@
-Yes. But the key rule is:
+# JULES Optimization Levels Specification
+
+**Status:** Design specification
+**Scope:** User-visible optimization levels and the modifier matrix (`--size`, `--pgo`, `--lto`/`--fto`, `--jit-budget`)
+
+The key rule:
 
 > **Optimization levels are compile-time budget presets. PGO, FTO/LTO, Thin, Full, and JIT profiling are not separate levels. They are modifiers that tune the same unified pipeline.**
 
-Do not create `-O4`, and do not create hidden runtime tiers. You want a small, orthogonal matrix:
+There is no `-O4` and there are no hidden runtime tiers. The design is a small, orthogonal matrix:
 
 ```text
 -O level       = how aggressively to optimize
@@ -10,7 +15,7 @@ Do not create `-O4`, and do not create hidden runtime tiers. You want a small, o
 --pgo          = where profile evidence comes from
 --lto / --fto  = how much cross-module visibility the optimizer gets
 --jit-budget   = runtime compilation latency budget, not an execution tier
-```
+
 
 ---
 

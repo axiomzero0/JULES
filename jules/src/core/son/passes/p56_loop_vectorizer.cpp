@@ -19,6 +19,21 @@
 //   acc = phi(init, acc op load) -> vector phi + horizontal lane tree at
 //     the exit (integer: exact; FP: gated on --fp=fast because the lane
 //     tree reassociates the reduction order)
+//   Cmp feeding Selects -> packed Cmp: a per-lane all-ones/all-zeros MASK
+//     in the same vector type (x86 cmpps/pcmpeqd result shape); the
+//     relation is bitwise-exact — no FP reassociation is introduced
+//   Select(mask, t, f) -> packed Select over vector t/f; pass 61 lowers
+//     it into the explicit And/AndNot/Or blend (pand/pandn/por). NaN
+//     semantics are exact: ordered cmppd predicates and a bitwise blend
+//   i64 elements with masks SKIP (no packed compare below SSE4.2)
+//
+// UNROLL x2 (perf levels): the vector loop processes TWO packs per
+// iteration (k counts 32-byte pairs; nv = bound / (VF*2); an odd pack
+// count tails into the scalar remainder exactly — floor-floor division
+// identity). Integer Add reductions split into TWO accumulators
+// (independent chains, merged lane-wise at the exit — exact for
+// integers); every other reduction keeps ONE accumulator with the two
+// pack updates chained, preserving the reassociation semantics exactly.
 // Any other shape (iv-derived stored values, calls, inner branches, a
 // second loop-carried phi, non-unit strides) makes the loop SKIP.
 #include "core/son/passes/vector_utils.h"
@@ -328,6 +343,41 @@ private:
                     pure_.push_back(n);
                     break;
                 }
+                case Op::Cmp: {
+                    // mask compare (pass 61 mask path): the packed form is a
+                    // per-lane all-ones/all-zeros mask feeding packed
+                    // Selects. Every user must be a Select in THIS body —
+                    // a lane mask has no other packed consumer. i64
+                    // elements have no packed compare on SSE2 (pcmpgtq is
+                    // SSE4.2) and skip here honestly.
+                    if (!mask_cmp_ok(n, vl)) return false;
+                    if (!vecx::packed_cmp_legal(
+                            vecx::vector_ty_for(g_.node(nd.in[1]).ty))) {
+                        skip_reason_ = "mask-cmp-no-packed-form";
+                        return false;
+                    }
+                    pure_.push_back(n);
+                    break;
+                }
+                case Op::Select: {
+                    // conditional packed value: cond must be a body Cmp
+                    // (the mask compare above); t/f pack exactly like Bin
+                    // operands. Pass 61 lowers the packed Select into the
+                    // explicit And/AndNot/Or mask blend.
+                    NodeId cnd = nd.in[1];
+                    if (cnd == kNoNode || g_.is_dead(cnd) ||
+                        g_.node(cnd).op != Op::Cmp ||
+                        g_.node(cnd).in[0] != vl.body_proj) {
+                        skip_reason_ = "select-cond-not-body-cmp";
+                        return false;
+                    }
+                    if (elem_ty_ != ty_none() && nd.ty != elem_ty_) {
+                        skip_reason_ = "select-type-mismatch";
+                        return false;
+                    }
+                    pure_.push_back(n);
+                    break;
+                }
                 case Op::Cast: {
                     // non-address casts (e.g. f32->f64 per element) are not
                     // packed in the MVP; address casts never reach here
@@ -337,6 +387,15 @@ private:
                 default:
                     skip_reason_ = op_name(nd.op);
                     return false;
+            }
+        }
+        // post-loop consistency: elem is registered by loads/stores (a
+        // body needs memory traffic); every Select must produce the
+        // element type
+        for (NodeId n : pure_) {
+            if (g_.node(n).op == Op::Select && g_.node(n).ty != elem_ty_) {
+                skip_reason_ = "select-type-mismatch";
+                return false;
             }
         }
         // re-filter pure_: safety against late-marked address pieces
@@ -484,6 +543,22 @@ private:
         return dn.ty == elem_ty_;
     }
 
+    // A body Cmp is packable as a lane mask only when every user is a
+    // Select pinned in the same body block (the mask's sole packed
+    // consumer); anything else — a bool Bin, a store of the comparison, a
+    // control use — makes the loop skip.
+    bool mask_cmp_ok(NodeId n, const VecLoop& vl) {
+        for (NodeId u : g_.uses_of(n)) {
+            if (g_.is_dead(u)) continue;
+            const Node& un = g_.node(u);
+            if (un.op != Op::Select || un.in[0] != vl.body_proj) {
+                skip_reason_ = "cmp-feeds-non-select";
+                return false;
+            }
+        }
+        return true;
+    }
+
     // A phi at `vl.header` whose value never changes per iteration: every
     // input is the phi itself or a node defined outside this loop.
     bool passthrough_phi(NodeId u, const VecLoop& vl) const {
@@ -534,6 +609,18 @@ private:
         TypeId vty = vecx::vector_ty_for(elem_ty_);
         TypeId ity = vl.iv_ty; // i64 or i32 (original iv type)
 
+        // UNROLL x2 (perf levels only): two packs per iteration amortize the
+        // loop control and the address chain over 2x elements, and integer
+        // Add reductions split into TWO accumulators (independent chains —
+        // the shape gcc emits). Exactness: sum(A-lanes) + sum(B-lanes) equals
+        // the one-accumulator sum for integer Add; every other reduction
+        // (FP anything, Min/Max/Mul) keeps ONE accumulator with the two
+        // pack updates chained, preserving the existing reassociation
+        // semantics exactly.
+        const u32 packs = size_biased_ ? 1u : 2u;
+        const bool two_acc = packs == 2 && reduction_phi_ != kNoNode &&
+                             red_.op == BinOp::Add && !ty_is_float(elem_ty_);
+
         NodeId entry_head = g.node(vl.header).in[vl.entry_slot];
         NodeId mphi = mem_phi(vl);
         // The loop's memory entry: the mem phi's entry input, or (when SROA
@@ -563,18 +650,32 @@ private:
         // ---- vector loop skeleton (classic while shape) ----
         NodeId vhead = g.make(Op::Region, ty_ctrl(), {gtrue});
         NodeId vmphi = g.make(Op::Phi, ty_mem(), {vhead, entry_mem});
+        // kphi counts ITERATIONS: each covers `packs` x 16 bytes
         NodeId kphi = g.make(Op::Phi, ty_i64(), {vhead, int64_const(gtrue, 0)});
-        NodeId vacc = kNoNode;
+        NodeId vaccA = kNoNode;
+        NodeId vaccB = kNoNode;
         if (reduction_phi_ != kNoNode) {
             NodeId init = g.node(reduction_phi_).in[vl.entry_slot + 1];
             NodeId bcast = broadcast_val(init, gtrue, vty);
-            vacc = g.make(Op::Phi, vty, {vhead, bcast});
+            vaccA = g.make(Op::Phi, vty, {vhead, bcast});
+            if (two_acc) vaccB = g.make(Op::Phi, vty, {vhead, bcast});
         }
 
-        // vector trip count nv = sext/zext(bound)/lanes, all i64
-        NodeId bound64 = widen(g, vhead, vl.bound);
+        // vector trip count (in ITERATIONS) = bound / (lanes*packs), all
+        // i64 — pinned AT THE LOOP ENTRY (gtrue), not the header: a
+        // header-pinned div re-executes every iteration (an idiv inside the
+        // hot loop cost ~30 cycles per 2-element vector step; found by the
+        // vecsum benchmark). bound is loop-invariant by construction (it
+        // is the original guard's operand), and the entry edge dominates
+        // the whole vector loop, so one evaluation is exact. Fault behavior
+        // is unchanged: the div executes only when the entry guard proved
+        // bound >= lanes >= 1 (nonzero const divisor — no #DE possible).
+        // floor(floor(bound/lanes)/packs) == floor(bound/(lanes*packs)),
+        // so an odd pack count tails into the scalar remainder exactly.
+        NodeId bound64 = widen(g, gtrue, vl.bound);
         NodeId nv = g.make(Op::Bin, ty_i64(),
-                           {vhead, bound64, int64_const(vhead, lanes)},
+                           {gtrue, bound64,
+                            int64_const(gtrue, static_cast<i64>(lanes) * packs)},
                            static_cast<u8>(BinOp::Div));
 
         // loop guard: if (k < nv) — pinned AT the header
@@ -584,84 +685,109 @@ private:
         NodeId ltrue = g.make(Op::IfTrue, ty_ctrl(), {lif});
         NodeId lfalse = g.make(Op::IfFalse, ty_ctrl(), {lif});
 
-        // ---- packed body (pinned at ltrue) ----
-        FlatMap<NodeId, NodeId> vmap; // scalar -> packed
-        // packed address: Cast(Ptr, Add(Cast(i64, base), Shl(k, 4)))
-        auto vec_addr = [&](vecx::AddrPattern ap, NodeId orig_addr) {
-            NodeId base64 = g.make(Op::Cast, ty_i64(), {ltrue, ap.base},
-                                   static_cast<u8>(CastOp::Ptr));
-            NodeId off = g.make(Op::Bin, ty_i64(),
-                                {ltrue, kphi, int64_const(ltrue, 4)},
-                                static_cast<u8>(BinOp::Shl));
-            NodeId addr64 = g.make(Op::Bin, ty_i64(), {ltrue, base64, off},
-                                   static_cast<u8>(BinOp::Add));
-            return g.make(Op::Cast, g.node(orig_addr).ty, {ltrue, addr64},
-                          static_cast<u8>(CastOp::Ptr));
-        };
-        for (NodeId ldn : loads_) {
-            NodeId vaddr = vec_addr(*load_addr_.find(ldn), g.node(ldn).in[2]);
-            NodeId vload = g.make(Op::Load, vty, {ltrue, vmphi, vaddr});
-            vmap.insert(ldn, vload);
-        }
-        // pure ops in dependency fixpoint (ids are not dep order)
-        {
-            FlatMap<NodeId, bool> done;
-            bool progress = true;
-            while (progress) {
-                progress = false;
-                for (NodeId p : pure_) {
-                    if (done.contains(p)) continue;
-                    bool ready = true;
-                    for (u8 i = 1; i < g.node(p).n_in && ready; ++i) {
-                        NodeId d = g.node(p).in[i];
-                        if (d == kNoNode || g_.is_dead(d)) continue;
-                        if (vmap.find(d)) continue;
-                        if (d == reduction_phi_) continue;
-                        if (pure_.end() != std::find(pure_.begin(), pure_.end(), d) &&
-                            !done.contains(d))
-                            ready = false;
+        // ---- packed bodies (pinned at ltrue; one per unrolled pack) ----
+        // Pack j's byte offset inside the iteration: (k*packs + j)*16.
+        NodeId cur_mem = vmphi;
+        NodeId acc_next = vaccA;          // 1-acc chain position (pack A reads
+                                          // the phi, pack B reads A's update)
+        NodeId updA = kNoNode, updB = kNoNode;
+        for (u32 j = 0; j < packs; ++j) {
+            // byte offset: Shl(k, 4+log2(packs)) + j*16 (Add only for j>0;
+            // the pair form's +16 is what the emitter's imm-lea folds)
+            NodeId byteoff = g.make(Op::Bin, ty_i64(),
+                                    {ltrue, kphi,
+                                     int64_const(ltrue, 4 + (packs == 2 ? 1 : 0))},
+                                    static_cast<u8>(BinOp::Shl));
+            if (j != 0) {
+                byteoff = g.make(Op::Bin, ty_i64(),
+                                 {ltrue, byteoff, int64_const(ltrue, 16)},
+                                 static_cast<u8>(BinOp::Add));
+            }
+
+            // this pack's accumulator view: pure ops that read the
+            // reduction phi map to it (two_acc: pack A -> accA, pack B ->
+            // accB; 1-acc: pack B chains on A's update)
+            NodeId acc_for_pack = two_acc ? (j == 0 ? vaccA : vaccB) : acc_next;
+
+            FlatMap<NodeId, NodeId> vmap; // scalar -> packed (this pack)
+            auto vec_addr = [&](vecx::AddrPattern ap, NodeId orig_addr) {
+                NodeId base64 = g.make(Op::Cast, ty_i64(), {ltrue, ap.base},
+                                       static_cast<u8>(CastOp::Ptr));
+                NodeId addr64 = g.make(Op::Bin, ty_i64(), {ltrue, base64, byteoff},
+                                       static_cast<u8>(BinOp::Add));
+                return g.make(Op::Cast, g.node(orig_addr).ty, {ltrue, addr64},
+                              static_cast<u8>(CastOp::Ptr));
+            };
+            for (NodeId ldn : loads_) {
+                NodeId vaddr = vec_addr(*load_addr_.find(ldn), g.node(ldn).in[2]);
+                NodeId vload = g.make(Op::Load, vty, {ltrue, cur_mem, vaddr});
+                vmap.insert(ldn, vload);
+                cur_mem = vload;
+            }
+            // pure ops in dependency fixpoint (ids are not dep order)
+            {
+                FlatMap<NodeId, bool> done;
+                bool progress = true;
+                while (progress) {
+                    progress = false;
+                    for (NodeId p : pure_) {
+                        if (done.contains(p)) continue;
+                        bool ready = true;
+                        for (u8 i = 1; i < g.node(p).n_in && ready; ++i) {
+                            NodeId d = g.node(p).in[i];
+                            if (d == kNoNode || g_.is_dead(d)) continue;
+                            if (vmap.find(d)) continue;
+                            if (d == reduction_phi_) continue;
+                            if (pure_.end() != std::find(pure_.begin(), pure_.end(), d) &&
+                                !done.contains(d))
+                                ready = false;
+                        }
+                        if (!ready) continue;
+                        Node pd = g.node(p); // copy: makes below may grow nodes_
+                        NodeId ins[kMaxInputs];
+                        ins[0] = ltrue;
+                        u8 n = 1;
+                        for (u8 i = 1; i < pd.n_in; ++i) {
+                            NodeId d = pd.in[i];
+                            if (d == reduction_phi_) { ins[n++] = acc_for_pack; continue; }
+                            if (const NodeId* m = vmap.find(d)) { ins[n++] = *m; continue; }
+                            ins[n++] = broadcast_operand(d, ltrue, vty);
+                        }
+                        NodeId vp = g.make_arr(pd.op, vty, ins, n, pd.sub, pd.aux);
+                        vmap.insert(p, vp);
+                        done.insert(p, true);
+                        progress = true;
                     }
-                    if (!ready) continue;
-                    Node pd = g.node(p); // copy: makes below may grow nodes_
-                    NodeId ins[kMaxInputs];
-                    ins[0] = ltrue;
-                    u8 n = 1;
-                    for (u8 i = 1; i < pd.n_in; ++i) {
-                        NodeId d = pd.in[i];
-                        if (d == reduction_phi_) { ins[n++] = vacc; continue; }
-                        if (const NodeId* m = vmap.find(d)) { ins[n++] = *m; continue; }
-                        ins[n++] = broadcast_operand(d, ltrue, vty);
-                    }
-                    NodeId vp = g.make_arr(pd.op, vty, ins, n, pd.sub, pd.aux);
-                    vmap.insert(p, vp);
-                    done.insert(p, true);
-                    progress = true;
                 }
             }
-        }
 
-        // reduction update: Bin(op, vacc, feed-vector)
-        NodeId vupdate = kNoNode;
-        if (reduction_phi_ != kNoNode) {
-            NodeId feed = red_.feed;
-            NodeId vfeed = kNoNode;
-            if (const NodeId* m = vmap.find(feed)) vfeed = *m;
-            NodeId lhs = red_.phi_on_lhs ? vacc : vfeed;
-            NodeId rhs = red_.phi_on_lhs ? vfeed : vacc;
-            vupdate = g.make(Op::Bin, vty, {ltrue, lhs, rhs},
-                             static_cast<u8>(red_.op));
-        }
+            // reduction update: Bin(op, acc, feed-vector)
+            if (reduction_phi_ != kNoNode) {
+                NodeId feed = red_.feed;
+                NodeId vfeed = kNoNode;
+                if (const NodeId* m = vmap.find(feed)) vfeed = *m;
+                NodeId lhs = red_.phi_on_lhs ? acc_for_pack : vfeed;
+                NodeId rhs = red_.phi_on_lhs ? vfeed : acc_for_pack;
+                NodeId upd = g.make(Op::Bin, vty, {ltrue, lhs, rhs},
+                                    static_cast<u8>(red_.op));
+                if (two_acc) {
+                    if (j == 0) updA = upd; else updB = upd;
+                } else {
+                    acc_next = upd;      // pack B chains on A's update
+                    if (j == 0) updA = upd; else updB = upd;
+                }
+            }
 
-        // packed stores chain on the memory
-        NodeId cur_mem = vmphi;
-        for (NodeId stn : stores_) {
-            NodeId vaddr = vec_addr(*store_addr_.find(stn), g.node(stn).in[2]);
-            NodeId sv = g.node(stn).in[3];
-            NodeId vval = kNoNode;
-            if (const NodeId* m = vmap.find(sv)) vval = *m;
-            else vval = broadcast_operand(sv, ltrue, vty);
-            NodeId vs = g.make(Op::Store, ty_mem(), {ltrue, cur_mem, vaddr, vval});
-            cur_mem = vs;
+            // packed stores chain on the memory
+            for (NodeId stn : stores_) {
+                NodeId vaddr = vec_addr(*store_addr_.find(stn), g.node(stn).in[2]);
+                NodeId sv = g.node(stn).in[3];
+                NodeId vval = kNoNode;
+                if (const NodeId* m = vmap.find(sv)) vval = *m;
+                else vval = broadcast_operand(sv, ltrue, vty);
+                NodeId vs = g.make(Op::Store, ty_mem(), {ltrue, cur_mem, vaddr, vval});
+                cur_mem = vs;
+            }
         }
 
         // k' = k + 1 (i64)
@@ -672,14 +798,19 @@ private:
         g.append_input(vhead, ltrue);
         g.append_input(vmphi, cur_mem);
         g.append_input(kphi, knew);
-        if (vacc != kNoNode) g.append_input(vacc, vupdate);
+        if (reduction_phi_ != kNoNode) {
+            g.append_input(vaccA, two_acc ? updA : updB);
+            if (two_acc) g.append_input(vaccB, updB);
+        }
 
         // ---- merge: guard-false + vector exit ----
         NodeId merge = g.make(Op::Region, ty_ctrl(), {gfalse, lfalse});
         NodeId merge_mem = g.make(Op::Phi, ty_mem(), {merge, entry_mem, vmphi});
 
-        // scalar iv entry: 0 (guard false) | k*lanes (vector exit)
-        NodeId done64 = g.make(Op::Bin, ty_i64(), {lfalse, kphi, int64_const(lfalse, lanes)},
+        // scalar iv entry: 0 (guard false) | k*lanes*packs (vector exit)
+        NodeId done64 = g.make(Op::Bin, ty_i64(),
+                               {lfalse, kphi,
+                                int64_const(lfalse, static_cast<i64>(lanes) * packs)},
                                static_cast<u8>(BinOp::Mul));
         NodeId done_val = done64;
         if (ity == ty_i32())
@@ -692,7 +823,14 @@ private:
         NodeId acc_entry = kNoNode;
         if (reduction_phi_ != kNoNode) {
             NodeId init = g.node(reduction_phi_).in[vl.entry_slot + 1];
-            NodeId horiz = horizontal_reduce(vacc, lfalse, red_.op);
+            NodeId horiz_src = vaccA;
+            if (two_acc) {
+                // lane-wise merge of the two accumulator chains, then the
+                // usual horizontal reduction: exact for integer Add
+                horiz_src = g.make(Op::Bin, vty, {lfalse, vaccA, vaccB},
+                                   static_cast<u8>(red_.op));
+            }
+            NodeId horiz = horizontal_reduce(horiz_src, lfalse, red_.op);
             acc_entry = g.make(Op::Phi, elem_ty_, {merge, init, horiz});
         }
 

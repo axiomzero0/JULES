@@ -66,14 +66,27 @@ private:
         }
 
         // convert every value phi into a Select; arm values must be pure and
-        // available before the branch (inputs dominate the branching block)
+        // available before the branch (inputs dominate the branching block).
+        // A phi whose arms carry the SAME node is the identity — replace it
+        // with that node directly (no Select(cond, x, x) residue). This is
+        // load-bearing for masked REDUCTIONS: `s = s + x` lowers (via SROA +
+        // this pass) to Add(Select(c, s, s), Select(c, x, 0)) — the residue
+        // select hides the reduction phi from vecx::match_reduction and the
+        // loop would skip. With the fold, the update is Add(s, Select(c, x,
+        // 0)) and the masked feed vectorizes (t38's masked_sum).
         for (NodeId phi : vphis) {
             const Node& pn = g_.node(phi);
             NodeId tv = pn.in[ti + 1];
             NodeId fv = pn.in[fi + 1];
             if (!arm_value_ok(tv, tproj, h) || !arm_value_ok(fv, fproj, h)) return false;
-            NodeId sel = g_.make(Op::Select, pn.ty, {h, ifn.in[1], tv, fv});
-            g_.replace_all_uses(phi, sel);
+            if (tv == fv) {
+                // identical on both arms (arm_value_ok repinned any
+                // arm-defined value to h, so it dominates the merge users)
+                g_.replace_all_uses(phi, tv);
+            } else {
+                NodeId sel = g_.make(Op::Select, pn.ty, {h, ifn.in[1], tv, fv});
+                g_.replace_all_uses(phi, sel);
+            }
             g_.kill(phi);
         }
 

@@ -23,7 +23,7 @@ TEXT_PRIMARY = "#242320"
 TEXT_MUTED = "#85827a"
 BORDER = "#c5bfab"
 
-KERNELS = ["fib", "tak", "primes", "mandel", "flops", "inthash"]
+KERNELS = ["fib", "tak", "primes", "mandel", "flops", "inthash", "vecsum", "vecmask"]
 CONFIG = {"julesc": "julesc-aot", "gcc": "gcc-O3", "clang": "clang-O3"}
 COLORS = {"julesc": ACCENT, "gcc": HEADER_FILL, "clang": ACCENT_2}
 

@@ -173,6 +173,17 @@ bool PassManager::run() {
                     PassStats st2;
                     st2.name = (*q)->name();
                     st2.order = order;
+                    // The re-run honors the SAME gates as the main run
+                    // (kill switches, --only, mode): a disabled pass must
+                    // stay disabled everywhere (2026-09-18 audit fix —
+                    // previously --disable was bypassed here, so a killed
+                    // pass silently ran in the cleanup sweep).
+                    const char* reason2 = nullptr;
+                    if (should_skip(**q, reason2)) {
+                        st2.skip_reason = reason2;
+                        stats_.push_back(st2);
+                        continue;
+                    }
                     if (!run_one(**q, st2)) {
                         stats_.push_back(st2);
                         break;

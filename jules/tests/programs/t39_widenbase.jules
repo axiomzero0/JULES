@@ -1,0 +1,58 @@
+// spine-tail base widening (pass 50): edge cases for the folded table.
+//   * fibrec: canonical descending shape, negative + boundary + table-edge
+//     arguments. fibrec(-n) must return -n (base case below the table,
+//     served by the B(w) default arm).
+//   * pairsum: stride-3 spine (landing zone check) with computed base.
+//   * widebase: base bound d above the table cap K=10 would be unsound to
+//     widen (C-true values above the table) — the gates must reject it and
+//     the plain accumulator transform must still compute correct values.
+fn fibrec(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fibrec(n - 1) + fibrec(n - 2);
+}
+
+fn pairsum(n: i64) -> i64 {
+    if n < 3 { return n * 10; }
+    return pairsum(n - 1) + pairsum(n - 3);
+}
+
+// C = n < 20: base-true values run up to 19, beyond the fold cap (10) —
+// widening must NOT fire; the plain loop handles it.
+fn widebase(n: i64) -> i64 {
+    if n < 20 { return n * 2; }
+    return widebase(n - 1) + widebase(n - 2);
+}
+
+// g2 = n + 2: ASCENDING spine — the structural gate must reject widening
+// (the table exit would be unsound); plain accumulator transform only.
+// Kept to small ranges: the raw recursion is exponential in distance to
+// the base, which makes huge arguments infeasible at -O0 (no transforms).
+fn upcount(n: i64) -> i64 {
+    if n > 40 { return n - 40; }
+    return upcount(n + 1) + upcount(n + 2);
+}
+
+fn main() -> i64 {
+    // boundary/table-edge sweep
+    print(fibrec(0 as i64));
+    print(fibrec(1 as i64));
+    print(fibrec(9 as i64));
+    print(fibrec(10 as i64));
+    print(fibrec(11 as i64));
+    print(fibrec(12 as i64));
+    print(fibrec(25 as i64));
+    // negatives: below the table, C-true default arm
+    print(fibrec(-1 as i64));
+    print(fibrec(-7 as i64));
+    // stride-3 landing zone
+    print(pairsum(10 as i64));
+    print(pairsum(11 as i64));
+    print(pairsum(12 as i64));
+    print(pairsum(-2 as i64));
+    // rejected-widening shapes must still be correct
+    print(widebase(24 as i64));
+    print(widebase(20 as i64));
+    print(upcount(37 as i64));
+    print(upcount(32 as i64));
+    return 0 as i64;
+}

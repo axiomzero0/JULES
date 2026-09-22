@@ -27,7 +27,8 @@ JULESC = os.path.join(ROOT, "build", "julesc")
 CLANG = "/home/z/my-project/tmp/clang-root/usr/lib/llvm-19/bin/clang"
 WORK = "/tmp/jules_bench_work"
 
-ALL_KERNELS = ["fib", "tak", "primes", "mandel", "flops", "inthash"]
+ALL_KERNELS = ["fib", "tak", "primes", "mandel", "flops", "inthash",
+              "vecsum", "vecmask"]
 
 # label -> (compiler kind, extra args)
 CONFIGS = [

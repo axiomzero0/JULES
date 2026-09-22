@@ -220,6 +220,33 @@ struct Allocator {
     //     same-register pair -> nothing at all
     // ------------------------------------------------------------------
     void pair_fold() {
+        // Loop-straddle guard: a store OUTSIDE a loop feeding a reload
+        // INSIDE it (at or after the loop-head label) must keep its slot
+        // round-trip. Folded into the isel scratch register instead, the
+        // value would have to survive the loop BODY, whose address/scratch
+        // chains write that register unconditionally — and the RA cannot
+        // see or protect it, because the fold made the value slot-
+        // invisible. (Found by the vecsum benchmark: the vectorizer's trip
+        // count pinned at the entry — [idiv][store sNV][load sNV][guard]
+        // folded to [idiv][guard], and rax died in the body's movups
+        // address chain on iteration 2.) Pairs fully inside or fully
+        // outside every loop are unaffected.
+        FlatMap<int, size_t> pf_label_at;
+        for (size_t i = 0; i < lf.code.size(); ++i)
+            if (lf.code[i].op == IOp::Label)
+                pf_label_at.insert(lf.code[i].a.label, i);
+        SmallVec<std::pair<size_t, size_t>, 4> pf_backedges;
+        for (size_t i = 0; i < lf.code.size(); ++i) {
+            const Inst& j = lf.code[i];
+            if (j.op != IOp::Jcc && j.op != IOp::Jmp) continue;
+            const size_t* tp = pf_label_at.find(j.a.label);
+            if (tp && *tp < i) pf_backedges.push_back({*tp, i});
+        }
+        auto straddles_loop = [&](size_t store_pos, size_t load_pos) {
+            for (const auto& be : pf_backedges)
+                if (store_pos < be.first && load_pos > be.first) return true;
+            return false;
+        };
         auto slot_read_after = [&](size_t from, i32 s) {
             for (size_t j = from; j < lf.code.size(); ++j) {
                 const Inst& c = lf.code[j];
@@ -276,7 +303,7 @@ struct Allocator {
             if (cur.op == IOp::MovFpS && cur.b.k == Operand::K::Slot &&
                 cur.a.k == Operand::K::Reg) {
                 size_t ld = same_reg_reload_across_gap(i, cur.b.slot, cur.a.reg);
-                if (ld != SIZE_MAX) {
+                if (ld != SIZE_MAX && !straddles_loop(i, ld)) {
                     cur.op = IOp::Nop;
                     lf.code[ld].op = IOp::Nop;
                     continue;
@@ -285,7 +312,7 @@ struct Allocator {
             if (cur.op == IOp::MovRS && cur.b.k == Operand::K::Slot &&
                 cur.a.k == Operand::K::Reg) {
                 size_t ld = same_reg_reload_across_gap(i, cur.b.slot, cur.a.reg);
-                if (ld != SIZE_MAX) {
+                if (ld != SIZE_MAX && !straddles_loop(i, ld)) {
                     cur.op = IOp::Nop;
                     lf.code[ld].op = IOp::Nop;
                     continue;
@@ -295,7 +322,8 @@ struct Allocator {
                 nxt.op == IOp::MovFpR && nxt.b.k == Operand::K::Slot &&
                 nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
                 nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.b.slot)) {
+                !slot_read_after(i + 2, cur.b.slot) &&
+                !straddles_loop(i, i + 1)) {
                 if (nxt.a.reg != cur.a.reg) {
                     cur.op = IOp::MovFpFp;
                     cur.a.reg = nxt.a.reg; // dst
@@ -310,7 +338,8 @@ struct Allocator {
                 nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
                 nxt.b.slot == cur.b.slot && cur.a.k == Operand::K::Reg &&
                 nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.b.slot)) {
+                !slot_read_after(i + 2, cur.b.slot) &&
+                !straddles_loop(i, i + 1)) {
                 if (nxt.a.reg != cur.a.reg) {
                     cur.op = IOp::MovRR;
                     cur.a.reg = nxt.a.reg; // dst
@@ -325,7 +354,8 @@ struct Allocator {
             if (cur.op == IOp::MovSImm && cur.a.k == Operand::K::Slot &&
                 nxt.op == IOp::MovSR && nxt.b.k == Operand::K::Slot &&
                 nxt.b.slot == cur.a.slot && nxt.a.k == Operand::K::Reg &&
-                !slot_read_after(i + 2, cur.a.slot)) {
+                !slot_read_after(i + 2, cur.a.slot) &&
+                !straddles_loop(i, i + 1)) {
                 cur.op = IOp::MovRImm;
                 cur.a.k = Operand::K::Reg;
                 cur.a.reg = nxt.a.reg;
@@ -385,7 +415,21 @@ struct Allocator {
             // adjacent reload, or a later reload is a legal gap load): the
             // chain continues through it. Retargeted to Z like the ops.
             if (i.op == IOp::MovFpS) return i.b.k == Operand::K::Slot;
-            return i.op == IOp::FpBin || i.op == IOp::FpNeg;
+            // Packed accumulator ops (VecBin*/VecLogical/VecCmp*/VecBcast)
+            // follow the same xmm0-dst isel contract as FpBin — two-operand,
+            // b preserved — so vector chains fuse exactly like scalar FP
+            // chains (paddq acc-in-place per iteration instead of four
+            // movaps copies around one op). VecCmpI32's serializer
+            // compositions DO clobber the b register (all-ones flips /
+            // swapped-compare results), but its b stays the xmm1 isel
+            // scratch there and the allocator pool starts at xmm2, so a
+            // retargeted Z (>= xmm2) can never collide with it.
+            return i.op == IOp::FpBin || i.op == IOp::FpNeg ||
+                   i.op == IOp::VecBinF64 || i.op == IOp::VecBinI64 ||
+                   i.op == IOp::VecBinI32 || i.op == IOp::VecBinF32 ||
+                   i.op == IOp::VecLogical || i.op == IOp::VecBcast ||
+                   i.op == IOp::VecCmpI32 || i.op == IOp::VecCmpF32 ||
+                   i.op == IOp::VecCmpF64;
         }
         if (i.a.reg != R::Rax) return false;
         if (i.op == IOp::MovRS) return i.b.k == Operand::K::Slot; // snapshot store
@@ -1037,6 +1081,32 @@ struct Allocator {
 
     void rewrite() {
         // (pair folding ran before liveness analysis — see run())
+        // Backedge map for the forwarding straddle guard below: labels +
+        // backward jumps on the raw stream (same detection the liveness
+        // pass uses).
+        FlatMap<int, size_t> rw_label_at;
+        for (size_t p = 0; p < lf.code.size(); ++p)
+            if (lf.code[p].op == IOp::Label)
+                rw_label_at.insert(lf.code[p].a.label, p);
+        SmallVec<std::pair<size_t, size_t>, 4> rw_backedges;
+        for (size_t p = 0; p < lf.code.size(); ++p) {
+            const Inst& j = lf.code[p];
+            if (j.op != IOp::Jcc && j.op != IOp::Jmp) continue;
+            const size_t* tp = rw_label_at.find(j.a.label);
+            if (tp && *tp < p) rw_backedges.push_back({*tp, p});
+        }
+        // A forward whose home store sits BEFORE a loop head and whose
+        // consumer sits at/after it must not fire: the value would live in
+        // the untracked isel scratch S across the loop body (re-read every
+        // iteration via the backedge), and the body's address/scratch
+        // chains write S unconditionally. Found by the vecsum benchmark
+        // (vectorizer trip count: idiv's rax forwarded to the loop-head
+        // guard, clobbered by the body's movups address chain).
+        auto forward_straddles_loop = [&](size_t store_pos, size_t consumer_pos) {
+            for (const auto& be : rw_backedges)
+                if (store_pos < be.first && consumer_pos > be.first) return true;
+            return false;
+        };
 
         slot_use_pos_.assign(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0), {});
         slot_def_pos_.assign(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0), {});
@@ -1139,7 +1209,19 @@ struct Allocator {
             if (ui >= lf.code.size()) continue;
             Inst& use = lf.code[ui];
             IOp consumer = use.op;
-            if (consumer != IOp::FpBin && consumer != IOp::FpCmp) continue;
+            // Packed consumers whose serializer preserves the b operand
+            // (two-operand SSE: paddq b,a reads b, writes a). VecCmpI32 is
+            // EXCLUDED: its pcmpeqd/pcmpgtd compositions build all-ones and
+            // swapped-compare results IN the b register — folding a promoted
+            // home there would destroy the value.
+            bool packed_consumer =
+                consumer == IOp::VecBinF64 || consumer == IOp::VecBinI64 ||
+                consumer == IOp::VecBinI32 || consumer == IOp::VecBinF32 ||
+                consumer == IOp::VecLogical ||
+                consumer == IOp::VecCmpF32 || consumer == IOp::VecCmpF64;
+            if (consumer != IOp::FpBin && consumer != IOp::FpCmp &&
+                !packed_consumer)
+                continue;
             // B-side: the mov loads the consumer's SOURCE register
             if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
                 mov.b.reg != use.a.reg) {
@@ -1298,6 +1380,9 @@ struct Allocator {
                 // the consumer must not write S (its result would replace
                 // S's value for downstream readers)
                 if (consumer.a.k == Operand::K::Reg && consumer.a.reg == S) continue;
+                // loop-straddle: the value in S would have to survive the
+                // loop body (re-read every iteration); keep the home store
+                if (forward_straddles_loop(d, u + 1)) continue;
                 // gap window (d, u): nothing may reference H or S
                 bool ok = true;
                 for (size_t k = d + 1; k < u; ++k) {

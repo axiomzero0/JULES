@@ -1,0 +1,31 @@
+// bench: vecsum — i64 array reduction (the SIMD fight: paddq lanes vs
+// gcc/clang SSE2 auto-vectorization; both compilers get 2-lane i64 packs
+// on the x86-64 baseline). Dynamic trip count exercises guard + remainder.
+fn vecsum(a: *mut i64, n: i64, rounds: i64) -> i64 {
+    var total: i64 = 0;
+    var r: i64 = 0;
+    while r < rounds {
+        var s: i64 = 0;
+        var i: i64 = 0;
+        while i < n {
+            s = s + a[i];
+            i = i + 1;
+        }
+        total = total + s;
+        r = r + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    let n: i64 = 100000;
+    let a: *mut i64 = alloc(i64, n);
+    var i: i64 = 0;
+    while i < n {
+        a[i] = (i * i) % 1000 - 500;
+        i = i + 1;
+    }
+    print(vecsum(a, n, 2000));
+    free(a);
+    return 0;
+}
