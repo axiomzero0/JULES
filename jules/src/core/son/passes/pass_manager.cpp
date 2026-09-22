@@ -5,6 +5,7 @@
 #include "core/son/passes/pass.h"
 #include "core/son/son.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 
@@ -110,6 +111,19 @@ bool PassManager::run_one(Pass& p, PassStats& st) {
 bool PassManager::run() {
     std::vector<Pass*> all = PassRegistry::instance().create_all();
 
+    // Stage partition: SoN passes run before Linear passes regardless of
+    // catalog number (stable within each stage by order). The catalog
+    // extended past the lowering family (89) with SoN-stage entries (90:
+    // PartialEvaluation, 91: PartialDeoptimization); without the partition
+    // they would run after the module was already linearized.
+    std::stable_sort(all.begin(), all.end(), [](const Pass* a, const Pass* b) {
+        if (a->stage() != b->stage()) return a->stage() == Stage::Son;
+        return a->order() < b->order();
+    });
+    size_t son_end = 0; // one-past-the-end of the SoN group
+    for (size_t i = 0; i < all.size(); ++i)
+        if (all[i]->stage() == Stage::Son) son_end = i + 1;
+
     // ---- parallel-group plan (metadata; execution stays sequential in MVP) ----
     {
         std::vector<std::pair<bool, std::vector<const char*>>> groups;
@@ -124,7 +138,71 @@ bool PassManager::run() {
         }
     }
 
-    for (Pass* p : all) {
+    // Post-inline cleanup: re-run the core cleanup/cse set at the
+    // SoN/Linear boundary — after the LAST SoN pass (historically after
+    // inlining; the PE/deopt family at 90-91 exposes new folding
+    // opportunities the same way) and before the linear stage consumes the
+    // graphs. Firing on the GROUP BOUNDARY (not on a specific pass) keeps
+    // the sweep running even when the last SoN pass is itself gated off.
+    // Rounds are budget presets (spec §8 fixpoint iterations): O0/Og skip,
+    // O1=1, O2=2, O3=3; rounds stop early when a fixpoint is reached.
+    // SROA/DSE run BEFORE the folding/cse passes so promoted values are
+    // visible to GVN. SCCP (8) is included: load forwarding/promotion in
+    // the main run (passes 21-26) exposes SSA constants only AFTER SCCP's
+    // original slot, so the post-inline re-run is where its
+    // control-conditional lattice gets real input — the same reason
+    // production pipelines (LLVM IPSCCP, Graal) re-run conditional
+    // propagation after inlining.
+    auto run_cleanup = [&]() {
+        if (!ctx_.opts.post_inline_cleanup || son_end == 0) return;
+        u32 rounds = level_budgets(ctx_.opts.level).cleanup_rounds;
+        // 54/58 run post-inline: inlining turns the param-based pair
+        // candidates (MayAlias under the soundness gate) into distinct
+        // local allocations (NoAlias) — the inlined copies pack there.
+        // Production pipelines re-run vectorization after inline the
+        // same way.
+        static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58};
+        for (u32 r = 0; r < rounds; ++r) {
+            std::vector<Pass*> again = PassRegistry::instance().create_all();
+            FlatMap<int, Pass*> by_order;
+            for (Pass* q : again)
+                if (q->stage() == Stage::Son) by_order.insert(q->order(), q);
+            bool any_change = false;
+            for (int order : kCleanupOrders) {
+                Pass** q = by_order.find(order);
+                if (!q || !*q) continue;
+                PassStats st2;
+                st2.name = (*q)->name();
+                st2.order = order;
+                // The re-run honors the SAME gates as the main run
+                // (kill switches, --only, mode): a disabled pass must
+                // stay disabled everywhere (2026-09-18 audit fix —
+                // previously --disable was bypassed here, so a killed
+                // pass silently ran in the cleanup sweep).
+                const char* reason2 = nullptr;
+                if (should_skip(**q, reason2)) {
+                    st2.skip_reason = reason2;
+                    stats_.push_back(st2);
+                    continue;
+                }
+                if (!run_one(**q, st2)) {
+                    stats_.push_back(st2);
+                    break;
+                }
+                if (st2.changes > 0) any_change = true;
+                stats_.push_back(st2);
+            }
+            for (Pass* q : again) delete q;
+            if (!any_change) break; // fixpoint reached early
+        }
+    };
+
+    for (size_t pi = 0; pi < all.size(); ++pi) {
+        // the boundary fires before the first Linear pass regardless of
+        // the skip state of the last SoN pass
+        if (pi == son_end) run_cleanup();
+
+        Pass* p = all[pi];
         PassStats st;
         st.name = p->name();
         st.order = p->order();
@@ -141,61 +219,9 @@ bool PassManager::run() {
             return false;
         }
         stats_.push_back(st);
-
-        // Post-inline cleanup: re-run the core cleanup/cse set after the
-        // inlining phase exposes new folding opportunities (scheduler-level
-        // decision; passes are allowed to repeat). Rounds are budget presets
-        // (spec §8 fixpoint iterations): O0/Og skip, O1=1, O2=2, O3=3;
-        // rounds stop early when a fixpoint is reached. SROA/DSE run BEFORE
-        // the folding/cse passes so promoted values are visible to GVN. SCCP
-        // (8) is included: load forwarding/promotion in the main run (passes
-        // 21-26) exposes SSA constants only AFTER SCCP's original slot, so
-        // the post-inline re-run is where its control-conditional lattice
-        // gets real input — the same reason production pipelines (LLVM
-        // IPSCCP, Graal) re-run conditional propagation after inlining.
-        if (ctx_.opts.post_inline_cleanup && p->order() == 82 && p->stage() == Stage::Son) {
-            u32 rounds = level_budgets(ctx_.opts.level).cleanup_rounds;
-            // 54/58 run post-inline: inlining turns the param-based pair
-            // candidates (MayAlias under the soundness gate) into distinct
-            // local allocations (NoAlias) — the inlined copies pack there.
-            // Production pipelines re-run vectorization after inline the
-            // same way.
-            static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58};
-            for (u32 r = 0; r < rounds; ++r) {
-                std::vector<Pass*> again = PassRegistry::instance().create_all();
-                FlatMap<int, Pass*> by_order;
-                for (Pass* q : again)
-                    if (q->stage() == Stage::Son) by_order.insert(q->order(), q);
-                bool any_change = false;
-                for (int order : kCleanupOrders) {
-                    Pass** q = by_order.find(order);
-                    if (!q || !*q) continue;
-                    PassStats st2;
-                    st2.name = (*q)->name();
-                    st2.order = order;
-                    // The re-run honors the SAME gates as the main run
-                    // (kill switches, --only, mode): a disabled pass must
-                    // stay disabled everywhere (2026-09-18 audit fix —
-                    // previously --disable was bypassed here, so a killed
-                    // pass silently ran in the cleanup sweep).
-                    const char* reason2 = nullptr;
-                    if (should_skip(**q, reason2)) {
-                        st2.skip_reason = reason2;
-                        stats_.push_back(st2);
-                        continue;
-                    }
-                    if (!run_one(**q, st2)) {
-                        stats_.push_back(st2);
-                        break;
-                    }
-                    if (st2.changes > 0) any_change = true;
-                    stats_.push_back(st2);
-                }
-                for (Pass* q : again) delete q;
-                if (!any_change) break; // fixpoint reached early
-            }
-        }
     }
+    // defensive: a SoN-only registry (no linear stage) still cleans up
+    if (son_end == all.size()) run_cleanup();
 
     for (Pass* p : all) delete p;
     return !ctx_.diag.has_errors();

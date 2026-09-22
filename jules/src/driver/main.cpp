@@ -255,6 +255,10 @@ int run(int argc, char** argv) {
     }
 
     // ---- pass pipeline -------------------------------------------------------------
+    // Function count at pipeline entry: PE variants appended by passes
+    // 90/91 must not shift the PGO sketch enumeration between the
+    // instrument and use builds (sketches cover originals only).
+    opts.orig_fn_count = static_cast<u32>(mod.fns.size());
     AnalysisManager am(mod);
     PassContext ctx(mod, syms, diag, am, opts);
     LinearModule lin;

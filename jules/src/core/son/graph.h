@@ -75,6 +75,10 @@ inline constexpr FnId kFnPrint = 0xFFFFFF01u; // builtin pseudo-targets in Call.
 inline constexpr FnId kFnFree  = 0xFFFFFF02u;
 inline constexpr FnId kFnPgoBump = 0xFFFFFF03u; // PGO counter increment (pass 43);
                                                // ival = counter index; in = {ctrl, mem}
+inline constexpr FnId kFnPgoSketch = 0xFFFFFF04u; // PGO sticky-value argument
+                                               // sketch (pass 91); ival = base counter
+                                               // index of the [first,total,match]
+                                               // triple; in = {ctrl, mem, arg}
 inline constexpr FnId kNoFn    = 0xFFFFFFFFu;
 inline constexpr FnId kMaxUserFn = 0xFFFFFF00u;
 

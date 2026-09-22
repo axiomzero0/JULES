@@ -59,6 +59,17 @@ bool match_counted(Graph& g, LoopInfo& li, DomTree& dom, const Loop& l,
             if (ty_is_vector(g.node(u).ty)) return false; // packed body op
         }
     }
+    // Deopt-guard ladders (pass 91) are family-owned: the cloner re-threads
+    // merge-region phis per copy, which severs the fallback rung's merge
+    // (observed: the generic rung cut out of the loop's ladder). Loops
+    // containing a guard site stay scalar-shaped; their ILP comes from the
+    // specialization itself, not from unrolling.
+    for (NodeId blk : l.blocks) {
+        for (NodeId u : g.uses_of(blk)) {
+            if (g.is_dead(u)) continue;
+            if ((g.node(u).flags & kFlagGuardSite) != 0) return false;
+        }
+    }
 
     u8 entry_slot = 2, latch_slot = 2;
     for (u8 i = 0; i < 2; ++i) {
@@ -319,11 +330,14 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
     std::vector<NodeId> live = cl.phis;
     std::vector<NodeId> live_vals;
     std::vector<NodeId> seed_orig;
+    std::vector<NodeId> latch_orig; // the phis' in-body updates (IV step,
+                                    // memory chain) — the peeling chain seed
     u8 seed_slot = at_entry ? cl.entry_slot : cl.latch_slot;
     for (NodeId phi : live) {
         NodeId v = g.node(phi).in[seed_slot + 1];
         live_vals.push_back(v);
         seed_orig.push_back(v);
+        latch_orig.push_back(g.node(phi).in[cl.latch_slot + 1]);
     }
     NodeId prev_latch = at_entry ? g.node(cl.header).in[cl.entry_slot] : header_latch;
 
@@ -358,9 +372,16 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
         }
 
         // next copy's seed: this copy's clone of the ORIGINAL seed value
-        // (remap-of-original: the copy's vmap keys originals)
+        // (remap-of-original: the copy's vmap keys originals). PEELING
+        // chains through the LATCH value — the in-body update — because
+        // copy m+1's entry seed is copy m's COMPUTED value; the entry-side
+        // seed is an external init constant that never remaps, so chaining
+        // through it re-ran iteration 0 in every peeled copy (observed:
+        // const-trip store loop writing a[0] six times, residual loop
+        // restarting its IV at init). The unroll path keeps the latch
+        // seed as before.
         for (size_t i = 0; i < live.size(); ++i)
-            live_vals[i] = c.remap(seed_orig[i]);
+            live_vals[i] = c.remap(at_entry ? latch_orig[i] : seed_orig[i]);
         prev_latch = c.remap(header_latch);
     }
 

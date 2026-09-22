@@ -145,6 +145,9 @@ enum class IOp : u16 {
                     // (8: punpcklqdq, 4: pshufd $0)
     PgoInc,         // incq jules_pgo_counters+OFF(%rip) — PGO counter bump
                     // (pass 43 instrument mode; a.slot = byte offset)
+    PgoSketch,      // sticky-value sketch update (pass 91): arg in Rax;
+                    // counters+OFF = [first, total, match]; text-side
+                    // expansion with local labels
 };
 
 struct Operand {

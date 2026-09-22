@@ -154,12 +154,19 @@ assert_pass_active t38_maskvec MaskGeneration
 # Spine-tail base widening: the accumulator transform must fire on the
 # canonical descending shapes (fibrec widens through the folded table).
 assert_pass_active t39_widenbase TailRecursionElimination
+# Partial evaluation (pass 90): mixed const/dynamic call sites must
+# specialize — the binding set dedups across the two c==1 sites and the
+# c==2 / (x,y) bindings create their own variants.
+assert_pass_active t40_static_pe PartialEvaluation
 
 # Kill-switch hold across the post-inline cleanup re-run (audit fix):
 # cleanup-set passes must stay dead when disabled.
 assert_pass_disabled t04_sroa ScalarReplacementOfAggregates
 assert_pass_disabled t02_gvn GlobalValueNumbering
 assert_pass_disabled t30_storemerge StoreMerging
+# The PE/deopt family honors the same kill switches everywhere.
+assert_pass_disabled t40_static_pe PartialEvaluation
+assert_pass_disabled t40_static_pe PartialDeoptimization
 
 # PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
 # Asserts: the instrumented binary's output is UNCHANGED (instrumentation
@@ -168,6 +175,7 @@ assert_pass_disabled t30_storemerge StoreMerging
 # output matches the expected file.
 run_pgo_test() {
     local name=$1
+    local pass_name=${2:-ProfileGuidedUnrolling}
     local src="tests/programs/${name}.jules"
     local exp="tests/expected/${name}.txt"
     local dir="$WORK/${name}_pgo"
@@ -200,9 +208,9 @@ run_pgo_test() {
 
     local changes
     changes=$(timeout 30 $JULESC --pgo=use="$dir/jules.prof" --stats "$src" -o "$dir/use.bin" 2>/dev/null |
-              awk -v p="ProfileGuidedUnrolling" '$2 == p {v += $4} END {print v + 0}')
+              awk -v p="$pass_name" '$2 == p {v += $4} END {print v + 0}')
     if [ -z "$changes" ] || [ "$changes" = "0" ]; then
-        echo "FAIL $name (pass 'ProfileGuidedUnrolling' reported no changes in use mode)"
+        echo "FAIL $name (pass '$pass_name' reported no changes in use mode)"
         fail=$((fail + 1))
         return 1
     fi
@@ -234,10 +242,11 @@ run_pgo_test() {
         return 1
     fi
 
-    echo "PASS $name [ProfileGuidedUnrolling changes=$changes, profile counters=$n]"
+    echo "PASS $name [$pass_name changes=$changes, profile counters=$n]"
     pass=$((pass + 1))
 }
 run_pgo_test t36_pgo
+run_pgo_test t41_partial_deop PartialDeoptimization
 
 echo
 echo "results: $pass passed, $fail failed"

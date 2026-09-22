@@ -115,6 +115,15 @@ bool match_pgo_loop(Graph& g, LoopInfo& li, const Loop& l, PgoLoop& out) {
             if (ty_is_vector(g.node(u).ty)) return false;
         }
     }
+    // Deopt-guard ladders (pass 91) are off-limits here too: the epilogue
+    // cloner re-threads merge-region phis and would sever the fallback
+    // rung (same family-ownership rule as match_counted).
+    for (NodeId blk : l.blocks) {
+        for (NodeId u : g.uses_of(blk)) {
+            if (g.is_dead(u)) continue;
+            if ((g.node(u).flags & kFlagGuardSite) != 0) return false;
+        }
+    }
 
     u8 entry_slot = 2, latch_slot = 2;
     for (u8 i = 0; i < 2; ++i) {
@@ -522,6 +531,12 @@ private:
                 fg.no_inline = true;
             }
         }
+        // Record the enumeration total for later passes: pass 91's
+        // argument sketches are laid out AFTER these loop-pair counters
+        // in jules.prof. The instrument and use builds derive the same
+        // count here (the enumeration happens before any mutation, and
+        // nothing before pass 43 reads the PGO mode).
+        ctx.opts.pgo_loop_pairs = pair;
         return changed;
     }
 
@@ -529,7 +544,6 @@ private:
         const std::vector<u64>& cnt = ctx.opts.pgo_counters;
         if (cnt.empty()) return false;
         u32 budget = level_budgets(ctx.opts.level).unroll_factor;
-        if (budget < 2) return false; // -O1/-Os/-Oz: no unrolling budget
         bool changed = false;
         u32 pair = 0;
         for (FunctionGraph& fg : ctx.mod.fns) {
@@ -543,6 +557,7 @@ private:
                 if (match_pgo_loop(g, li, l, pl)) loops.push_back(pl);
             }
             for (size_t i = 0; i < loops.size(); ++i) {
+                if (budget < 2) continue; // level gate: enumerate-only pass
                 u32 idx = pair + static_cast<u32>(i);
                 if (2ull * idx + 1 >= cnt.size()) break; // profile mismatch
                 u64 entries = cnt[2 * idx];
@@ -562,6 +577,11 @@ private:
             }
             pair += static_cast<u32>(loops.size());
         }
+        // Same enumeration total as the instrument build (see instrument).
+        // Recorded even when the transform found nothing to do, and BEFORE
+        // the budget check would have bailed — pass 91 needs it either way.
+        ctx.opts.pgo_loop_pairs = pair;
+        if (budget < 2) return false; // -O1/-Os/-Oz: no unrolling budget
         return changed;
     }
 };

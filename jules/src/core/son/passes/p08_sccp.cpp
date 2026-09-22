@@ -393,18 +393,35 @@ private:
         // killed block heads (stores, loads, consts, jumps, unreachable
         // returns) must die with its control, otherwise the graph carries
         // uses-of-killed-nodes until the next DCE run — which never comes
-        // within the same pipeline sweep.
+        // within the same pipeline sweep. An If is NOT a block head, so a
+        // killed If must take its projections with it explicitly, or the
+        // projections dangle off a Dead input (observed on PE variants:
+        // `if c==1` true-arm kills the false projection, the cascade kills
+        // the nested `if c==2` If pinned there, and its IfFalse survives
+        // with a dead input — verifier rejects).
         if (!dead_ctrl_.empty()) {
             bool again = true;
             while (again) {
                 again = false;
                 for (NodeId id = 0; id < g_.size(); ++id) {
-                    Node& n = g_.node(id);
+                    Node n = g_.node(id); // copy: kill/uses_of mutate around us
                     if (n.op == Op::Dead || n.op == Op::Stop) continue;
                     if (n.n_in == 0) continue;
                     if (!dead_ctrl_.contains(n.in[0])) continue;
                     g_.kill(id);
                     if (is_block_head(n.op)) dead_ctrl_.insert(id, true);
+                    if (n.op == Op::If) {
+                        const SmallVec<NodeId, 4> projs = g_.uses_of(id);
+                        for (NodeId p : projs) {
+                            Op po = g_.node(p).op;
+                            if (po == Op::IfTrue || po == Op::IfFalse) {
+                                if (!g_.is_dead(p)) {
+                                    g_.kill(p);
+                                    dead_ctrl_.insert(p, true);
+                                }
+                            }
+                        }
+                    }
                     changed = true;
                     again = true;
                 }

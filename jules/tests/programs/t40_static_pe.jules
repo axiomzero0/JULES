@@ -1,0 +1,36 @@
+// PartialEvaluation (pass 90): static specialization on provable call-site
+// constants. mix branches on c and multiplies x*y in a residual loop:
+//   * mix(1, d1, d2) and mix(1, d2, d1) share ONE variant (binding c==1 —
+//     structural dedup is the code-size discipline inline-per-site lacks)
+//   * mix(2, d1, d2) is a second binding (c==2)
+//   * mix(opaque(6), 3, 4) keeps c dynamic and binds the OTHER two
+//     arguments (x==3, y==4) — binding-time analysis works on any subset
+// The dynamic arguments come through #[no_inline] opaque() so nothing
+// const-folds them away before pass 90 sees the sites.
+#[no_inline]
+fn mix(c: i64, x: i64, y: i64) -> i64 {
+    if c == 1 { return x * 3 + 7; }
+    if c == 2 { return y * 5 - 3; }
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < c {
+        s = s + x * y;
+        i = i + 1;
+    }
+    return s;
+}
+
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    return v;
+}
+
+fn main() -> i64 {
+    let d1: i64 = opaque(10);
+    let d2: i64 = opaque(20);
+    print(mix(1, d1, d2));            // variant A (c==1): 10*3+7 = 37
+    print(mix(1, d2, d1));            // SAME variant A (dedup): 20*3+7 = 67
+    print(mix(2, d1, d2));            // variant B (c==2): 20*5-3 = 97
+    print(mix(opaque(6), 3, 4));      // variant C (x==3,y==4): 6*12 = 72
+    return 0;
+}

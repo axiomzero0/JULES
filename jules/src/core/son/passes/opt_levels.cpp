@@ -93,9 +93,9 @@ constexpr Row kRowPeep{{X, L, Y, Y, Y, Y, L}};      // machine peephole
 constexpr Row kRowRequired{{Y, Y, Y, Y, Y, Y, Y}};  // required lowering
 constexpr Row kRowAlways{{L, Y, Y, Y, Y, Y, Y}};    // always-inline (semantic)
 
-// One entry per catalog order 1..89; nullptr => phase default (kRowScalar1
+// One entry per catalog order 1..91; nullptr => phase default (kRowScalar1
 // capped by level: nothing but required lowering runs at -O0).
-const Row* kMatrix[90] = {};
+const Row* kMatrix[96] = {};
 
 void init_matrix() {
     struct Spec {
@@ -201,12 +201,15 @@ void init_matrix() {
         {87, &kRowPeep},      // MachinePeephole
         {88, &kRowLoopC},     // MachineLICM (scaffold)
         {89, nullptr},        // DeoptMetadataEmission: if speculation/JIT
+        // Phase 9: partial evaluation & deoptimization (PE family)
+        {90, &kRowSpec},      // PartialEvaluation: O2 ~, O3 on
+        {91, &kRowSpec},      // PartialDeoptimization: guarded ladder (PGO)
     };
     static bool done = false;
     if (done) return;
     done = true;
     for (const Spec& s : kSpec)
-        if (s.order >= 1 && s.order < 90) kMatrix[s.order] = s.row;
+        if (s.order >= 1 && s.order < 96) kMatrix[s.order] = s.row;
 }
 
 } // namespace
@@ -215,7 +218,7 @@ Avail pass_avail(int order, OptLevel lvl) {
     init_matrix();
     int li = static_cast<int>(lvl);
     const Row* row = nullptr;
-    if (order >= 1 && order < 90) row = kMatrix[order];
+    if (order >= 1 && order < 96) row = kMatrix[order];
 
     // Pass 85 is the register allocator: levels map to allocator grades
     // (spec: O0/Og simple, O1 linear scan, O2/O3 budgeted, Os/Oz linear).

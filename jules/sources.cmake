@@ -103,6 +103,9 @@ src/core/son/passes/p42_loop_unrolling.cpp
     src/core/son/passes/p87_machine_peephole.cpp
     src/core/son/passes/p88_machine_licm.cpp
     src/core/son/passes/p89_deopt_metadata_emission.cpp
+    src/core/son/passes/pe/pe.cpp
+    src/core/son/passes/pe/p90_partial_evaluation.cpp
+    src/core/son/passes/pe/p91_partial_deop.cpp
     src/core/son/passes/opt_levels.cpp
     src/core/son/passes/pass_manager.cpp
     src/core/son/verifier.cpp

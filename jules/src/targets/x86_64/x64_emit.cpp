@@ -373,17 +373,33 @@ struct Emitter {
             i.b.imm = 0;
         }
 
-        u8 gp = 0, xm = 0;
-        for (NodeId id = 0; id < g_.size(); ++id) {
-            const Node& n = g_.node(id);
-            if (n.op != Op::Param) continue;
-            i32 s = slot(id);
-            if (fp_of(n.ty)) {
-                if (xm >= kArgXmmCount) return false;
-                st_slot(IOp::MovFpS, kArgXmmRegs[xm++], s, sz_of(n.ty));
-            } else {
-                if (gp >= kArgGpCount) return false;
-                st_slot(IOp::MovRS, kArgGpRegs[gp++], s, 8);
+        // Parameter binding by SIGNATURE POSITION (Param.aux), not by the
+        // order live Param nodes appear in the graph: PE variants (pass
+        // 90/91) drop bound parameters and can leave earlier ones dead
+        // (their branches fold away), so a live param at aux=k must land
+        // in the k-th argument's register. The register index within its
+        // class counts only same-class parameters before it — exactly how
+        // emit_call assigns argument registers at call sites.
+        for (u32 idx = 0; idx < lf_.params.size(); ++idx) {
+            bool fp_param = fp_of(lf_.params[idx]);
+            for (NodeId id = 0; id < g_.size(); ++id) {
+                const Node& n = g_.node(id);
+                if (n.op != Op::Param || n.aux != idx) continue;
+                i32 s = slot(id);
+                if (fp_param) {
+                    u8 xm = 0;
+                    for (u32 j = 0; j < idx; ++j)
+                        if (fp_of(lf_.params[j])) ++xm;
+                    if (xm >= kArgXmmCount) return false;
+                    st_slot(IOp::MovFpS, kArgXmmRegs[xm], s, sz_of(n.ty));
+                } else {
+                    u8 gp = 0;
+                    for (u32 j = 0; j < idx; ++j)
+                        if (!fp_of(lf_.params[j])) ++gp;
+                    if (gp >= kArgGpCount) return false;
+                    st_slot(IOp::MovRS, kArgGpRegs[gp], s, 8);
+                }
+                break; // one Param node per index
             }
         }
 
@@ -1067,6 +1083,25 @@ struct Emitter {
             i.a.slot = static_cast<i32>(nd.ival * 8); // byte offset (idx * 8)
             if (nd.ival >= 0 && static_cast<u64>(nd.ival) + 1 > lf_.pgo_count)
                 lf_.pgo_count = static_cast<u32>(nd.ival) + 1;
+            return;
+        }
+        if (nd.aux == kFnPgoSketch) {
+            // Sticky-value argument sketch (pass 91): one 3-slot counter
+            // triple [first, total, match]. The argument is loaded into
+            // Rax full-width (32-bit loads zero-extend, so the stored
+            // value and the compare agree on the upper bits); the update
+            // sequence itself is a serializer-side expansion with local
+            // labels. GP registers are scratch between node emissions
+            // (values live in stack slots), and no XMM state is touched.
+            load_value(nd.in[2], R::Rax, sz_of(g_.node(nd.in[2]).ty));
+            Inst& i = emit(IOp::PgoSketch);
+            i.a.k = Operand::K::Sym;
+            i.a.sym = "jules_pgo_counters";
+            i.a.slot = static_cast<i32>(nd.ival * 8); // triple base (idx * 8)
+            i.b.k = Operand::K::Reg;
+            i.b.reg = R::Rax;
+            if (nd.ival >= 0 && static_cast<u64>(nd.ival) + 3 > lf_.pgo_count)
+                lf_.pgo_count = static_cast<u32>(nd.ival) + 3;
             return;
         }
         invalidate_fp_consts(); // all XMMs are caller-saved across calls
@@ -3014,6 +3049,33 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             os << "\tincq jules_pgo_counters";
             if (i.a.slot != 0) os << "+" << i.a.slot;
             os << "(%rip)\n";
+            break;
+        }
+        case IOp::PgoSketch: {
+            // sticky-value sketch update at counters+OFF:
+            //   [first, total, match] with `first` seeded by the first
+            //   observation (total == 0) and `match` counting the
+            //   invocations equal to it. Local labels are uniqued by a
+            //   function-scope counter (constant-initialized, no global
+            //   constructor); the machine passes (86-88) see one opaque
+            //   effect Inst, same contract as PgoInc.
+            static int sketch_seq = 0; // unique labels across the module
+            const int sid = sketch_seq++;
+            const char* off = "";
+            std::string off_s;
+            if (i.a.slot != 0) {
+                off_s = "+" + std::to_string(i.a.slot);
+                off = off_s.c_str();
+            }
+            os << "\tcmpq $0, jules_pgo_counters" << off << "+8(%rip)\n";
+            os << "\tjne .Lpe_sk" << sid << "_a\n";
+            os << "\tmovq %rax, jules_pgo_counters" << off << "+0(%rip)\n";
+            os << ".Lpe_sk" << sid << "_a:\n";
+            os << "\tincq jules_pgo_counters" << off << "+8(%rip)\n";
+            os << "\tcmpq %rax, jules_pgo_counters" << off << "+0(%rip)\n";
+            os << "\tjne .Lpe_sk" << sid << "_b\n";
+            os << "\tincq jules_pgo_counters" << off << "+16(%rip)\n";
+            os << ".Lpe_sk" << sid << "_b:\n";
             break;
         }
         case IOp::CallFn: os << "\tcall .L" << i.a.label << "_E\n"; break;

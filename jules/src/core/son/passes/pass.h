@@ -46,6 +46,14 @@ struct PassOptions {
     // (entry, header) per instrumented loop, enumerated in the same
     // deterministic (fn, loop) order pass 43 re-derives at compile time.
     std::vector<u64> pgo_counters;
+    // Loop-pair total pass 43 enumerated BEFORE its mutation (identical in
+    // the instrument and use builds — nothing before 43 reads the PGO mode).
+    // Pass 91's argument sketches start AFTER these counters.
+    u32 pgo_loop_pairs = 0;
+    // Module function count at pipeline entry (set by the driver). Pass
+    // 90/91 append PE variants; sketch enumeration covers originals only
+    // so appended variants cannot shift counter indices between builds.
+    u32 orig_fn_count = 0;
 };
 
 struct PassStats {
