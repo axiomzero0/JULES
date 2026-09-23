@@ -247,6 +247,48 @@ run_pgo_test() {
 }
 run_pgo_test t36_pgo
 run_pgo_test t41_partial_deop PartialDeoptimization
+run_pgo_test t42_range_deop PartialDeoptimization
+
+# t42 RANGE deopt (pass 91): the standard flow above proves the ladder
+# fires on profile-derived hulls and the output survives; the adversarial
+# round below FORCES the range guards to fail. A range hull from a real
+# profile covers every observed value, so failure is induced by shrinking
+# the recorded [min, max] counters below reality (scripts/t42_shrink_hull.py:
+# c [3,9] -> [4,8], x [0,199] -> [1,198]) — c == 3 / c == 9 / x == 199 then
+# transfer DOWN the ladder (generic / rung-1) instead of the innermost
+# variant, and the output must stay byte-identical.
+t42_range_deop_adversarial() {
+    local src="tests/programs/t42_range_deop.jules"
+    local exp="tests/expected/t42_range_deop.txt"
+    local dir="$WORK/t42_range_deop_adv"
+    mkdir -p "$dir"
+    cp "$dir/../t42_range_deop_pgo/jules.prof" "$dir/real.prof"
+    if ! python3 scripts/t42_shrink_hull.py "$dir/real.prof" "$dir/adv.prof" \
+         > "$dir/patch.log" 2>&1; then
+        echo "FAIL t42_range_deop (adversarial profile patch)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if ! timeout 30 $JULESC --pgo=use="$dir/adv.prof" --stats "$src" \
+         -o "$dir/adv.bin" > "$dir/adv.log" 2>&1; then
+        echo "FAIL t42_range_deop (adversarial compile)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    timeout 30 "$dir/adv.bin" > "$dir/adv.out" 2>&1
+    if ! diff -q "$exp" "$dir/adv.out" > /dev/null; then
+        echo "FAIL t42_range_deop (adversarial output — forced deopt broke semantics)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    echo "PASS t42_range_deop [adversarial: shrunk hulls force the range guards to deopt]"
+    pass=$((pass + 1))
+}
+# the adversarial round runs only after the standard t42 round succeeded
+# (it consumes t42's profile); guarded so one failure doesn't cascade.
+if [ -d "$WORK/t42_range_deop_pgo" ]; then
+    t42_range_deop_adversarial
+fi
 
 echo
 echo "results: $pass passed, $fail failed"

@@ -1086,22 +1086,23 @@ struct Emitter {
             return;
         }
         if (nd.aux == kFnPgoSketch) {
-            // Sticky-value argument sketch (pass 91): one 3-slot counter
-            // triple [first, total, match]. The argument is loaded into
-            // Rax full-width (32-bit loads zero-extend, so the stored
-            // value and the compare agree on the upper bits); the update
-            // sequence itself is a serializer-side expansion with local
-            // labels. GP registers are scratch between node emissions
-            // (values live in stack slots), and no XMM state is touched.
+            // Sticky-value argument sketch (pass 91): a 5-slot counter
+            // quintuple [first, total, match, min, max]. The argument is
+            // loaded into Rax full-width (32-bit loads zero-extend — the
+            // const guard compares low bits, the RANGE hull is only
+            // trusted for 64-bit params); the update sequence itself is a
+            // serializer-side expansion with local labels. GP registers are
+            // scratch between node emissions (values live in stack slots),
+            // and no XMM state is touched.
             load_value(nd.in[2], R::Rax, sz_of(g_.node(nd.in[2]).ty));
             Inst& i = emit(IOp::PgoSketch);
             i.a.k = Operand::K::Sym;
             i.a.sym = "jules_pgo_counters";
-            i.a.slot = static_cast<i32>(nd.ival * 8); // triple base (idx * 8)
+            i.a.slot = static_cast<i32>(nd.ival * 8); // quint base (idx * 8)
             i.b.k = Operand::K::Reg;
             i.b.reg = R::Rax;
-            if (nd.ival >= 0 && static_cast<u64>(nd.ival) + 3 > lf_.pgo_count)
-                lf_.pgo_count = static_cast<u32>(nd.ival) + 3;
+            if (nd.ival >= 0 && static_cast<u64>(nd.ival) + 5 > lf_.pgo_count)
+                lf_.pgo_count = static_cast<u32>(nd.ival) + 5;
             return;
         }
         invalidate_fp_consts(); // all XMMs are caller-saved across calls
@@ -3053,12 +3054,14 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         }
         case IOp::PgoSketch: {
             // sticky-value sketch update at counters+OFF:
-            //   [first, total, match] with `first` seeded by the first
-            //   observation (total == 0) and `match` counting the
-            //   invocations equal to it. Local labels are uniqued by a
-            //   function-scope counter (constant-initialized, no global
-            //   constructor); the machine passes (86-88) see one opaque
-            //   effect Inst, same contract as PgoInc.
+            //   [first, total, match, min, max] with `first` seeded by
+            //   the first observation (total == 0), `match` counting the
+            //   invocations equal to it, and [min, max] the signed hull
+            //   of every observed argument (the Range-assumption feed).
+            //   Local labels are uniqued by a function-scope counter
+            //   (constant-initialized, no global constructor); the
+            //   machine passes (86-88) see one opaque effect Inst, same
+            //   contract as PgoInc.
             static int sketch_seq = 0; // unique labels across the module
             const int sid = sketch_seq++;
             const char* off = "";
@@ -3070,12 +3073,24 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             os << "\tcmpq $0, jules_pgo_counters" << off << "+8(%rip)\n";
             os << "\tjne .Lpe_sk" << sid << "_a\n";
             os << "\tmovq %rax, jules_pgo_counters" << off << "+0(%rip)\n";
+            os << "\tmovq %rax, jules_pgo_counters" << off << "+24(%rip)\n";
+            os << "\tmovq %rax, jules_pgo_counters" << off << "+32(%rip)\n";
             os << ".Lpe_sk" << sid << "_a:\n";
             os << "\tincq jules_pgo_counters" << off << "+8(%rip)\n";
             os << "\tcmpq %rax, jules_pgo_counters" << off << "+0(%rip)\n";
             os << "\tjne .Lpe_sk" << sid << "_b\n";
             os << "\tincq jules_pgo_counters" << off << "+16(%rip)\n";
             os << ".Lpe_sk" << sid << "_b:\n";
+            // min: store when rax < min (min - rax > 0 signed)
+            os << "\tcmpq %rax, jules_pgo_counters" << off << "+24(%rip)\n";
+            os << "\tjle .Lpe_sk" << sid << "_c\n";
+            os << "\tmovq %rax, jules_pgo_counters" << off << "+24(%rip)\n";
+            os << ".Lpe_sk" << sid << "_c:\n";
+            // max: store when rax > max (max - rax < 0 signed)
+            os << "\tcmpq %rax, jules_pgo_counters" << off << "+32(%rip)\n";
+            os << "\tjge .Lpe_sk" << sid << "_d\n";
+            os << "\tmovq %rax, jules_pgo_counters" << off << "+32(%rip)\n";
+            os << ".Lpe_sk" << sid << "_d:\n";
             break;
         }
         case IOp::CallFn: os << "\tcall .L" << i.a.label << "_E\n"; break;

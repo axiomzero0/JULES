@@ -1,0 +1,39 @@
+// PartialDeoptimization (pass 91) — RANGE assumptions, the Const -> Range
+// -> Dynamic widening rung of the version ladder.
+//   * scale(c, x): BOTH guards are foldable under a range — c < 0 and
+//     c > 200 are provably false for c in [3, 9]. The sticky-value sketch
+//     sees c cycling 3..9 (first=3, match ~14% — NOT sticky), but the
+//     [min, max] hull is [3, 9]: a hot RANGE -> guard(c in [3,9]) {
+//     call variant } with both guard branches pruned in the variant
+//     (the residual body is just x * c + 1). x is [0, 199] — a second
+//     range rung (ladder order c then x, both guards at the call
+//     boundary).
+//   * scale(3, 0) / scale(9, 199) are the HULL EDGES: both must PASS the
+//     inclusive range guard and run the variant.
+//   * A range hull from a real profile covers every observed value, so
+//     the deopt arm is forced by an ADVERSARIAL PROFILE in the runner:
+//     the [min, max] counters are shrunk to [4, 8] / [1, 198] and the
+//     use build re-runs — c == 3, c == 9 and x == 199 then FAIL their
+//     guards and transfer DOWN the ladder (generic / rung-1 variants),
+//     and the output must stay byte-identical at every -O level:
+//     profiles pick specializations, never semantics.
+#[no_inline]
+fn scale(c: i64, x: i64) -> i64 {
+    if c < 0 { return 0; }
+    if c > 200 { return x; }
+    return x * c + 1;
+}
+
+fn main() -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < 200 {
+        var c: i64 = i % 7 + 3;
+        acc = acc + scale(c, i);
+        i = i + 1;
+    }
+    print(acc);            // 119204
+    print(scale(3, 0));    // 1    (both params at hull min)
+    print(scale(9, 199));  // 1792 (both params at hull max)
+    return 0;
+}

@@ -126,7 +126,7 @@ private:
                 if (!pn || *pn == kNoNode) continue;
                 NodeId b = g.make(Op::Call, ty_mem(), {start, prev, *pn}, 0,
                                   kFnPgoSketch);
-                g.node(b).ival = static_cast<i64>(base + 3ull * j);
+                g.node(b).ival = static_cast<i64>(base + kPeSketchSlots * j);
                 ++j;
                 prev = b;
             }
@@ -146,9 +146,11 @@ private:
         const std::vector<u64>& cnt = ctx.opts.pgo_counters;
         if (cnt.empty() || ctx.opts.orig_fn_count == 0) return false;
         u64 base = pe_sketch_base(ctx.opts);
+        PeBudgets b = pe_budgets(ctx.opts.level);
+        if (b.max_variants_per_fn == 0) return false;
 
         // enumerate (fn, param) in the instrument build's order; collect
-        // hot parameters
+        // hot parameters (sticky Const, or a Range hull within budget)
         FlatMap<FnId, std::vector<PeAssumption>> hot;
         u32 upto = ctx.opts.orig_fn_count < ctx.mod.fns.size()
                        ? ctx.opts.orig_fn_count
@@ -158,18 +160,41 @@ private:
             FunctionGraph& fg = ctx.mod.fns[fi];
             for (u32 p = 0; p < fg.param_types.size(); ++p) {
                 if (!ty_is_int(fg.param_types[p])) continue;
-                if (base + 3ull * j + 2 < cnt.size()) {
-                    u64 first = cnt[base + 3ull * j];
-                    u64 total = cnt[base + 3ull * j + 1];
-                    u64 match = cnt[base + 3ull * j + 2];
-                    if (total >= kPeSketchMinSamples &&
-                        match * 100ull >= kPeSketchMinMatchPct * total) {
+                if (base + kPeSketchSlots * j + 4 < cnt.size()) {
+                    u64 first = cnt[base + kPeSketchSlots * j];
+                    u64 total = cnt[base + kPeSketchSlots * j + 1];
+                    u64 match = cnt[base + kPeSketchSlots * j + 2];
+                    u64 mn = cnt[base + kPeSketchSlots * j + 3];
+                    u64 mx = cnt[base + kPeSketchSlots * j + 4];
+                    if (total < kPeSketchMinSamples) { ++j; continue; }
+                    if (match * 100ull >= kPeSketchMinMatchPct * total) {
+                        // sticky value: assume param == first
                         PeAssumption a;
                         a.param = static_cast<u8>(p);
                         a.value.is_fp = false;
                         a.value.ty = fg.param_types[p];
                         a.value.iv = static_cast<i64>(first);
                         hot[fg.fid].push_back(a);
+                    } else if (ty_bits(fg.param_types[p]) == 64) {
+                        // not sticky, but a narrow hull: assume param in
+                        // [min, max]. 64-bit params only — narrower widths
+                        // sketch zero-extended and their recorded order is
+                        // not the source domain's signed order.
+                        i64 slo = static_cast<i64>(mn);
+                        i64 shi = static_cast<i64>(mx);
+                        if (slo <= shi) {
+                            u64 span = static_cast<u64>(shi) -
+                                       static_cast<u64>(slo); // exact: slo<=shi
+                            if (span > 0 && span <= b.range_max_span) {
+                                PeAssumption a;
+                                a.kind = PeKind::Range;
+                                a.param = static_cast<u8>(p);
+                                a.value.ty = fg.param_types[p];
+                                a.range_lo = slo;
+                                a.range_hi = shi;
+                                hot[fg.fid].push_back(a);
+                            }
+                        }
                     }
                 }
                 ++j;
@@ -177,8 +202,6 @@ private:
         }
         if (hot.empty()) return false;
 
-        PeBudgets b = pe_budgets(ctx.opts.level);
-        if (b.max_variants_per_fn == 0) return false;
         bool changed = false;
 
         for (u32 fi = 0; fi < ctx.mod.fns.size(); ++fi) {
@@ -246,9 +269,10 @@ private:
     // every g.make()/make_arr() can reallocate the graph's node vector,
     // which would dangle a Node reference.
 
-    // One rung's call: the variant binding asms[0..bound_count) with the
-    // bound arguments dropped. rung == kNoFn falls back to the original
-    // target (the generic floor).
+    // One rung's call: the variant binding asms[0..bound_count) — Const
+    // bindings DROP their call arguments, Range bindings KEEP them (the
+    // value stays runtime inside the variant). rung == kNoFn falls back to
+    // the original target (the generic floor).
     static NodeId make_rung_call(Graph& g, Node nc, NodeId cb, NodeId call_mem,
                                  FnId rung, const std::vector<PeAssumption>& asms,
                                  u32 bound_count) {
@@ -260,7 +284,8 @@ private:
             u32 pidx = static_cast<u32>(i - 2);
             bool is_bound = false;
             for (u32 z = 0; z < bound_count; ++z)
-                if (asms[z].param == pidx) { is_bound = true; break; }
+                if (asms[z].param == pidx &&
+                    asms[z].kind == PeKind::Const) { is_bound = true; break; }
             if (is_bound) continue;
             if (k >= kMaxInputs) break;
             ins[k++] = nc.in[i];
@@ -284,6 +309,19 @@ private:
         return e;
     }
 
+    // Merge a true-side end and a false-side end at their join: Region +
+    // value/memory phis (the ladder's structural merge, shared by the
+    // const-guard and range-guard shapes).
+    static LadderEnd merge_ends(Graph& g, Node nc, const LadderEnd& T, NodeId f,
+                                const LadderEnd& F) {
+        LadderEnd out;
+        out.exit = g.make(Op::Region, ty_ctrl(), {T.exit, f});
+        out.mem = g.make(Op::Phi, ty_mem(), {out.exit, T.mem, F.mem});
+        if (nc.ty != ty_void())
+            out.val = g.make(Op::Phi, nc.ty, {out.exit, T.val, F.val});
+        return out;
+    }
+
     // Recursive rung builder. Level k guards asms[k] at `cb` on its true
     // side (descending to level k+1, or the innermost rung call when k+1
     // is past the end) and falls back to the rung with k bindings on its
@@ -299,7 +337,41 @@ private:
         NodeId arg = (slot < nc.n_in) ? nc.in[slot] : kNoNode;
         if (arg == kNoNode) return arm_call(g, nc, cb, asms, rungs, k); // defensive
 
-        // guard: arg == V (the hot constant, in the param's own domain)
+        if (a.kind == PeKind::Range) {
+            // Range guard: (arg >= lo) and (arg <= hi) as two nested Ifs —
+            // the IR's Cmp is signed-only and this reuses exactly the
+            // control shapes the const path exercises. BOTH false arms
+            // fall to the rung with k bindings (fresh calls — exactly one
+            // of the three arms runs; each is the whole function).
+            NodeId lo_c = g.make(Op::Const, a.value.ty, {cb});
+            g.node(lo_c).ival = a.range_lo;
+            NodeId ge = g.make(Op::Cmp, ty_i1(), {cb, arg, lo_c},
+                               static_cast<u8>(CmpOp::Ge));
+            NodeId gif1 = g.make(Op::If, ty_ctrl(), {cb, ge});
+            g.node(gif1).flags |= kFlagGuardSite;
+            guards.push_back(gif1);
+            NodeId t1 = g.make(Op::IfTrue, ty_ctrl(), {gif1});
+            NodeId f1 = g.make(Op::IfFalse, ty_ctrl(), {gif1});
+
+            NodeId hi_c = g.make(Op::Const, a.value.ty, {t1});
+            g.node(hi_c).ival = a.range_hi;
+            NodeId le = g.make(Op::Cmp, ty_i1(), {t1, arg, hi_c},
+                               static_cast<u8>(CmpOp::Le));
+            NodeId gif2 = g.make(Op::If, ty_ctrl(), {t1, le});
+            g.node(gif2).flags |= kFlagGuardSite;
+            guards.push_back(gif2);
+            NodeId t2 = g.make(Op::IfTrue, ty_ctrl(), {gif2});
+            NodeId f2 = g.make(Op::IfFalse, ty_ctrl(), {gif2});
+
+            LadderEnd T = build_level(g, nc, t2, k + 1, asms, rungs, guards);
+            LadderEnd F2 = arm_call(g, nc, f2, asms, rungs, k);
+            LadderEnd inner = merge_ends(g, nc, T, f2, F2);
+
+            LadderEnd F1 = arm_call(g, nc, f1, asms, rungs, k);
+            return merge_ends(g, nc, inner, f1, F1);
+        }
+
+        // const guard: arg == V (the hot constant, in the param's domain)
         NodeId v = g.make(Op::Const, a.value.ty, {cb});
         g.node(v).ival = a.value.iv;
         g.node(v).fval = a.value.fv;
@@ -321,14 +393,7 @@ private:
         // false side: the rung with k bindings (generic floor at k == 0)
         LadderEnd F = arm_call(g, nc, f, asms, rungs, k);
 
-        // merge: Region{T.exit, f} + value/memory phis
-        NodeId r = g.make(Op::Region, ty_ctrl(), {T.exit, f});
-        LadderEnd out;
-        out.exit = r;
-        out.mem = g.make(Op::Phi, ty_mem(), {r, T.mem, F.mem});
-        if (nc.ty != ty_void())
-            out.val = g.make(Op::Phi, nc.ty, {r, T.val, F.val});
-        return out;
+        return merge_ends(g, nc, T, f, F);
     }
 
     // Build the guarded ladder over the (still live) call node `call`,

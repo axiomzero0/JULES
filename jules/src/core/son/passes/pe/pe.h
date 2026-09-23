@@ -36,10 +36,24 @@
 
 namespace jules {
 
-// One assumption: parameter slot `param` equals constant `value`.
+enum class PeKind : u8 { Const, Range };
+
+// One assumption on a parameter slot. Two kinds:
+//   * Const  — param == value (p90's proven call-site constants; p91's
+//     sticky-hot values). The bound param is DROPPED from the variant's
+//     signature (replaced by an entry Const).
+//   * Range  — param stays a runtime value, but provably within
+//     [range_lo, range_hi] on profiled invocations (p91 only). The param
+//     is KEPT in the variant; branches that cannot be taken anywhere in
+//     the interval fold away (bounds checks, saturating clamps). This is
+//     the Const -> Range -> Dynamic widening ladder: the sketch reports
+//     [first..match] hot or the [min..max] hull, never both.
 struct PeAssumption {
     u8 param = 0;
-    ConstVal value;
+    PeKind kind = PeKind::Const;
+    ConstVal value;             // Const: the exact value (ty = param type)
+    i64 range_lo = 0;           // Range: inclusive lower bound
+    i64 range_hi = 0;           // Range: inclusive upper bound
 };
 
 // Level-tied budgets (the spec's termination & code-size safety).
@@ -48,6 +62,7 @@ struct PeBudgets {
     u32 growth_num = 1;          // variant live nodes <= origin * growth_num
     u32 growth_den = 1;          //   ... / growth_den
     u32 total_nodes = 0;         // global node budget across all variants
+    u32 range_max_span = 0;      // max (hi - lo) for Range assumptions
 };
 PeBudgets pe_budgets(OptLevel lvl);
 
@@ -62,8 +77,11 @@ PeBta pe_binding_time_analysis(Graph& g, const std::vector<PeAssumption>& bindin
 // Fold engine: iterate {reachability, constant propagation, dead-branch
 // pruning, phi collapse} to a fixpoint on a freshly bound graph. Shared by
 // variant creation (the "late-stage peephole on specialized graphs").
-// Returns true when any rewrite fired.
-bool pe_fold(Graph& g, u32 round_limit);
+// Returns true when any rewrite fired. `bindings` (optional) seed Range
+// assumptions onto the KEPT param nodes of the cloned graph — indices are
+// the CLONE's compact indices (see pe_make_variant), not the origin's.
+bool pe_fold(Graph& g, u32 round_limit,
+            const std::vector<PeAssumption>* bindings = nullptr);
 
 // Variant creation. Clones `origin`, binds the assumptions, folds, checks
 // budgets (level-tied), dedups against previously created variants, and
@@ -80,21 +98,27 @@ const std::vector<PeAssumption>* pe_variant_assumptions(FnId fid);
 // ---- PGO argument sketches (pass 91) ---------------------------------------
 //
 // Instrument mode pins one sticky-value sketch per (function, integer
-// parameter) at the function entry: counters [first, total, match] where
-// `first` is the first observed argument value, `total` the invocation
-// count and `match` the count of invocations equal to `first`. A parameter
-// is hot when match/total >= 95% with total >= 64 — the guarded ladder
-// then assumes param == first. The sketch is deliberately one-sided (it
-// cannot see a value hotter than the first one); that only costs missed
-// specializations, never correctness: the guard protects every use.
+// parameter) at the function entry: counters [first, total, match, min,
+// max] where `first` is the first observed argument value, `total` the
+// invocation count, `match` the count of invocations equal to `first`,
+// and [min, max] the observed hull. A parameter is hot when either
+//   * match/total >= 95% with total >= 64 (sticky value -> Const), or
+//   * total >= 64 and (max - min) fits the level's range budget
+//     (-> Range assumption; 64-bit int params only — narrower widths
+//     load zero-extended and the recorded hull would not be the source
+//     domain's signed order).
+// The sketch is one-sided on stickiness (it cannot see a value hotter
+// than the first one); that only costs missed specializations, never
+// correctness: the guard protects every use.
 //
 // Counter layout in jules.prof: [pass-43 loop pairs (2 each)]
-//                               [sketches (3 each), (fn, param) order].
+//                               [sketches (5 each), (fn, param) order].
 // The sketch enumeration covers ORIGINAL functions only (fid < the
 // module's entry-time function count) so appended PE variants cannot
 // shift indices between the instrument and use builds.
 inline constexpr u64 kPeSketchMinSamples = 64;
 inline constexpr u64 kPeSketchMinMatchPct = 95; // match * 100 >= pct * total
+inline constexpr u64 kPeSketchSlots = 5;         // [first,total,match,min,max]
 
 // Number of sketch slots over the module's original functions
 // (integer-typed parameters of fids < orig_fn_count).

@@ -27,18 +27,21 @@ PeBudgets pe_budgets(OptLevel lvl) {
             b.growth_num = 5;  // 1.25x per variant (shared across sites)
             b.growth_den = 4;
             b.total_nodes = 1024;
+            b.range_max_span = 256;  // range hulls up to +-256 wide
             break;
         case OptLevel::O3:
             b.max_variants_per_fn = 4;
             b.growth_num = 3;  // 1.5x
             b.growth_den = 2;
             b.total_nodes = 4096;
+            b.range_max_span = 4096;
             break;
         case OptLevel::Os:
             b.max_variants_per_fn = 1; // size-first: only the top rung
             b.growth_num = 9;           // 1.125x
             b.growth_den = 8;
             b.total_nodes = 256;
+            b.range_max_span = 16;      // only near-constant hulls pay
             break;
         case OptLevel::Oz:
             b.max_variants_per_fn = 0; // size-first: no PE
@@ -54,11 +57,47 @@ PeBudgets pe_budgets(OptLevel lvl) {
 
 namespace {
 
-enum class Lat : u8 { Top, Const, Bottom };
+// Lattice: Top (optimistic) -> Const -> Range -> Bottom (dynamic).
+// Range is the widening rung: a value known to lie in [lo, hi] (signed
+// domain; single-point ranges lo == hi carry the same information as a
+// Const but meet through the hull like any range). The propagation is
+// monotone down this chain — inputs only descend, meets only widen hulls.
+enum class Lat : u8 { Top, Const, Range, Bottom };
 struct LatVal {
     Lat kind = Lat::Top;
     ConstVal v;
+    i64 lo = 0, hi = 0; // Range
 };
+
+u32 lat_rank(Lat k) {
+    switch (k) {
+        case Lat::Top: return 0;
+        case Lat::Const: return 1;
+        case Lat::Range: return 2;
+        case Lat::Bottom: return 3;
+    }
+    return 3;
+}
+
+LatVal range_of(i64 lo, i64 hi) {
+    LatVal r;
+    r.kind = Lat::Range;
+    r.lo = lo;
+    r.hi = hi;
+    return r;
+}
+
+LatVal as_range(const LatVal& a) { // Const -> single-point range
+    if (a.kind == Lat::Range) return a;
+    if (a.kind == Lat::Const)
+        return range_of(a.v.iv, a.v.iv);
+    return a; // Top / Bottom pass through
+}
+
+// Cap on how wide a PROPAGATED hull may get before we give up and call
+// the value dynamic. Soundness never depends on it (wider hulls are still
+// sound); it only bounds the usefulness/precision trade.
+constexpr u64 kRangePropSpanCap = 1ull << 20;
 
 // Control reachability from Start. A Region is reachable when any
 // predecessor is (the optimistic-but-sound direction for phi meets: a phi
@@ -102,6 +141,123 @@ FlatMap<NodeId, bool> control_reachable(Graph& g) {
     return reach;
 }
 
+// ---- range transfers (signed integer domain) ---------------------------------
+//
+// Hull from i64 endpoints: ordered, and span (exact in u64 when lo <= hi
+// as signed) within the propagation cap.
+bool hull_ok(i64 lo, i64 hi) {
+    if (lo > hi) return false;
+    u64 span = static_cast<u64>(hi) - static_cast<u64>(lo);
+    return span <= kRangePropSpanCap;
+}
+
+LatVal eval_bin_range(BinOp op, const LatVal& a, const LatVal& b) {
+    // FP stays Const-only (no fp ranges in the MVP).
+    if ((a.kind == Lat::Const && a.v.is_fp) || (b.kind == Lat::Const && b.v.is_fp))
+        return LatVal{Lat::Bottom, {}};
+    if (a.kind == Lat::Bottom || b.kind == Lat::Bottom) return LatVal{Lat::Bottom, {}};
+
+    // both Const: exact (existing evaluator, includes wrap semantics)
+    if (a.kind == Lat::Const && b.kind == Lat::Const) {
+        ConstVal out;
+        if (!eval_bin_const(op, a.v, b.v, out)) return LatVal{Lat::Bottom, {}};
+        return LatVal{Lat::Const, out};
+    }
+
+    // interval cases (Add / Sub always; Mul only Const x Range). Overflow
+    // in i64 gives up (Bottom) — the wrap semantics live in the exact
+    // Const evaluator only; hulls stay in-range by construction.
+    LatVal x = as_range(a), y = as_range(b);
+    if (x.kind != Lat::Range || y.kind != Lat::Range) return LatVal{Lat::Bottom, {}};
+    i64 lo, hi;
+    switch (op) {
+        case BinOp::Add: {
+            if (__builtin_add_overflow(x.lo, y.lo, &lo)) break;
+            if (__builtin_add_overflow(x.hi, y.hi, &hi)) break;
+            if (!hull_ok(lo, hi)) break;
+            return range_of(lo, hi);
+        }
+        case BinOp::Sub: {
+            if (__builtin_sub_overflow(x.lo, y.hi, &lo)) break;
+            if (__builtin_sub_overflow(x.hi, y.lo, &hi)) break;
+            if (!hull_ok(lo, hi)) break;
+            return range_of(lo, hi);
+        }
+        case BinOp::Mul: {
+            i64 c;
+            LatVal r;
+            if (a.kind == Lat::Const && b.kind == Lat::Range) { c = a.v.iv; r = y; }
+            else if (b.kind == Lat::Const && a.kind == Lat::Range) { c = b.v.iv; r = x; }
+            else break; // Range x Range
+            if (__builtin_mul_overflow(c, r.lo, &lo)) break;
+            if (__builtin_mul_overflow(c, r.hi, &hi)) break;
+            if (lo > hi) { i64 t = lo; lo = hi; hi = t; } // c < 0 flips
+            if (!hull_ok(lo, hi)) break;
+            return range_of(lo, hi);
+        }
+        default:
+            break; // Div/Mod/bitwise/shifts/min/max: no interval model
+    }
+    return LatVal{Lat::Bottom, {}};
+}
+
+// Compare an interval against a constant (or another interval): the
+// result is 0/1 when the relation holds for EVERY value of the hull(s)
+// or for NO value — otherwise Bottom.
+LatVal eval_cmp_range(CmpOp op, const LatVal& a, const LatVal& b) {
+    if ((a.kind == Lat::Const && a.v.is_fp) || (b.kind == Lat::Const && b.v.is_fp))
+        return LatVal{Lat::Bottom, {}};
+    if (a.kind == Lat::Bottom || b.kind == Lat::Bottom) return LatVal{Lat::Bottom, {}};
+    if (a.kind == Lat::Const && b.kind == Lat::Const) {
+        ConstVal out;
+        if (!eval_cmp_const(op, a.v, b.v, out)) return LatVal{Lat::Bottom, {}};
+        return LatVal{Lat::Const, out};
+    }
+
+    // normalize: (left hull, right hull), both as intervals
+    LatVal x = as_range(a), y = as_range(b);
+    if (x.kind != Lat::Range || y.kind != Lat::Range) return LatVal{Lat::Bottom, {}};
+    auto b01 = [&](bool v) {
+        LatVal r;
+        r.kind = Lat::Const;
+        r.v.is_fp = false;
+        r.v.ty = ty_i1();
+        r.v.iv = v ? 1 : 0;
+        return r;
+    };
+    // Relation on the endpoints (signed):
+    //   definitely-true forms and definitely-false forms per CmpOp.
+    switch (op) {
+        case CmpOp::Lt: // x < y: true iff x.hi < y.lo; false iff x.lo >= y.hi
+            if (x.hi < y.lo) return b01(true);
+            if (x.lo >= y.hi) return b01(false);
+            break;
+        case CmpOp::Le: // true iff x.hi <= y.lo; false iff x.lo > y.hi
+            if (x.hi <= y.lo) return b01(true);
+            if (x.lo > y.hi) return b01(false);
+            break;
+        case CmpOp::Gt: // true iff x.lo > y.hi; false iff x.hi <= y.lo
+            if (x.lo > y.hi) return b01(true);
+            if (x.hi <= y.lo) return b01(false);
+            break;
+        case CmpOp::Ge: // true iff x.lo >= y.hi; false iff x.hi < y.lo
+            if (x.lo >= y.hi) return b01(true);
+            if (x.hi < y.lo) return b01(false);
+            break;
+        case CmpOp::Eq: // true only for identical single points; false on
+            // disjoint hulls. Overlapping-but-not-identical hulls stay
+            // dynamic (a meet may include values outside the overlap).
+            if (x.lo == x.hi && y.lo == y.hi) return b01(x.lo == y.lo);
+            if (x.hi < y.lo || y.hi < x.lo) return b01(false);
+            break;
+        case CmpOp::Ne:
+            if (x.lo == x.hi && y.lo == y.hi) return b01(x.lo != y.lo);
+            if (x.hi < y.lo || y.hi < x.lo) return b01(true);
+            break;
+    }
+    return LatVal{Lat::Bottom, {}};
+}
+
 // Worklist constant propagation over the value lattice. Seeding is a
 // separate phase so the BTA can override the (otherwise Bottom) params
 // with binding constants BEFORE the drain, and the fold engine can
@@ -125,9 +281,10 @@ public:
                 set(id, v);
             }
         }
-        // Phase 2: parameters — bound ones carry the binding value, the
-        // rest are dynamic by construction. Bound params must be seeded
-        // BEFORE the Bottom sweep so the lattice stays monotone.
+        // Phase 2: parameters — bound ones carry the binding (Const value
+        // or Range hull), the rest are dynamic by construction. Bound
+        // params must be seeded BEFORE the Bottom sweep so the lattice
+        // stays monotone.
         for (NodeId id = 0; id < g_.size(); ++id) {
             const Node& n = g_.node(id);
             if (n.op != Op::Param) continue;
@@ -135,11 +292,13 @@ public:
             if (bindings)
                 for (const PeAssumption& x : *bindings)
                     if (x.param == n.aux) { a = &x; break; }
-            if (a != nullptr) {
+            if (a != nullptr && a->kind == PeKind::Const) {
                 LatVal v;
                 v.kind = Lat::Const;
                 v.v = a->value;
                 set(id, v);
+            } else if (a != nullptr && a->kind == PeKind::Range) {
+                set(id, range_of(a->range_lo, a->range_hi));
             } else {
                 set(id, LatVal{Lat::Bottom, {}});
             }
@@ -165,15 +324,43 @@ private:
 
     void set(NodeId n, const LatVal& v) {
         LatVal old = get(n);
-        bool changed = false;
-        if (old.kind == Lat::Top) changed = (v.kind != Lat::Top);
-        else if (old.kind == Lat::Const) {
-            if (v.kind == Lat::Bottom) changed = true;
-            else if (v.kind == Lat::Const)
-                changed = (old.v.is_fp != v.v.is_fp) ||
-                          (v.v.is_fp ? old.v.fv != v.v.fv : old.v.iv != v.v.iv);
+        if (lat_rank(old.kind) > lat_rank(v.kind)) return; // never ascend
+
+        if (old.kind == Lat::Range && v.kind == Lat::Range) {
+            // Hull GROWTH is the dangerous direction: a loop-carried phi
+            // (i = phi(0, i+1)) widens by 1 per visit and has no fixpoint
+            // below the span cap; the step limit would truncate the drain
+            // mid-widening and leave STALE Const values on its users
+            // (observed: `i < 7` still Const(true) from the [0,1] era ->
+            // stage 2 pruned the live exit — the t24 miscompile class).
+            // Two growths prove the value is cyclic: collapse to Bottom,
+            // the classic SCCP jump to overdefined. Stable meets (phi of
+            // independent branch values, range-seeded params) never grow
+            // and keep their hull.
+            if (!(v.lo < old.lo || v.hi > old.hi)) return; // not growing
+            u8 w = 0;
+            if (const u8* pw = widened_.find(n)) w = *pw;
+            if (w >= 2) {
+                lat_.insert(n, LatVal{Lat::Bottom, {}});
+                for (NodeId u : g_.uses_of(n)) work_.push_back(u);
+                return;
+            }
+            widened_.insert(n, static_cast<u8>(w + 1));
+            lat_.insert(n, v);
+            for (NodeId u : g_.uses_of(n)) work_.push_back(u);
+            return;
         }
-        if (!changed) return;
+
+        if (old.kind == v.kind) {
+            if (old.kind == Lat::Top || old.kind == Lat::Bottom) return;
+            // Const: a differing value is a lattice violation in a
+            // monotone drain; treat as a change (defensive, never observed)
+            bool diff = (old.v.is_fp != v.v.is_fp) ||
+                        (v.v.is_fp ? old.v.fv != v.v.fv : old.v.iv != v.v.iv);
+            if (!diff) return;
+        }
+        // rank descent (Top->Const, Const->Range, *->Bottom) or the
+        // defensive Const re-set above
         lat_.insert(n, v);
         for (NodeId u : g_.uses_of(n)) work_.push_back(u);
     }
@@ -183,9 +370,21 @@ private:
         if (b.kind == Lat::Top) return a;
         if (a.kind == Lat::Bottom || b.kind == Lat::Bottom)
             return LatVal{Lat::Bottom, {}};
-        if (a.v.is_fp != b.v.is_fp) return LatVal{Lat::Bottom, {}};
-        if (a.v.is_fp ? a.v.fv == b.v.fv : a.v.iv == b.v.iv) return a;
-        return LatVal{Lat::Bottom, {}};
+        if (a.kind == Lat::Const && b.kind == Lat::Const) {
+            if (a.v.is_fp != b.v.is_fp) return LatVal{Lat::Bottom, {}};
+            if (a.v.is_fp ? a.v.fv == b.v.fv : a.v.iv == b.v.iv) return a;
+            if (a.v.is_fp) return LatVal{Lat::Bottom, {}}; // fp has no hull
+            return range_of(a.v.iv < b.v.iv ? a.v.iv : b.v.iv,
+                            a.v.iv < b.v.iv ? b.v.iv : a.v.iv);
+        }
+        if (a.v.is_fp || b.v.is_fp) return LatVal{Lat::Bottom, {}};
+        LatVal x = as_range(a), y = as_range(b); // Const -> single point
+        if (x.kind != Lat::Range || y.kind != Lat::Range)
+            return LatVal{Lat::Bottom, {}};
+        i64 lo = x.lo < y.lo ? x.lo : y.lo;
+        i64 hi = x.hi > y.hi ? x.hi : y.hi;
+        if (!hull_ok(lo, hi)) return LatVal{Lat::Bottom, {}};
+        return range_of(lo, hi);
     }
 
     void process(NodeId n) {
@@ -204,31 +403,13 @@ private:
             case Op::Bin: {
                 LatVal a = get(nd.in[1]), b = get(nd.in[2]);
                 if (a.kind == Lat::Top || b.kind == Lat::Top) return;
-                if (a.kind == Lat::Bottom || b.kind == Lat::Bottom) {
-                    set(n, LatVal{Lat::Bottom, {}});
-                    return;
-                }
-                ConstVal out;
-                if (!eval_bin_const(static_cast<BinOp>(nd.sub), a.v, b.v, out)) {
-                    set(n, LatVal{Lat::Bottom, {}});
-                    return;
-                }
-                set(n, LatVal{Lat::Const, out});
+                set(n, eval_bin_range(static_cast<BinOp>(nd.sub), a, b));
                 return;
             }
             case Op::Cmp: {
                 LatVal a = get(nd.in[1]), b = get(nd.in[2]);
                 if (a.kind == Lat::Top || b.kind == Lat::Top) return;
-                if (a.kind == Lat::Bottom || b.kind == Lat::Bottom) {
-                    set(n, LatVal{Lat::Bottom, {}});
-                    return;
-                }
-                ConstVal out;
-                if (!eval_cmp_const(static_cast<CmpOp>(nd.sub), a.v, b.v, out)) {
-                    set(n, LatVal{Lat::Bottom, {}});
-                    return;
-                }
-                set(n, LatVal{Lat::Const, out});
+                set(n, eval_cmp_range(static_cast<CmpOp>(nd.sub), a, b));
                 return;
             }
             case Op::Un: {
@@ -236,6 +417,22 @@ private:
                 if (a.kind == Lat::Top) return;
                 if (a.kind == Lat::Bottom) {
                     set(n, LatVal{Lat::Bottom, {}});
+                    return;
+                }
+                if (a.kind == Lat::Range &&
+                    static_cast<UnOp>(nd.sub) == UnOp::Neg) {
+                    i64 lo, hi;
+                    if (!__builtin_sub_overflow(0, a.hi, &lo) &&
+                        !__builtin_sub_overflow(0, a.lo, &hi) &&
+                        hull_ok(lo, hi)) {
+                        set(n, range_of(lo, hi));
+                    } else {
+                        set(n, LatVal{Lat::Bottom, {}});
+                    }
+                    return;
+                }
+                if (a.kind == Lat::Range) { // Not/BNot over an interval:
+                    set(n, LatVal{Lat::Bottom, {}}); // no interval model
                     return;
                 }
                 ConstVal out;
@@ -253,6 +450,12 @@ private:
                     set(n, LatVal{Lat::Bottom, {}});
                     return;
                 }
+                if (a.kind == Lat::Range) {
+                    // width-changing casts need domain-crossing hulls
+                    // (truncation wraps); out of MVP scope
+                    set(n, LatVal{Lat::Bottom, {}});
+                    return;
+                }
                 ConstVal out;
                 if (!eval_cast_const(static_cast<CastOp>(nd.sub), a.v, nd.ty, out)) {
                     set(n, LatVal{Lat::Bottom, {}});
@@ -267,7 +470,10 @@ private:
                     set(n, get(c.v.iv != 0 ? nd.in[2] : nd.in[3]));
                     return;
                 }
-                if (c.kind == Lat::Bottom) set(n, meet(get(nd.in[2]), get(nd.in[3])));
+                // dynamic condition (Bottom) or an unknown boolean hull
+                // (Range, e.g. a meet of 0 and 1): either arm may run
+                if (c.kind == Lat::Bottom || c.kind == Lat::Range)
+                    set(n, meet(get(nd.in[2]), get(nd.in[3])));
                 return;
             }
             case Op::Phi: {
@@ -299,6 +505,7 @@ private:
     Graph& g_;
     const FlatMap<NodeId, bool>& reach_;
     FlatMap<NodeId, LatVal> lat_;
+    FlatMap<NodeId, u8> widened_; // Range growth count (loop-widening cap)
     std::vector<NodeId> work_;
 };
 
@@ -332,11 +539,11 @@ PeBta pe_binding_time_analysis(Graph& g, const std::vector<PeAssumption>& bindin
 
 namespace {
 
-bool fold_round(Graph& g) {
+bool fold_round(Graph& g, const std::vector<PeAssumption>* bindings) {
     bool changed = false;
     FlatMap<NodeId, bool> reach = control_reachable(g);
     Prop prop(g, reach);
-    prop.seed_graph(nullptr);
+    prop.seed_graph(bindings);
     prop.drain();
     FlatMap<NodeId, bool> dead_ctrl;
 
@@ -477,10 +684,11 @@ bool fold_round(Graph& g) {
 
 } // namespace
 
-bool pe_fold(Graph& g, u32 round_limit) {
+bool pe_fold(Graph& g, u32 round_limit,
+            const std::vector<PeAssumption>* bindings) {
     bool any = false;
     for (u32 r = 0; r < round_limit; ++r) {
-        if (!fold_round(g)) break;
+        if (!fold_round(g, bindings)) break;
         any = true;
     }
     return any;
@@ -517,6 +725,12 @@ u64 assumptions_key(FnId origin, const std::vector<PeAssumption>& as) {
     u64 h = mix(0x51ed270b, static_cast<u64>(origin));
     for (const PeAssumption& a : s) {
         h = mix(h, a.param);
+        h = mix(h, static_cast<u64>(a.kind));
+        if (a.kind == PeKind::Range) {
+            h = mix(h, static_cast<u64>(a.range_lo));
+            h = mix(h, static_cast<u64>(a.range_hi));
+            continue;
+        }
         h = mix(h, a.value.is_fp ? 1u : 0u);
         h = mix(h, a.value.is_fp ? std::bit_cast<u64>(a.value.fv)
                                  : static_cast<u64>(a.value.iv));
@@ -533,11 +747,15 @@ const std::vector<PeAssumption>* pe_variant_assumptions(FnId fid) {
 
 namespace {
 
-// Deep-clone `src` into a fresh graph with the bound parameters replaced by
-// entry Const nodes and the remaining parameters re-indexed contiguously.
+// Deep-clone `src` into a fresh graph. Const-bound parameters become
+// entry Const nodes (dropped from the signature); Range-bound parameters
+// are KEPT as runtime parameters (re-indexed contiguously with the other
+// kept ones — `new_index` maps ORIGINAL param index -> clone index, and
+// is also returned so the fold can seed ranges by the CLONE's indices).
 FunctionGraph clone_bound(const FunctionGraph& src,
-                         const std::vector<PeAssumption>& bindings,
-                         std::vector<TypeId>& kept_params) {
+                          const std::vector<PeAssumption>& bindings,
+                          std::vector<TypeId>& kept_params,
+                          std::vector<u32>& new_index) {
     FunctionGraph out;
     out.name = kNoSymbol;
     out.always_inline = src.always_inline;
@@ -551,13 +769,13 @@ FunctionGraph clone_bound(const FunctionGraph& src,
     const Graph& sg = src.g;
     FlatMap<NodeId, NodeId> map;
 
-    // param bookkeeping: bound -> Const, kept -> Param with compact index
-    std::vector<u32> new_index(src.param_types.size(), 0xFFFFFFFFu);
+    // param bookkeeping: Const-bound -> dropped (entry Const); Range-
+    // bound and unbound -> kept, compact index
     for (u32 p = 0; p < src.param_types.size(); ++p) {
-        bool bound = false;
-        for (const PeAssumption& a : bindings)
-            if (a.param == p) { bound = true; break; }
-        if (bound) continue;
+        const PeAssumption* a = nullptr;
+        for (const PeAssumption& x : bindings)
+            if (x.param == p && x.kind == PeKind::Const) { a = &x; break; }
+        if (a != nullptr) continue;
         new_index[p] = static_cast<u32>(kept_params.size());
         kept_params.push_back(src.param_types[p]);
     }
@@ -573,7 +791,7 @@ FunctionGraph clone_bound(const FunctionGraph& src,
             const PeAssumption* a = nullptr;
             for (const PeAssumption& x : bindings)
                 if (x.param == n.aux) { a = &x; break; }
-            if (a != nullptr) {
+            if (a != nullptr && a->kind == PeKind::Const) {
                 ConstVal v = a->value;
                 if (n.aux < src.param_types.size()) v.ty = src.param_types[n.aux];
                 NodeId c = g.make(Op::Const, v.ty, {g.start()});
@@ -581,7 +799,10 @@ FunctionGraph clone_bound(const FunctionGraph& src,
                 g.node(c).fval = v.fv;
                 map.insert(id, c);
             } else {
-                u32 idx = (n.aux < new_index.size()) ? new_index[n.aux] : 0xFFFFFFFFu;
+                // kept (unbound, or Range-bound: the value stays runtime,
+                // the fold seeds the hull onto this node)
+                u32 idx = (n.aux < new_index.size()) ? new_index[n.aux]
+                                                    : 0xFFFFFFFFu;
                 if (idx == 0xFFFFFFFFu) idx = 0; // defensive: stray param
                 NodeId p = g.make(Op::Param, n.ty, {g.start()}, 0, idx);
                 map.insert(id, p);
@@ -650,8 +871,16 @@ FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
     if (bta.static_values == 0 && bta.static_ifs == 0) return kNoFn;
 
     std::vector<TypeId> kept;
-    FunctionGraph v = clone_bound(*src, bindings, kept);
-    bool folded = pe_fold(v.g, 8);
+    std::vector<u32> new_index(src->param_types.size(), 0xFFFFFFFFu);
+    FunctionGraph v = clone_bound(*src, bindings, kept, new_index);
+
+    // fold seeding uses the CLONE's compact param indices (Range params
+    // are kept there; Const params are already entry Consts)
+    std::vector<PeAssumption> seed = bindings;
+    for (PeAssumption& a : seed)
+        if (a.param < new_index.size()) a.param = static_cast<u8>(new_index[a.param]);
+
+    bool folded = pe_fold(v.g, 8, &seed);
     u64 live = v.g.live_count();
     u64 origin_live = src->g.live_count();
     // growth budget: variant nodes <= origin * growth factor
