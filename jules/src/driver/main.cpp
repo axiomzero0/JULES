@@ -21,6 +21,7 @@
 //     --only a,b,c     run only the named passes
 //     --mode M         aot | jit-baseline | jit-optimizing
 #include "core/codegen/linear.h"
+#include "core/codegen/target.h"
 #include "core/diagnostics/diag.h"
 #include "core/lexer/token.h"
 #include "core/parser/ast.h"
@@ -64,6 +65,18 @@ int run(int argc, char** argv) {
         std::string v;
         if (a == "-o" && i + 1 < argc) output = argv[++i];
         else if (a == "-S") emit_asm_only = true;
+        else if (parse_kv(a, "--target=", v)) {
+            if (!TargetRegistry::instance().find(v.c_str())) {
+                std::fprintf(stderr, "unknown target '%s' (registered:", v.c_str());
+                for (const MachineTarget* t : TargetRegistry::instance().all_targets())
+                    std::fprintf(stderr, " %s", t->name());
+                std::fprintf(stderr, ")\n");
+                return 2;
+            }
+            // validated: the selected target's isel and register model are
+            // what the linear stage runs (x86_64 today; the registry is
+            // the seam for future architectures)
+        }
         else if (a == "-O" || a == "-O1") opts.requested_level = OptLevel::O1;
         else if (a.size() >= 3 && a.compare(0, 2, "-O") == 0) {
             if (!parse_opt_level(a, opts.requested_level)) {

@@ -1,4 +1,4 @@
-// Pass 85 — x86-64 linear-scan register allocator.
+// Pass 85 — x86-64 register allocation (target layer).
 //
 // Input: post-isel MIR where every value lives in a dedicated frame slot
 // (the spill-everywhere model of the MVP emitter). The allocator promotes
@@ -8,18 +8,22 @@
 //     range spans [first def, last activity] (defs = MovRS/MovFpS/MovSImm,
 //     uses = MovSR/MovFpR/LeaSlot). The SoN values behind slots are SSA, so
 //     a range with multiple defs only arises from phi copies — still a
-//     single linear interval, which is exactly what linear scan assigns.
-//   * Register pools: callee-saved GPRs (rbx, r12-r15) for ranges that cross
-//     calls (SysV: preserved; saved/restored by our prologue/epilogue),
-//     caller-saved GPRs (r10, r11 — never touched by isel) for local ranges,
-//     and xmm2-7 for FP ranges that do not cross calls (all XMMs are
-//     caller-saved in SysV, so call-crossing FP values stay in memory).
+//     single linear interval, split exactly by its generations.
+//   * WHICH ranges keep registers is decided globally by the shared,
+//     target-neutral allocator core (core/codegen/ralloc.h): an exact
+//     min-cost flow over the segment chain (consecutive-ones program, so
+//     the integral optimum is the true optimum), then bank-aware
+//     assignment and iterated conservative coalescing at generation
+//     precision. This file is the x86-64 INPUT BUILDER (live ranges,
+//     weights, bank facts from the machine target description) and the
+//     APPLY side (operand rewriting, callee-saved prologue/epilogue,
+//     frame layout) — the algorithm itself is written once, shared by
+//     every future architecture.
 //   * Address-taken slots (LeaSlot — stack objects) and slots referenced by
 //     both GPR and FP slot-ops stay in memory.
-//   * Interference = interval overlap (Poletto linear scan). A slot that
-//     finds no free register is simply not promoted: its instructions keep
-//     the original memory operands, so spilling degenerates to the
-//     correctness-first spill-everywhere behavior for that value.
+//   * A slot the core does not promote is simply not promoted: its
+//     instructions keep the original memory operands, so spilling
+//     degenerates to the correctness-first spill-everywhere behavior.
 //
 // ABI notes: pushes are inserted between `mov rbp, rsp` and the frame
 // subtraction, so the callee-save area occupies rbp-8..rbp-8n. Restores are
@@ -28,6 +32,8 @@
 // leave is the only requirement). FrameSub is re-patched so the final rsp
 // stays 16-byte aligned.
 #include "core/codegen/linear.h"
+#include "core/codegen/ralloc.h"
+#include "core/codegen/target.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -119,20 +125,6 @@ bool slot_def_at(const Inst& i) {
     bool f = false;
     return slot_def_inst(i, s, f);
 }
-
-struct RegPool {
-    std::vector<R> regs;
-    std::vector<bool> used;
-
-    RegPool(const R* list, size_t n) : regs(list, list + n), used(n, false) {}
-    int find_free() const {
-        for (size_t i = 0; i < regs.size(); ++i)
-            if (!used[i]) return static_cast<int>(i);
-        return -1;
-    }
-    void take(int i) { used[static_cast<size_t>(i)] = true; }
-    void release(int i) { used[static_cast<size_t>(i)] = false; }
-};
 
 // Block-level slot sets (small functions; linear scan in vectors).
 struct SlotSet {
@@ -632,73 +624,203 @@ struct Allocator {
     }
 
     // ------------------------------------------------------------------
-    // Hint retarget (post-assignment coalescing repair).
+    // Hybrid allocation: build the target-neutral problem, run the shared
+    // core (exact flow spill selection + assignment + iterated
+    // coalescing — see core/codegen/ralloc.h), map the solution back.
     //
-    // The linear scan assigns hulls, so a loop phi (hull wraps the whole
-    // loop) never lands on the same register as its source value (hull
-    // nested inside). The exact liveness (gens) says they can share: the
-    // phi's old generation ends exactly where the source's begins. Move
-    // one partner onto the other's register when the pair is gen-disjoint
-    // and no third range claims the register in between.
+    // Weights (the flow's spill costs): each use contributes 10 x loop
+    // depth — the classic Chaitin-style weighting; ranges that span a
+    // backedge execute their uses per iteration and are amplified 16x,
+    // replacing the old "never a spill victim" rule with a global cost
+    // tradeoff (when pressure makes some loop-carried value lose, the
+    // flow picks the least-bad one instead of whatever a local heuristic
+    // would).
+    //
+    // Bank model (from the machine target description, trimmed per
+    // function): caller GPRs [r10, r11 + argument registers the emitted
+    // stream never writes], callee GPRs [rbx, r12-r15], XMM caller
+    // [xmm2..const-pool floor].
     // ------------------------------------------------------------------
-    bool try_retarget(i32 move, i32 onto) {
-        LiveRange& m = range(move);
-        LiveRange& o = range(onto);
-        R reg = o.assigned;
-        if (m.fp != o.fp) return false;
-        if (m.crosses_call && !reg_is_callee_saved_gpr(reg)) return false;
-        // exact liveness of the pair must be disjoint — with one exception:
-        // a TOUCHING boundary (one gen's end == the other's start) is a
-        // value handover in a single instruction ([mov Z, X] reads the old
-        // and writes the new; a coalesced two-operand op does the same),
-        // not an interference.
-        auto touch = [](const std::pair<size_t, size_t>& a,
-                        const std::pair<size_t, size_t>& b) {
-            return a.first <= b.second && b.first <= a.second;
-        };
-        for (const auto& g1 : m.gens)
-            for (const auto& g2 : o.gens) {
-                if (!touch(g1, g2)) continue;
-                if (g1.second == g2.first || g2.second == g1.first) continue;
-                return false; // genuine overlap
+    ralloc::RaProblem build_problem(bool size_biased) {
+        ralloc::RaProblem pb;
+        pb.prefer_callee_saved = size_biased;
+
+        // ---- GPR banks (static facts + per-function discovery) --------
+        ralloc::RaClass gpr;
+        gpr.name = "GPR";
+        {
+            // caller bank: r10, r11, then clean argument registers
+            std::vector<u16> caller;
+            caller.push_back(static_cast<u16>(R::R10));
+            caller.push_back(static_cast<u16>(R::R11));
+            {
+                const R cand[] = {R::Rdx, R::Rsi, R::Rdi, R::R8, R::R9};
+                auto writes_reg = [&](const Inst& q, R c) {
+                    auto dst = [&](const Operand& o) {
+                        return o.k == Operand::K::Reg && o.reg == c;
+                    };
+                    switch (q.op) {
+                        case IOp::MovRR: case IOp::MovSR: case IOp::MovRImm:
+                        case IOp::ArithRR: case IOp::ArithRImm:
+                        case IOp::ShiftImm: case IOp::ShiftCl:
+                        case IOp::Neg: case IOp::Not: case IOp::Cmov:
+                        case IOp::LoadMem: case IOp::LeaSlot: case IOp::LeaSym:
+                        case IOp::SExt32:
+                            return dst(q.a);
+                        case IOp::Cqo: return c == R::Rdx;
+                        case IOp::IDiv: case IOp::UDiv:
+                            return c == R::Rax || c == R::Rdx;
+                        case IOp::CallFn: case IOp::CallSym: case IOp::TailCallFn:
+                            return true; // clobbers every caller-saved reg
+                        default:
+                            return false; // FP ops / stores / labels / branches
+                    }
+                };
+                for (R c : cand) {
+                    bool clean = true;
+                    for (const Inst& q : lf.code) {
+                        if (writes_reg(q, c)) { clean = false; break; }
+                    }
+                    if (clean) caller.push_back(static_cast<u16>(c));
+                }
             }
-        // no third range on the register may overlap the mover's hull
-        for (LiveRange& u : ranges) {
-            if (&u == &m || &u == &o) continue;
-            if (!u.promoted || u.assigned != reg) continue;
-            if (u.last_live >= m.first_live && u.first_live <= m.last_live)
-                return false;
+            ralloc::RaBank cb;
+            cb.name = "caller";
+            cb.regs = std::move(caller);
+            gpr.banks.push_back(cb);
         }
-        m.assigned = reg;
-        return true;
+        {
+            ralloc::RaBank cb;
+            cb.name = "callee";
+            cb.regs = {static_cast<u16>(R::Rbx), static_cast<u16>(R::R12),
+                       static_cast<u16>(R::R13), static_cast<u16>(R::R14),
+                       static_cast<u16>(R::R15)};
+            cb.callee_saved = true;
+            gpr.banks.push_back(cb);
+        }
+        pb.classes.push_back(gpr);
+
+        // ---- XMM bank: xmm2..(const-pool floor) ------------------------
+        // All XMMs are caller-saved in SysV, so call-crossing FP ranges
+        // are filtered by promotable(). The isel FP constant pool owns
+        // the top of the bank down to lf.fp_const_min_xmm (an XMM INDEX,
+        // not an enum value: 14 = xmm14).
+        {
+            ralloc::RaClass xmm;
+            xmm.name = "XMM";
+            ralloc::RaBank cb;
+            cb.name = "caller";
+            int xmm_hi = lf.fp_const_min_xmm;
+            if (xmm_hi > 14) xmm_hi = 14; // pool unused: 14/15 reserved
+            if (xmm_hi < 3) xmm_hi = 3;   // degenerate: keep at least xmm2
+            const int xmm2 = static_cast<int>(R::Xmm2);
+            for (int r = xmm2; r < xmm2 + (xmm_hi - 2); ++r)
+                cb.regs.push_back(static_cast<u16>(r));
+            xmm.banks.push_back(cb);
+            pb.classes.push_back(xmm);
+        }
+
+        // ---- loop nesting depths: block-level natural-loop membership
+        // (computed by analyze(); linear backedge containment interleaves
+        // on rotated layouts — an inner latch emitted after an outer
+        // latch — and undercounts nesting, which mis-ranks spill weights)
+        auto loop_depth = [&](size_t pos) -> u32 {
+            if (pos >= inst_block_.size()) return 0;
+            int b = inst_block_[pos];
+            if (b < 0) return 0; // prologue: inside no loop
+            if (static_cast<size_t>(b) >= block_depth_.size()) return 0;
+            return block_depth_[static_cast<size_t>(b)];
+        };
+
+        // ---- vregs ------------------------------------------------------
+        // Use positions per slot drive the weights; the class index maps
+        // fp -> XMM(1), gp -> GPR(0).
+        for (i32 s = 0; s < lf.slot_count; ++s) {
+            const LiveRange& r = range(s);
+            if (!promotable(r)) continue;
+            ralloc::RaVReg v;
+            v.id = s;
+            v.cls = r.fp ? 1 : 0;
+            v.crosses_call = r.crosses_call;
+            v.loop_carried = r.spans_backedge;
+            v.first = static_cast<u32>(r.first_live);
+            v.last = static_cast<u32>(r.last_live);
+            v.starts_at_def = r.starts_at_def;
+            for (const auto& g : r.gens)
+                v.gens.push_back(ralloc::RaGen{static_cast<u32>(g.first),
+                                               static_cast<u32>(g.second)});
+            u64 w = 0;
+            for (size_t p = 0; p < lf.code.size(); ++p) {
+                i32 us = 0;
+                bool uf = false, ua = false;
+                if (slot_use_inst(lf.code[p], us, uf, ua) && us == s)
+                    w += (u64(1) << std::min<u32>(loop_depth(p), 6)) * 10;
+            }
+            if (r.spans_backedge) w *= 16;
+            v.weight = static_cast<u32>(std::min<u64>(w, ~0u / 2));
+#ifdef JULES_DEBUG_RA_W
+            if (r.fp) {
+                std::fprintf(stderr, "[raw] slot %d first=%zu last=%zu spans=%d uses:",
+                             s, r.first_live, r.last_live, (int)r.spans_backedge);
+                for (size_t p = 0; p < lf.code.size(); ++p) {
+                    i32 us2 = 0; bool uf2 = false, ua2 = false;
+                    if (slot_use_inst(lf.code[p], us2, uf2, ua2) && us2 == s)
+                        std::fprintf(stderr, " %zu(d%u)", p, loop_depth(p));
+                }
+                std::fprintf(stderr, "  (depths per block map)\n");
+            }
+#endif
+            if (v.gens.empty())
+                v.gens.push_back(ralloc::RaGen{v.first, v.last});
+            pb.vregs.push_back(v);
+        }
+
+        // ---- coalescing moves: the fuse hints -------------------------
+        for (const auto& h : hints_) {
+            ralloc::RaMove mv;
+            mv.a = h.first;
+            mv.b = h.second;
+            pb.moves.push_back(mv);
+        }
+        return pb;
     }
 
-    void retarget() {
-#ifdef JULES_DEBUG_RA3
-        for (const Fuse& f : fuses_)
-            std::fprintf(stderr, "[ra3] fuse load@%zu store@%zu a=s%d z=s%d fp=%d ops=%u inpl=%d\n",
-                         f.load_pos, f.store_pos, f.a_slot, f.z_slot, (int)f.fp, f.ops,
-                         (int)f.inplace_ok);
-#endif
-        for (auto& h : hints_) {
-            if (h.first == h.second) continue;
-            LiveRange& z = range(h.first);
-            LiveRange& a = range(h.second);
-            if (!z.defined || !a.defined) continue;
-            if (!z.promoted || !a.promoted) continue;
-            if (z.assigned == a.assigned) continue;
-            bool r1 = try_retarget(h.first, h.second);
-            bool r2 = r1 ? false : try_retarget(h.second, h.first);
-            if (r1 || r2) {
-                ++lf.ra_coalesced;
-#ifdef JULES_DEBUG_RA3
-                std::fprintf(stderr, "[ra3] coalesce s%d<-s%d: s%d -> reg %d\n", h.first, h.second,
-                             r1 ? h.first : h.second,
-                             (int)range(r1 ? h.first : h.second).assigned);
-#endif
+    void solve(bool size_biased) {
+        ralloc::RaProblem pb = build_problem(size_biased);
+        ralloc::RaSolution sol = ralloc::ralloc_hybrid(pb);
+#ifdef JULES_DEBUG_RA_FLOW
+        std::fprintf(stderr, "[raf] fn %u: vregs=%zu classes=%zu moves=%zu "
+                     "promoted=%u spilled=%u coalesced=%u\n", lf.fid,
+                     pb.vregs.size(), pb.classes.size(), pb.moves.size(),
+                     sol.promoted_count, sol.spilled_count, sol.coalesced_moves);
+        for (size_t ci = 0; ci < pb.classes.size(); ++ci) {
+            const auto& c = pb.classes[ci];
+            u32 tot = 0, cal = 0;
+            for (const auto& b : c.banks) {
+                tot += (u32)b.regs.size();
+                if (b.callee_saved) cal += (u32)b.regs.size();
             }
+            std::fprintf(stderr, "[raf]   class %s banks=%zu total=%u callee=%u\n",
+                         c.name, c.banks.size(), tot, cal);
         }
+        for (const auto& v : pb.vregs)
+            std::fprintf(stderr, "[raf]   vreg %d cls=%u w=%u cross=%d loopy=%d "
+                         "span=[%u,%u] sad=%d gens=%zu -> reg=%d\n",
+                         v.id, (unsigned)v.cls, v.weight, (int)v.crosses_call,
+                         (int)v.loop_carried, v.first, v.last, (int)v.starts_at_def,
+                         v.gens.size(), -1);
+        for (const auto& a : sol.vregs)
+            std::fprintf(stderr, "[raf]   -> vreg %d reg=%u promoted=%d\n",
+                         a.id, (unsigned)a.reg, (int)a.promoted);
+#endif
+        for (const ralloc::RaAssign& a : sol.vregs) {
+            LiveRange& r = range(a.id);
+            r.promoted = a.promoted;
+            r.assigned = static_cast<R>(a.reg);
+        }
+        lf.ra_coalesced = sol.coalesced_moves;
     }
+
 
     // ------------------------------------------------------------------
     // Liveness: backward dataflow over the emitted blocks, then a
@@ -775,6 +897,8 @@ struct Allocator {
         }
 
         // 5) per-instruction backward walk: range events + call crossing.
+        // (inst_block persisted for build_problem's block-level depths)
+        inst_block_ = inst_block;
         for (size_t bi = nb; bi-- > 0;) {
             SlotSet live = live_out[bi];
             for (size_t i = lf.code.size(); i-- > 0;) {
@@ -823,26 +947,59 @@ struct Allocator {
 
         compute_gens();
 
-        // Backedge detection on the linear stream: a jump to an earlier
-        // label. A live range that spans a backedge is loop-carried — the
-        // linear stream contains ONE copy of the loop body, so static use
-        // counts and densities undercount its real (per-iteration) use; such
-        // ranges are never eligible as spill victims.
+        // ------------------------------------------------------------------
+        // 6) Exact loop facts, at BLOCK level (replaces the old linear hull
+        // approximation — which had two defects that mattered once the
+        // flag became a flow WEIGHT multiplier instead of a victim guard):
+        //
+        //   a) "spans a backedge" via hull containment marked EVERY value
+        //      whose hull sits inside a loop body as loop-carried (first <
+        //      bot && last > top holds for any in-body interval), so the
+        //      x16 amplification stopped discriminating — on mandel it
+        //      scored the intra-iteration temp mag2 ABOVE the loop-carried
+        //      recurrence input zx0 and the flow (optimally, per its
+        //      inputs!) spilled the wrong one.
+        //
+        //   b) loop DEPTH via linear backedge containment interleaves for
+        //      rotated/nested layouts (an inner latch placed after an outer
+        //      latch in the stream), undercounting nesting.
+        //
+        // Exact versions: loop-carried = live across a real backedge =
+        // in live_out of some backedge LATCH block (the liveness fixpoint
+        // above already computed it); depth = natural-loop membership
+        // count (backward reachability from the latch, stopping at the
+        // header — reducible CFGs only, which is all we emit).
+        // ------------------------------------------------------------------
         {
-            FlatMap<int, size_t> label_at;
-            for (size_t i = 0; i < lf.code.size(); ++i)
-                if (lf.code[i].op == IOp::Label) label_at.insert(lf.code[i].a.label, i);
-            for (size_t i = 0; i < lf.code.size(); ++i) {
-                const Inst& j = lf.code[i];
-                if (j.op != IOp::Jcc && j.op != IOp::Jmp) continue;
-                const size_t* tp = label_at.find(j.a.label);
-                if (!tp || *tp >= i) continue;
-                size_t top = *tp, bot = i;
-                for (LiveRange& r : ranges)
-                    if (r.first_live != SIZE_MAX && r.first_live < bot &&
-                        r.last_live > top)
-                        r.spans_backedge = true;
+            block_depth_.assign(nb, 0);
+            std::vector<char> loop_carried(ranges.size(), 0);
+            // blocks are emitted in index order, so succ <= self is a
+            // back edge (self included: one-block loops)
+            for (size_t b = 0; b < nblocks; ++b) {
+                for (int h : lf.blocks[b].succs) {
+                    if (h < 0 || static_cast<size_t>(h) > b) continue;
+                    // natural loop of backedge (b -> h)
+                    std::vector<char> in_loop(nb, 0);
+                    in_loop[static_cast<size_t>(h)] = 1;
+                    std::vector<int> wl;
+                    wl.push_back(static_cast<int>(b));
+                    while (!wl.empty()) {
+                        int x = wl.back();
+                        wl.pop_back();
+                        if (x < 0 || static_cast<size_t>(x) >= nblocks) continue;
+                        if (in_loop[static_cast<size_t>(x)]) continue;
+                        in_loop[static_cast<size_t>(x)] = 1;
+                        for (int p : lf.blocks[static_cast<size_t>(x)].preds)
+                            wl.push_back(p);
+                    }
+                    for (size_t q = 0; q < nb; ++q)
+                        if (in_loop[q]) ++block_depth_[q];
+                    for (i32 s : live_out[b].slots)
+                        loop_carried[static_cast<size_t>(s)] = 1;
+                }
             }
+            for (size_t s = 0; s < ranges.size(); ++s)
+                ranges[s].spans_backedge = loop_carried[s] != 0;
         }
 #ifdef JULES_DEBUG_RA2
         for (i32 si = 0; si < lf.slot_count; ++si) {
@@ -886,187 +1043,6 @@ struct Allocator {
         return r.has_reads;
     }
 
-    // Poletto linear scan over ranges sorted by start position. With the
-    // size-biased cost model (-Os/-Oz), callee-saved registers are preferred
-    // for everything: fewer live push/pop pairs trade a little speed for
-    // smaller frames and prologues.
-    void assign(bool size_biased) {
-        const R gp_callee[] = {R::Rbx, R::R12, R::R13, R::R14, R::R15};
-        // xmm2..: all XMMs are caller-saved in SysV, so these are only
-        // usable for ranges that do not cross calls. The isel FP constant
-        // pool owns the top of the bank down to lf.fp_const_min_xmm (it
-        // grows from xmm15 when the function has distinct loop constants —
-        // a bigger pool trades allocatable registers for zero per-iteration
-        // rematerialization, which is the right trade for FP-heavy loops).
-        int xmm_hi = lf.fp_const_min_xmm;
-        if (xmm_hi > 14) xmm_hi = 14; // pool unused: 14/15 stay reserved
-        if (xmm_hi < 3) xmm_hi = 3;   // degenerate: keep at least xmm2
-        const R xmm_fixed[] = {R::Xmm2,  R::Xmm3,  R::Xmm4,  R::Xmm5,  R::Xmm6,
-                              R::Xmm7,  R::Xmm8,  R::Xmm9,  R::Xmm10, R::Xmm11,
-                              R::Xmm12, R::Xmm13};
-        const size_t xmm_n = static_cast<size_t>(xmm_hi - 2);
-
-        // Caller-saved pool: usable only for non-crossing GPR ranges.
-        // In functions with no calls at all, the argument registers are
-        // dead isel territory — nothing ever writes them after the
-        // prologue parameter spill (which only READS them). Scanning the
-        // emitted stream for actual writes and adopting every untouched
-        // argument register relieves exactly the pressure that hurts
-        // multi-loop kernels (7+ simultaneously live values vs the 7
-        // registers the base pools offer). rax/rcx stay out: Setcc/MovZX
-        // and the div/shift contracts write them unconditionally.
-        R extra_caller[5];
-        u8 n_extra = 0;
-        {
-            const R cand[] = {R::Rdx, R::Rsi, R::Rdi, R::R8, R::R9};
-            auto writes_reg = [&](const Inst& q, R c) {
-                auto dst = [&](const Operand& o) {
-                    return o.k == Operand::K::Reg && o.reg == c;
-                };
-                switch (q.op) {
-                    case IOp::MovRR: case IOp::MovSR: case IOp::MovRImm:
-                    case IOp::ArithRR: case IOp::ArithRImm:
-                    case IOp::ShiftImm: case IOp::ShiftCl:
-                    case IOp::Neg: case IOp::Not: case IOp::Cmov:
-                    case IOp::LoadMem: case IOp::LeaSlot: case IOp::LeaSym:
-                    case IOp::SExt32:
-                        return dst(q.a);
-                    case IOp::Cqo: return c == R::Rdx;
-                    case IOp::IDiv: case IOp::UDiv:
-                        return c == R::Rax || c == R::Rdx;
-                    case IOp::CallFn: case IOp::CallSym: case IOp::TailCallFn:
-                        return true; // clobbers every caller-saved register
-                    default:
-                        return false; // FP ops / stores / labels / branches
-                }
-            };
-            for (R c : cand) {
-                bool clean = true;
-                for (const Inst& q : lf.code) {
-                    if (writes_reg(q, c)) { clean = false; break; }
-                }
-                if (clean) extra_caller[n_extra++] = c;
-            }
-        }
-        std::vector<R> caller_list;
-        caller_list.push_back(R::R10);
-        caller_list.push_back(R::R11);
-        for (u8 e = 0; e < n_extra; ++e) caller_list.push_back(extra_caller[e]);
-        RegPool caller_pool(caller_list.data(), caller_list.size());
-        RegPool callee_pool(gp_callee, sizeof gp_callee / sizeof gp_callee[0]);
-        RegPool xmm_pool(xmm_fixed, xmm_n < sizeof xmm_fixed / sizeof xmm_fixed[0]
-                                         ? xmm_n
-                                         : sizeof xmm_fixed / sizeof xmm_fixed[0]);
-        // A register in the caller pool that is also used by the callee pool
-        // never happens (disjoint lists).
-
-        std::vector<LiveRange*> order;
-        for (LiveRange& r : ranges)
-            if (promotable(r)) order.push_back(&r);
-        std::sort(order.begin(), order.end(),
-                  [](const LiveRange* a, const LiveRange* b) {
-                      return a->first_live < b->first_live;
-                  });
-
-        struct Active {
-            LiveRange* r;
-            RegPool* pool;
-            int idx;
-            bool dead = false;
-        };
-        std::vector<Active> active;
-
-        for (LiveRange* r : order) {
-            // expire: ranges that ended before this one starts. A range
-            // whose FIRST activity is a def may start exactly at another
-            // range's final use (the fused [mov Z, A] reads A and writes Z
-            // in one instruction — and a coalesced op reads the old value
-            // and writes the new one in the same instruction), so the
-            // touching case `u.last_live == r.first_live` is a handover,
-            // not an interference — but only when the newcomer begins
-            // with a def. A newcomer that begins with a USE genuinely
-            // overlaps (both values live at that position).
-            for (Active& a : active) {
-                if (a.r->last_live < r->first_live) a.dead = true;
-                else if (a.r->last_live == r->first_live && r->starts_at_def)
-                    a.dead = true;
-            }
-            // (mark-then-sweep to keep indices stable)
-            std::vector<Active> keep;
-            for (Active& a : active) {
-                if (a.dead) a.pool->release(a.idx);
-                else keep.push_back(a);
-            }
-            active = std::move(keep);
-
-            // Candidate pools in preference order:
-            //   non-crossing GP  : caller-saved first (no prologue cost), then callee
-            //   crossing GP      : callee-saved only (survive calls)
-            //   FP               : xmm2-7 (all XMMs caller-saved in SysV)
-            // Poletto spill heuristic: when a pool is exhausted, spill the
-            // active range from THAT pool whose live range ends furthest and
-            // whose end is later than the newcomer's — its register goes to
-            // the newcomer (the victim's slot keeps memory operands, which
-            // degenerates to spill-everywhere for that value).
-            auto try_pool = [&](RegPool* cand) -> bool {
-                int free = cand->find_free();
-                if (free >= 0) {
-                    cand->take(free);
-                    r->promoted = true;
-                    r->assigned = cand->regs[static_cast<size_t>(free)];
-                    active.push_back(Active{r, cand, free, false});
-                    return true;
-                }
-                // spill heuristic inside this pool: prefer the LEAST
-                // DENSELY USED active range that ends later than the
-                // newcomer. Interval end alone misleads for loop-carried
-                // values (their interval spans the whole loop while the
-                // next use is immediate), so rank by use density
-                // (uses per instruction of live range) and only spill
-                // strictly-colder victims than the newcomer.
-                auto density = [](const LiveRange* v) {
-                    size_t span = v->last_live > v->first_live
-                                      ? v->last_live - v->first_live + 1
-                                      : 1;
-                    return static_cast<double>(v->use_count) /
-                           static_cast<double>(span);
-                };
-                Active* victim = nullptr;
-                for (Active& a : active) {
-                    if (a.pool != cand) continue;
-                    if (a.r->spans_backedge) continue; // loop-carried: keep
-                    if (a.r->last_live <= r->last_live) continue;
-                    if (density(a.r) >= density(r)) continue; // keep hotter values
-                    if (!victim || density(a.r) < density(victim->r)) victim = &a;
-                }
-                if (!victim) return false;
-                victim->r->promoted = false; // spilled back to memory
-                int vi = victim->idx;
-                // ownership of the register moves to the newcomer; remove the
-                // victim WITHOUT releasing (the pool slot stays taken)
-                active.erase(active.begin() + (victim - active.data()));
-                cand->take(vi);
-                r->promoted = true;
-                r->assigned = cand->regs[static_cast<size_t>(vi)];
-                active.push_back(Active{r, cand, vi, false});
-                return true;
-            };
-
-            bool done = false;
-            if (!r->fp) {
-                if (r->crosses_call || size_biased) {
-                    done = try_pool(&callee_pool);
-                    if (!done && !r->crosses_call) done = try_pool(&caller_pool);
-                } else {
-                    done = try_pool(&caller_pool);
-                    if (!done) done = try_pool(&callee_pool);
-                }
-            } else {
-                done = try_pool(&xmm_pool);
-            }
-            (void)done; // a value that found no register simply stays in memory
-        }
-    }
 
     // Slot use positions (collected pre-promotion, when operands still
     // carry Slot ids) and promoted home-store positions (collected during
@@ -1075,6 +1051,9 @@ struct Allocator {
     // already absorbed — its home store can die and the consumer can read
     // the value straight from the store's source register.
     std::vector<std::vector<size_t>> slot_use_pos_;
+    std::vector<int> inst_block_;   // emit position -> block id (-1 prologue)
+    std::vector<u32> block_depth_;  // block id -> natural-loop nesting depth
+                                    // (prologue pseudo-block last, depth 0)
     std::vector<std::vector<size_t>> slot_def_pos_;
     FlatMap<size_t, i32> home_store_;
     FlatMap<size_t, i32> use_slot_at_; // use position -> the slot it read
@@ -1758,8 +1737,8 @@ struct Allocator {
         pair_fold();      // same-slot store/load adjacency — before analysis
         analyze();        // ranges, generations, exact sub-intervals
         extract_fuses();  // accumulator chains + coalescing hints
-        assign(size_biased);
-        retarget();       // unify hinted pairs onto shared registers
+        solve(size_biased); // hybrid core: flow spill set + assignment +
+                            // iterated coalescing (replaces linear scan)
         rewrite();        // promotion + operand folds + fuse application
         finalize();
         return lf.ra_promoted > 0;

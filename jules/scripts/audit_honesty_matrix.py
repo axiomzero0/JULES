@@ -60,6 +60,11 @@ mismatches = []
 for n in sorted(claimed):
     name, status = claimed[n]
     files = [f for f in os.listdir(PDIR) if f.startswith(f"p{n:02d}_")]
+    if not files:  # pass families live in subdirectories (pe/, ...)
+        sub = os.path.join(PDIR, "pe")
+        if os.path.isdir(sub):
+            files = [f for f in os.listdir(sub) if f.startswith(f"p{n:02d}_")]
+            files = [os.path.join("pe", f) for f in files]
     assert len(files) == 1, f"pass {n}: {files}"
     loc = sum(1 for _ in open(os.path.join(PDIR, files[0])))
     actual = classify(os.path.join(PDIR, files[0]))
