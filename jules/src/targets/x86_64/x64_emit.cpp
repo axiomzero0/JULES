@@ -5,6 +5,7 @@
 #include "core/codegen/linear.h"
 #include "core/son/passes/pass_utils.h"
 #include "core/son/son.h"
+#include "targets/x86_64/x64_dp_isel.h"
 
 #include <cstdio>
 #include <cstring>
@@ -130,7 +131,7 @@ bool fp_of(TypeId t) { return ty_in_xmm(t); } // scalar FP + packed vectors: XMM
 
 struct Emitter {
     Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms)
-        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms) {
+        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms), dp_(lf, fg) {
         lf_.label_counter = kLocalLabelBase;
     }
 
@@ -407,9 +408,16 @@ struct Emitter {
             label(kBlockLabelBase + b.index);
             cur_block_ = b.index;
             sc_begin_block(b); // fused short-circuit: suppress chain nodes
+            dp_.plan_block(b, suppress_); // DP-on-DAG cover (pass-84 selector)
             for (NodeId n : b.nodes) {
                 const bool* sup = suppress_.find(n);
                 if (sup && *sup) continue;
+                DpIsel::Act da = dp_.act(n);
+                if (da == DpIsel::Act::Suppressed) continue; // inline in a chain
+                if (da == DpIsel::Act::Root) {
+                    emit_dp_root(n);
+                    continue;
+                }
                 emit_node(n);
             }
             for (int ci : b.phi_copy_indices) {
@@ -988,11 +996,18 @@ struct Emitter {
 
     void emit_store(NodeId n) {
         const Node& nd = g_.node(n);
+        load_value(nd.in[2], R::Rcx, 8);
+        emit_store_payload(nd);
+    }
+
+    // Store value side. The address is already in Rcx: the default emitter
+    // loads it from the address node's slot, the DP selector computes the
+    // address chain inline into Rcx instead.
+    void emit_store_payload(const Node& nd) {
         NodeId val = nd.in[3];
         bool vec = ty_is_vector(g_.node(val).ty);
         bool fp = fp_of(g_.node(val).ty);
         u8 size = sz_of(g_.node(val).ty);
-        load_value(nd.in[2], R::Rcx, 8);
         if (vec) {
             load_fp(val, R::Xmm0);
             Inst& i = emit(IOp::StoreMem);
@@ -1050,6 +1065,139 @@ struct Emitter {
             i.a.k = Operand::K::Reg; i.a.reg = R::Rcx;
             i.b.k = Operand::K::Reg; i.b.reg = R::Rdx;
             i.size = size;
+        }
+    }
+
+    // ---- DP-on-DAG selection: root + chain emission (x64_dp_isel) ---------
+
+    // Emit a claimed root: the address chains of Load/Store, or a Bin whose
+    // chosen cover is strictly cheaper than the hand emitter's form. The
+    // chain nodes it consumed were suppressed in the block loop. Address
+    // ptrcasts are unwrapped exactly as the planner did at claim time
+    // (machine-level identity, suppressed with the chain).
+    NodeId dp_unwrap_addr(NodeId a) {
+        int hops = 0;
+        for (const Node* ad = &g_.node(a);
+             ad->op == Op::Cast && static_cast<CastOp>(ad->sub) == CastOp::Ptr &&
+             hops++ < 4;
+             ad = &g_.node(a))
+            a = ad->in[1];
+        return a;
+    }
+
+    void emit_dp_root(NodeId n) {
+        const Node& nd = g_.node(n);
+        if (nd.op == Op::Load) {
+            emit_dp_val(dp_unwrap_addr(nd.in[2]), R::Rax);
+            Inst& i = emit(IOp::LoadMem);
+            i.a.k = Operand::K::Reg; i.a.reg = R::Rax;
+            i.b.k = Operand::K::Reg; i.b.reg = R::Rax;
+            i.size = sz_of(nd.ty);
+            store_result(n, sz_of(nd.ty));
+            return;
+        }
+        if (nd.op == Op::Store) {
+            emit_dp_val(dp_unwrap_addr(nd.in[2]), R::Rcx);
+            emit_store_payload(nd);
+            return;
+        }
+        // Bin root: the chosen form into rax, then the materializing store
+        emit_dp_val(n, R::Rax);
+        store_result(n, sz_of(nd.ty));
+    }
+
+    // Emit node n's value into register dst following the planner's
+    // committed cell. Scratch discipline: each form uses only {dst, other}
+    // and every inline chain completes before the same form's leaf loads,
+    // so nested chains cannot clobber each other's results.
+    void emit_dp_val(NodeId n, R dst) {
+        const DpIsel::ValCell* c = dp_.cell(n);
+        if (!c || c->form == DpIsel::ValCell::Form::Leaf) {
+            load_value(n, dst, sz_of(g_.node(n).ty));
+            return;
+        }
+        R other = (dst == R::Rax) ? R::Rcx : R::Rax;
+        switch (c->form) {
+            case DpIsel::ValCell::Form::Lea2: {
+                // chains first (they use both scratch regs); leaf loads
+                // write only their target register
+                if (c->base.k == DpIsel::OpRef::K::Chain && c->base.node != kNoNode)
+                    emit_dp_val(c->base.node, dst);
+                if (c->idx.k == DpIsel::OpRef::K::Chain && c->idx.node != kNoNode &&
+                    c->idx.node != c->base.node)
+                    emit_dp_val(c->idx.node, other);
+                if (c->base.k != DpIsel::OpRef::K::Chain)
+                    load_value(c->base.node, dst, 8);
+                if (c->idx.k != DpIsel::OpRef::K::Chain && c->idx.node != c->base.node)
+                    load_value(c->idx.node, other, 8);
+                Inst& i = emit(IOp::Lea2);
+                i.a.k = Operand::K::Reg;
+                i.a.reg = dst;
+                i.b.k = Operand::K::Reg;
+                i.b.reg = dst; // base register holds the base value
+                i.b.slot = static_cast<i32>( // SIB index register
+                    c->idx.node == c->base.node ? dst : other);
+                i.size = c->scale;
+                i.b.imm = c->disp;
+                return;
+            }
+            case DpIsel::ValCell::Form::LeaRR: {
+                if (c->idx.k == DpIsel::OpRef::K::Chain && c->idx.node != kNoNode)
+                    emit_dp_val(c->idx.node, dst);
+                else
+                    load_value(c->idx.node, dst, 8);
+                Inst& i = emit(IOp::LeaRR);
+                i.a.k = Operand::K::Reg;
+                i.a.reg = dst;
+                i.b.k = Operand::K::Reg;
+                i.b.reg = dst;
+                i.size = c->scale;
+                i.b.imm = c->disp;
+                return;
+            }
+            case DpIsel::ValCell::Form::ShlImm: {
+                if (c->a.k == DpIsel::OpRef::K::Chain && c->a.node != kNoNode)
+                    emit_dp_val(c->a.node, dst);
+                else
+                    load_value(c->a.node, dst, c->size);
+                Inst& i = emit(IOp::ShiftImm);
+                i.bin = BinOp::Shl;
+                i.a.k = Operand::K::Reg;
+                i.a.reg = dst;
+                i.b.k = Operand::K::Imm;
+                i.b.imm = c->shift;
+                i.size = c->size;
+                return;
+            }
+            case DpIsel::ValCell::Form::Arith: {
+                // b-side first: an inline chain lands in `other` and uses
+                // `dst` as internal scratch, so it must complete before the
+                // a-side load fills `dst`
+                if (c->b.k == DpIsel::OpRef::K::Chain && c->b.node != kNoNode) {
+                    emit_dp_val(c->b.node, other);
+                } else if (c->b.k == DpIsel::OpRef::K::Leaf) {
+                    load_value(c->b.node, other, c->size);
+                } else if (c->b.k == DpIsel::OpRef::K::Imm && c->big_imm) {
+                    imm_reg(IOp::MovRImm, other, c->b.imm);
+                }
+                load_value(c->a.node, dst, c->size);
+                if (c->b.k == DpIsel::OpRef::K::Imm && !c->big_imm) {
+                    Inst& i = emit(IOp::ArithRImm);
+                    i.bin = c->bin;
+                    i.a.k = Operand::K::Reg;
+                    i.a.reg = dst;
+                    i.b.k = Operand::K::Imm;
+                    i.b.imm = c->b.imm;
+                    i.size = c->size;
+                } else {
+                    Inst& i = reg2(IOp::ArithRR, dst, other, c->size);
+                    i.bin = c->bin;
+                }
+                return;
+            }
+            default:
+                load_value(n, dst, sz_of(g_.node(n).ty));
+                return;
         }
     }
 
@@ -1431,6 +1579,7 @@ struct Emitter {
     FunctionGraph& fg_;
     Graph& g_;
     SymbolTable& syms_;
+    DpIsel dp_; // per-block DP cover planner (x64_dp_isel.{h,cpp})
     // replaced by fp_const_cache_dom_ (dominance-checked)
     int next_const_xmm_ = 15;
 };
@@ -1440,7 +1589,12 @@ struct Emitter {
 // ---- pass 84 ------------------------------------------------------------------
 bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms) {
     Emitter e(lf, fg, syms);
-    return e.run();
+    bool ok = e.run();
+    if (ok && std::getenv("JULES_DP_STATS"))
+        std::fprintf(stderr, "[dp] %.*s: roots=%u folds=%u\n",
+                     static_cast<int>(syms.name(fg.name).size()),
+                     syms.name(fg.name).data(), e.dp_.roots(), e.dp_.folds());
+    return ok;
 }
 
 // ---- pass 85: frame layout (spill-everywhere allocator) --------------------------
@@ -1571,6 +1725,7 @@ bool flags_preserving(IOp op) {
         case IOp::LeaSlot:
         case IOp::LeaSym:
         case IOp::LeaRR:
+        case IOp::Lea2:
         case IOp::Nop:
         case IOp::Comment:
             return true;
@@ -2464,7 +2619,7 @@ bool x64_machine_peephole(LFunction& lf) {
             switch (o) {
                 case IOp::MovRR: case IOp::MovFpFp: case IOp::MovSR:
                 case IOp::MovFpR: case IOp::MovRImm: case IOp::Setcc:
-                case IOp::LeaRR: case IOp::LeaSlot: case IOp::LeaSym:
+                case IOp::LeaRR: case IOp::Lea2: case IOp::LeaSlot: case IOp::LeaSym:
                 case IOp::RestoreCal: case IOp::LoadMem:
                     return true;
                 default:
@@ -2475,7 +2630,7 @@ bool x64_machine_peephole(LFunction& lf) {
             switch (o) {
                 case IOp::MovRR: case IOp::MovFpFp: case IOp::MovSR:
                 case IOp::MovFpR: case IOp::MovRImm: case IOp::Setcc:
-                case IOp::LeaRR: case IOp::LeaSlot: case IOp::LeaSym:
+                case IOp::LeaRR: case IOp::Lea2: case IOp::LeaSlot: case IOp::LeaSym:
                 case IOp::RestoreCal: case IOp::LoadMem:
                 case IOp::ArithRR: case IOp::ArithRImm: case IOp::FpBin:
                 case IOp::VecBinF64: case IOp::VecBinI64: case IOp::VecBinI32:
@@ -2492,6 +2647,8 @@ bool x64_machine_peephole(LFunction& lf) {
         auto inst_reads = [&](const Inst& q, u32& mask) {
             if (q.op == IOp::Nop || q.op == IOp::Comment) return;
             if (q.b.k == Operand::K::Reg) mask |= bit(q.b.reg);
+            if (q.op == IOp::Lea2 && q.b.k == Operand::K::Reg)
+                mask |= bit(static_cast<R>(q.b.slot)); // SIB index register
             if (q.a.k == Operand::K::Reg && !a_is_write_only(q.op)) mask |= bit(q.a.reg);
             if (q.op == IOp::IDiv || q.op == IOp::UDiv || q.op == IOp::Cqo)
                 mask |= bit(R::Rax) | bit(R::Rdx);
@@ -3280,6 +3437,14 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
             // dst = base*scale + disp (AT&T: leaq disp(,base,scale), dst)
             int scale = (i.size == 2 || i.size == 4 || i.size == 8) ? i.size : 1;
             os << "\tleaq " << i.b.imm << "(," << r(i.b.reg) << "," << scale << "), "
+               << r(i.a.reg) << "\n";
+            break;
+        }
+        case IOp::Lea2: {
+            // dst = base + idx*scale + disp (full SIB: leaq disp(base,idx,scale), dst)
+            int scale = (i.size == 2 || i.size == 4 || i.size == 8) ? i.size : 1;
+            os << "\tleaq " << i.b.imm << "(" << r(i.b.reg) << ","
+               << r(static_cast<R>(i.b.slot)) << "," << scale << "), "
                << r(i.a.reg) << "\n";
             break;
         }

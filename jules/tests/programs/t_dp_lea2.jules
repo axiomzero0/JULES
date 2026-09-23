@@ -1,0 +1,72 @@
+// dp-isel exercise: 2D row-major addressing (base + index*scale chains —
+// the SIB-lea / shl / imul cover rules), baseless scale forms, mul-by-
+// small-constant selection, read-modify-write through the array, and
+// value-side multiplications.
+//
+// REGRESSION PROVENANCE: the RMW loop + value-mul fill combination was
+// the trigger that exposed the nested-loop unrolling miscompile (pass 42
+// cloning a body containing an inner loop: the cloner could not copy a
+// cyclic body — outer unroll copies 2-4 lost their inner loops and the
+// 2D sum only counted a quarter of the elements). Fixed in
+// loop_transforms.cpp (cycle-aware body_order + deferred backedge
+// patching; p42 is innermost-only now). Keep both shapes here.
+fn grid(g: *mut i64, w: i64, h: i64) -> i64 {
+    var y: i64 = 0;
+    var acc: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            let row: i64 = y * w;       // runtime w: generic imul chain
+            let cell: i64 = row + x;    // inlined into the addressing lea
+            acc = acc + g[cell];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    let w: i64 = 64;
+    let h: i64 = 64;
+    let g: *mut i64 = alloc(i64, w * h);
+    var i: i64 = 0;
+    while i < w * h {
+        g[i] = (i * 7) % 13 - 6;         // value-side mul: the old trigger
+        i = i + 1;
+    }
+    // read-modify-write through the array (the old trigger)
+    i = 0;
+    while i < w * h {
+        g[i] = g[i] + 3;
+        i = i + 1;
+    }
+    // fixed-stride 2D reads: y*64 + x exercises the constant-width SIB
+    // shapes (shl by 6, folded scale 8 for the i64 element offset)
+    var t: i64 = 0;
+    var y: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            t = t + g[y * 64 + x];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    // scalar mul covers: 3 = lea x+x*2, 5 = lea x+x*4, 9 = lea x+x*8,
+    // 8 = shl $3
+    var m: i64 = 0;
+    i = 0;
+    while i < 100 {
+        m = m + i * 3;
+        m = m + i * 5;
+        m = m + i * 9;
+        m = m + i * 8;
+        i = i + 1;
+    }
+    print(grid(g, w, h));
+    print(t);
+    print(m);
+    free(g);
+    return 0;
+}

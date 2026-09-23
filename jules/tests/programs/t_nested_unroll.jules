@@ -1,0 +1,39 @@
+// REGRESSION: nested-loop unrolling miscompile (pass 42, fixed with the
+// cycle-aware body cloner in loop_transforms.cpp).
+//
+// Shape: fill loop -> RMW loop (g[i] = g[i] + 3) -> 2D-nested sum loop
+// (y * 64 + x addressing). The old cloner could not copy a body containing
+// an inner loop: unrolling the OUTER y-loop produced copies whose inner
+// loops lost their backedges — the bodies died, leaving empty cmp/jge
+// guard shells — so the sum counted only one row in four:
+//     printed 3066, correct 12282 (= -6 + 3*4096)
+// Found via t_dp_lea2's read-modify-write loop; this file is the minimal
+// locked repro.
+fn main() -> i64 {
+    let w: i64 = 64;
+    let h: i64 = 64;
+    let g: *mut i64 = alloc(i64, w * h);
+    var i: i64 = 0;
+    while i < w * h {
+        g[i] = (i * 7) % 13 - 6;
+        i = i + 1;
+    }
+    i = 0;
+    while i < w * h {
+        g[i] = g[i] + 3;
+        i = i + 1;
+    }
+    var t: i64 = 0;
+    var y: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            t = t + g[y * 64 + x];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    print(t);
+    free(g);
+    return 0;
+}

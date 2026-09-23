@@ -113,6 +113,7 @@ src/core/son/passes/p42_loop_unrolling.cpp
     src/core/codegen/ralloc_flow.cpp
     src/core/codegen/target.cpp
     src/driver/main.cpp
+    src/targets/x86_64/x64_dp_isel.cpp
     src/targets/x86_64/x64_emit.cpp
     src/targets/x86_64/x64_ra.cpp
     src/targets/x86_64/x64_target.cpp

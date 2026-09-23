@@ -128,6 +128,13 @@ enum class IOp : u16 {
     Comment,        // emission-time annotation (MIR comments, disabled in release)
     LeaRR,          // lea: dst(a.reg) = base(b.reg)*scale + disp(b.imm); scale in
                     // `size` (1/2/4/8); pass-87 formation from [mov][add/sub/shl]
+    Lea2,           // lea (full SIB, emitted by the pass-84 DP selector):
+                    // dst(a.reg) = base(b.reg) + idx*scale + disp(b.imm);
+                    // the index register rides in b.slot (reinterpreted —
+                    // consumers are op-gated, like LeaRR's b.imm), scale in
+                    // `size` (1/2/4/8). Scratch regs only; never slot-reading,
+                    // never allocator-homed, so the pass-85 slot machinery is
+                    // oblivious to it.
     // ---- packed-vector ops (128-bit SSE2 baseline; passes 54-66) ----
     VecBinF64,      // addpd/subpd/mulpd/divpd xmm0, xmm1 (bin encodes op)
     VecBinI64,      // paddq/psubq (Add/Sub only — no SIMD i64 mul below AVX512DQ)

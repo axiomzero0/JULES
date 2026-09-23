@@ -665,6 +665,8 @@ struct Allocator {
                         case IOp::ShiftImm: case IOp::ShiftCl:
                         case IOp::Neg: case IOp::Not: case IOp::Cmov:
                         case IOp::LoadMem: case IOp::LeaSlot: case IOp::LeaSym:
+                        case IOp::LeaRR: case IOp::Lea2: // DP selector emits
+                                                          // Lea2 pre-RA
                         case IOp::SExt32:
                             return dst(q.a);
                         case IOp::Cqo: return c == R::Rdx;

@@ -1,4 +1,4 @@
-// Implementation of loop_transforms.h (shared by passes 42/44).
+// Implementation of loop_transforms.h (shared by passes 42/43/44).
 //
 // The body cloner duplicates a loop's body blocks `extra` times as a
 // trailing chain. Control/data wiring, concretely:
@@ -9,6 +9,23 @@
 // that phi's update value (copy 0 = the original body). The header's
 // latch predecessor and every phi backedge input are retargeted to the
 // last copy after the chain is built.
+//
+// NESTED-LOOP CYCLES (the t_dp_lea2 miscompile): a body containing an
+// inner loop is a CYCLE — the inner header Region's latch pred is
+// downstream of the projections of its own guard. Two rules make the
+// cloner cycle-correct:
+//   1. body_order never deadlocks: a Region waits only for preds that
+//      are NOT reachable from the Region itself (backedge preds do not
+//      block placement; they are cloned later in the sweep).
+//   2. remap() misses on in-body nodes are DEFERRED: the clone is built
+//      with the original as a placeholder, and every deferred input is
+//      patched to the proper clone after the whole copy is swept. The
+//      old cloner silently wired such inputs to the ORIGINAL nodes —
+//      the cloned inner loop lost its backedge, its body died, and the
+//      outer loop kept running empty guard shells that summed a quarter
+//      of the iterations (found by mini3: fill + RMW + 2D sum printing
+//      3066 instead of 12282; the asm showed copies 2-4 of the outer
+//      unroll as cmp/jge shells with no bodies).
 #include "core/son/passes/loop_transforms.h"
 
 namespace jules {
@@ -62,8 +79,8 @@ bool match_counted(Graph& g, LoopInfo& li, DomTree& dom, const Loop& l,
     // Deopt-guard ladders (pass 91) are family-owned: the cloner re-threads
     // merge-region phis per copy, which severs the fallback rung's merge
     // (observed: the generic rung cut out of the loop's ladder). Loops
-    // containing a guard site stay scalar-shaped; their ILP comes from the
-    // specialization itself, not from unrolling.
+    // containing a guard site stay scalar-shaped; their ILP comes from
+    // the specialization itself, not from unrolling.
     for (NodeId blk : l.blocks) {
         for (NodeId u : g.uses_of(blk)) {
             if (g.is_dead(u)) continue;
@@ -186,11 +203,54 @@ struct Cloner {
     FlatMap<NodeId, NodeId> blkmap; // block head -> clone head (this copy)
     NodeId entry;                   // this copy's entry Jump
 
+    // In-body originals (blocks + nodes pinned at them), shared across
+    // copies. remap() misses on these are backedges / forward refs within
+    // the copy: defer, patch post-sweep. Misses on anything else are loop
+    // invariants: the original is correct.
+    const FlatMap<NodeId, bool>* in_body = nullptr;
+
+    struct Deferred {
+        NodeId node; // the clone holding a placeholder input
+        u8 slot;
+        NodeId orig; // the in-body original not yet cloned at defer time
+    };
+    std::vector<Deferred> deferred_;
+
+    bool body_has(NodeId n) const {
+        return n != kNoNode && in_body && in_body->contains(n);
+    }
+
     NodeId remap(NodeId n) const {
         if (n == kNoNode) return kNoNode;
         if (const NodeId* m = vmap.find(n)) return *m;
         if (const NodeId* m = blkmap.find(n)) return *m;
         return n; // invariant/external: unchanged
+    }
+
+    // After the copy is swept, every deferred input is re-remapped with
+    // the completed maps. Cycle-correct by construction: backedge
+    // originals are cloned later in the sweep, so the patch lands on the
+    // copy's own latch/phi-update clones.
+    void patch_deferred() {
+        for (const Deferred& d : deferred_) {
+            NodeId m = remap(d.orig);
+            if (m != d.orig) g.set_input(d.node, d.slot, m);
+            // else: unreachable given the ordering gate plus the
+            // unconditional content sweep (every in-body original is
+            // cloned exactly once per copy); keeping the original would
+            // reproduce the old broken wiring, so this stays loud in the
+            // comment rather than silent in the code.
+        }
+        deferred_.clear();
+    }
+
+    void defer_misses(const Node& un, NodeId clone, u8 from_slot) {
+        for (u8 i = from_slot; i < un.n_in; ++i) {
+            NodeId o = un.in[i];
+            if (o == kNoNode) continue;
+            NodeId got = remap(o);
+            if (got == o && body_has(o)) deferred_.push_back(Deferred{clone, i, o});
+        }
     }
 
     NodeId clone_node(NodeId u, NodeId pin) {
@@ -207,45 +267,25 @@ struct Cloner {
         cn.flags = un.flags;
         vmap.insert(u, c);
         if (un.op == Op::Return) g.append_input(g.stop(), c);
+        defer_misses(un, c, 1);
         return c;
     }
 
-    // Clone all non-head nodes pinned at block `old_blk` onto `new_blk`,
-    // in DEPENDENCY order: a node whose in-block inputs are not yet cloned
-    // waits for a later sweep (users lists are arbitrary order; cloning an
-    // Add before the Mul it reads would remap the Mul to the ORIGINAL).
+    // Clone all non-head nodes pinned at block `old_blk` onto `new_blk`.
+    // Single pass: intra-block order does not matter — an input whose
+    // producer is cloned later in the pass defers and is patched after
+    // the sweep. (The old dependency-progress loop existed so remap()
+    // would hit in order; deferral removes that requirement — and the
+    // old loop could never have handled a cyclic body anyway.)
     void clone_block_contents(NodeId old_blk, NodeId new_blk, u32& count) {
-        std::vector<NodeId> pinned;
         const SmallVec<NodeId, 4> users = g.uses_of(old_blk);
         for (NodeId u : users) {
             if (u == new_blk) continue;
             const Node& un = g.node(u);
             if (un.in[0] != old_blk) continue;
             if (is_head_op(un.op) || un.op == Op::Region) continue;
-            pinned.push_back(u);
-        }
-        FlatMap<NodeId, bool> done;
-        bool progress = true;
-        while (progress && done.size() < pinned.size()) {
-            progress = false;
-            for (NodeId u : pinned) {
-                if (done.contains(u)) continue;
-                const Node& un = g.node(u);
-                bool ready = true;
-                for (u8 i = 1; i < un.n_in; ++i) {
-                    NodeId d = un.in[i];
-                    if (d == kNoNode || d == u) continue;
-                    bool in_block = false;
-                    for (NodeId q : pinned)
-                        if (q == d) { in_block = true; break; }
-                    if (in_block && !done.contains(d)) { ready = false; break; }
-                }
-                if (!ready) continue;
-                clone_node(u, new_blk);
-                done.insert(u, true);
-                ++count;
-                progress = true;
-            }
+            clone_node(u, new_blk);
+            ++count;
         }
     }
 
@@ -259,14 +299,81 @@ struct Cloner {
         cn.fval = bn.fval;
         cn.flags = bn.flags;
         blkmap.insert(b, c);
+        defer_misses(bn, c, 0);
         return c;
     }
 };
 
 // Body block order: control reachability from the body projection,
-// predecessor-before-successor. Projections follow their If; Regions are
-// deferred until all their preds are placed.
+// predecessor-before-successor. Projections follow their If; Regions wait
+// only for FORWARD preds — a pred reachable FROM the Region (a backedge
+// into a nested loop header, or an irreducible cycle) does not block
+// placement: it is cloned later in the sweep and its input is patched via
+// the deferred mechanism.
+//
+// Returns FEWER than cl.blocks.size() entries when the body cannot be
+// linearized; callers treat that as "do not transform". No safety-append:
+// an arbitrary append order is exactly how the nested-loop miscompile
+// was born.
 std::vector<NodeId> body_order(Graph& g, const CountedLoop& cl) {
+    auto in_blocks = [&](NodeId b) {
+        return std::find(cl.blocks.begin(), cl.blocks.end(), b) != cl.blocks.end();
+    };
+
+    // Body-internal successor edges: B -> H when control flows B to H
+    // (Region pred lists, Jump ctrl inputs, projection pin blocks).
+    FlatMap<NodeId, std::vector<NodeId>> succ;
+    auto add_edge = [&](NodeId from, NodeId to) {
+        if (from == to || !in_blocks(from) || !in_blocks(to)) return;
+        if (std::vector<NodeId>* v = succ.find(from)) {
+            if (std::find(v->begin(), v->end(), to) == v->end()) v->push_back(to);
+        } else {
+            succ.insert(from, std::vector<NodeId>{to});
+        }
+    };
+    for (NodeId b : cl.blocks) {
+        const Node& bn = g.node(b);
+        switch (bn.op) {
+            case Op::Region:
+                for (u8 i = 0; i < bn.n_in; ++i)
+                    if (bn.in[i] != kNoNode) add_edge(bn.in[i], b);
+                break;
+            case Op::Jump:
+                if (bn.in[0] != kNoNode) add_edge(bn.in[0], b);
+                break;
+            case Op::IfTrue:
+            case Op::IfFalse: {
+                NodeId if_pin = g.node(bn.in[0]).in[0];
+                if (if_pin != kNoNode) add_edge(if_pin, b);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    // Per-Region downstream set (backedge-pred detection). Bodies are
+    // small (match_counted's 60-node guard): the O(B^2) scan is fine.
+    FlatMap<NodeId, std::vector<NodeId>> down_of;
+    auto downstream = [&](NodeId r) -> const std::vector<NodeId>& {
+        if (const std::vector<NodeId>* v = down_of.find(r)) return *v;
+        std::vector<NodeId> seen;
+        std::vector<NodeId> work{r};
+        while (!work.empty()) {
+            NodeId n = work.back();
+            work.pop_back();
+            const std::vector<NodeId>* s = succ.find(n);
+            if (!s) continue;
+            for (NodeId t : *s) {
+                if (std::find(seen.begin(), seen.end(), t) == seen.end()) {
+                    seen.push_back(t);
+                    work.push_back(t);
+                }
+            }
+        }
+        down_of.insert(r, std::move(seen));
+        return *down_of.find(r);
+    };
+
     FlatMap<NodeId, u32> placed;
     std::vector<NodeId> order;
     std::vector<NodeId> pending = cl.blocks; // worklist of heads
@@ -281,11 +388,15 @@ std::vector<NodeId> body_order(Graph& g, const CountedLoop& cl) {
             }
             bool ready = true;
             if (bn.op == Op::Region) {
-                for (u8 i = 0; i < bn.n_in; ++i)
-                    if (bn.in[i] != kNoNode && !placed.contains(bn.in[i]) &&
-                        std::find(cl.blocks.begin(), cl.blocks.end(), bn.in[i]) !=
-                            cl.blocks.end())
-                        { ready = false; break; }
+                const std::vector<NodeId>& down = downstream(b);
+                for (u8 i = 0; i < bn.n_in; ++i) {
+                    NodeId p = bn.in[i];
+                    if (p == kNoNode || placed.contains(p)) continue;
+                    if (!in_blocks(p)) continue; // external pred
+                    if (std::find(down.begin(), down.end(), p) != down.end())
+                        continue;                // backedge pred: cloned later
+                    ready = false; break;
+                }
             } else if (bn.op == Op::IfTrue || bn.op == Op::IfFalse) {
                 // the projection's input is an internal If; the If is
                 // PINNED at a block — that block must be placed first
@@ -293,9 +404,7 @@ std::vector<NodeId> body_order(Graph& g, const CountedLoop& cl) {
                 if (if_pin != cl.body_proj && !placed.contains(if_pin)) ready = false;
             } else {
                 NodeId ctrl = bn.in[0];
-                if (ctrl != kNoNode && ctrl != cl.body_proj &&
-                    std::find(cl.blocks.begin(), cl.blocks.end(), ctrl) !=
-                        cl.blocks.end() &&
+                if (ctrl != kNoNode && ctrl != cl.body_proj && in_blocks(ctrl) &&
                     !placed.contains(ctrl))
                     ready = false;
             }
@@ -305,10 +414,6 @@ std::vector<NodeId> body_order(Graph& g, const CountedLoop& cl) {
             progress = true;
         }
     }
-    // safety: append anything unreachable by the ordering (should not
-    // happen for matched loops)
-    for (NodeId b : cl.blocks)
-        if (!placed.contains(b)) order.push_back(b);
     return order;
 }
 
@@ -318,8 +423,22 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
     if (extra == 0 || cl.blocks.empty()) return 0;
 
     std::vector<NodeId> order = body_order(g, cl);
+    // ORDERING GATE: a body that cannot be linearized is not transformed
+    // at all. This runs BEFORE any mutation — a partially-rewired clone
+    // chain is exactly the failure mode being guarded against.
+    if (order.size() != cl.blocks.size()) return 0;
     NodeId header_latch = g.node(cl.header).in[cl.latch_slot]; // J_0
     if (header_latch == kNoNode || g.is_dead(header_latch)) return 0;
+
+    // In-body node set (blocks + everything pinned at them), shared by
+    // all copies: remap() misses on these defer; misses on anything else
+    // are loop invariants and stay original.
+    FlatMap<NodeId, bool> in_body;
+    for (NodeId b : cl.blocks) {
+        in_body.insert(b, true);
+        for (NodeId u : g.uses_of(b))
+            if (g.node(u).in[0] == b) in_body.insert(u, true);
+    }
 
     // Seed bookkeeping: copy m's seed is copy (m-1)'s clone of the phi's
     // ORIGINAL seed input at the attach slot. Chaining through the original
@@ -343,6 +462,7 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
 
     for (u32 copy = 1; copy <= extra; ++copy) {
         Cloner c{g, cl, {}, {}, kNoNode};
+        c.in_body = &in_body;
         // seeds: header phis -> previous copy's values
         for (size_t i = 0; i < live.size(); ++i) c.vmap.insert(live[i], live_vals[i]);
         // the copy's entry block: a fresh Jump fed by the previous latch
@@ -358,7 +478,8 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
                 NodeId nb;
                 if (bn.op == Op::IfTrue || bn.op == Op::IfFalse) {
                     // projection of an internal If: its input is the If's
-                    // CLONE (the If was pinned at an earlier block)
+                    // CLONE (the If was pinned at an earlier block — the
+                    // ordering guarantees the pin was swept first)
                     NodeId ifn = bn.in[0];
                     NodeId cif = c.remap(ifn);
                     nb = g.make(bn.op, bn.ty, {cif});
@@ -370,6 +491,7 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
                 c.clone_block_contents(b, nb, copied);
             }
         }
+        c.patch_deferred(); // cycle inputs: originals -> this copy's clones
 
         // next copy's seed: this copy's clone of the ORIGINAL seed value
         // (remap-of-original: the copy's vmap keys originals). PEELING

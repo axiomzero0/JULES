@@ -16,6 +16,8 @@
 // roadmap item.
 #include "core/son/passes/loop_transforms.h"
 
+#include <algorithm>
+
 namespace jules {
 
 class LoopUnrollingPass : public Pass {
@@ -51,6 +53,23 @@ private:
             for (const Loop& l : li->loops()) {
                 loopx::CountedLoop cl;
                 if (!loopx::match_counted(g, *li, ctx.analysis.doms(fg), l, cl)) continue;
+                // INNERMOST-ONLY: an outer loop's body contains a whole
+                // inner loop; unrolling it duplicates that loop F times
+                // (pure bloat — the inner loop's own unroll already covers
+                // the ILP). It was also the shape of the nested-cycle
+                // cloner bug (t_dp_lea2 / mini3: the old cloner could not
+                // copy a cyclic body — see loop_transforms.cpp; the cloner
+                // now can, but the trade still says innermost only).
+                bool nested = false;
+                for (const Loop& l2 : li->loops()) {
+                    if (l2.header == l.header) continue;
+                    if (std::find(l.blocks.begin(), l.blocks.end(), l2.header) !=
+                        l.blocks.end()) {
+                        nested = true;
+                        break;
+                    }
+                }
+                if (nested) continue;
                 if (cl.trip < 6) continue;               // too small to matter
                 if (cl.body_nodes > 60) continue;        // size guard
                 u32 f = factor;

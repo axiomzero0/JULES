@@ -10,8 +10,9 @@ SoN (target-independent IR)
   v
 Linear MIR  ---------------------------- target-neutral
   |  pass 84 instruction selection       <-- PER ARCHITECTURE
-  |       (x64_emit.cpp today; the DP-on-DAGs selector + opt-in ILP
-  |        sniper below is the evolution path)
+  |       (x64_dp_isel.cpp DP-on-DAG cover layered over the x64_emit.cpp
+  |        hand emitters, which stay the per-node fallback; opt-in ILP
+  |        sniper is the evolution path)
   v
 Post-isel MIR (every value in a frame slot; scratch-register isel
 contract: operands load into rax/rcx/xmm0/xmm1, results store back)
@@ -114,20 +115,64 @@ sat on the recurrence's critical path while the old code's round trip
 hid behind the escape branch's latency slack. Lesson: an exact optimizer
 amplifies weight-model errors; a heuristic smears them.
 
-## Instruction selection (the next tier)
+## Instruction selection (the DP tier is live)
 
-The current selector is a one-node-at-a-time template expander. The
-evolution path, per the design:
+The pass-84 selector is now the planned two-tier structure's workhorse:
+a **DP-on-DAG cover** (Burton/Twig-class) lives in
+`src/targets/x86_64/x64_dp_isel.{h,cpp}`, layered over the hand emitters
+(`x64_emit.cpp`), which remain the fallback for every node without a
+claimed rule — selection quality never regresses when a pattern is
+missing, because the DP only claims nodes it covers strictly cheaper
+(latency-class cost units: slot load 3 / store 1, lea/arith/shl 1,
+imul 3; ties break on fewer instructions, then lower rule id).
 
-1. **DP on DAGs (the workhorse)**: per-basic-block tree/DAG cover by
-   dynamic programming over machine patterns (Burton/Twig-class), O(N)
-   per block, optimal local covers, native handling of complex
-   addressing modes; runs at every -O level.
+Per block the planner runs two passes: Pass A claims Load/Store address
+chains (always a win — the address arithmetic never takes the
+store-then-load round trip through frame slots; address ptrcasts are
+unwrapped as machine-level identities), Pass B claims Bin nodes the
+rule set covers strictly cheaper than the hand emitter. Claimed roots
+are emitted from committed cells; chain nodes consumed inline are
+suppressed; everything else flows to the hand emitters unchanged.
+
+The rule set: full-SIB `Lea2` (base + index*scale + disp — the one MIR
+opcode the DP adds; the index register rides in `b.slot`, consumers are
+op-gated), baseless `LeaRR`, `ShlImm` (Mul by 2^k), mul-by-3/5/9 as
+`lea x + x*scale`, and generic Arith with an inline b-side chain.
+Scratch discipline: every form computes into {dst, other} with at most
+one nested chain operand, so nested chains cannot clobber each other.
+
+Telemetry (JULES_DP_STATS=1): per-function claimed roots and folded
+chain nodes. On the 2D-indexing stress test: 24 full-SIB leas where the
+previous pipeline had 0, and the old compiler's 914-line asm drops to
+695 lines for the same computation.
+
+**The bug the selector flushed out** (kept here as the lesson): writing
+the selector's test program — fill, RMW loop, 2D sum — produced a wrong
+answer at -O2 that predated the DP entirely. Root cause: pass 42's
+body cloner could not copy a body containing an inner loop. The clone
+order deadlocked on the header-Region/latch cycle, the safety-append
+emitted blocks in an order where the Region's backedge `remap()` fell
+through to the ORIGINAL node, and the cloned inner loops silently lost
+their backedges — the bodies died, leaving empty cmp/jge guard shells,
+so the outer loop's unrolled copies summed only one row in four
+(3066 vs 12282, regression-locked by t_nested_unroll). Fixed in
+`loop_transforms.cpp`: body_order is cycle-aware (a Region's backedge
+preds — reachable from the Region itself — do not block placement),
+remap misses on in-body nodes are deferred and patched after each
+copy's sweep, an ordering gate refuses to transform bodies that cannot
+be linearized (before any mutation), and pass 42 unrolls innermost
+loops only (outer unrolling duplicates whole inner loops — bloat with
+no ILP below the inner loop's own unroll).
+
+1. **DP on DAGs (the workhorse)**: shipped (above).
 2. **Custom ILP (the sniper)**: for profiled-hot or high-pressure
    regions only (inner loops below an instruction budget), a compact
    ILP over pattern choice + scheduling + bank assignment with
    dependency, register-constraint, and mutual-exclusion structure —
    millisecond solves on small regions, global vision where it pays.
+   Not yet built; the RA-round weight lesson applies double here (an
+   exact optimizer amplifies objective-model errors), so the DP's cost
+   model gets benched before the ILP objective gains a pressure term.
 
 The RA contract above is the prerequisite: both tiers emit into the same
 frame-slot + scratch-register MIR, so the allocator core does not change
