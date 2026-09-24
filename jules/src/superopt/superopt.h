@@ -143,6 +143,57 @@ struct Row {
 
 typedef std::vector<Row> IsaTable;
 
+// ---- Tier-4 final verification (the Z3 layer) ------------------------------
+//
+// The verification LADDER (strongest tier runs last, only on survivors):
+//   Tier 1 — in-search vector equivalence (the goal test itself): every
+//            candidate is refuted or kept for ~300ns on the batch-0 lanes.
+//   Tier 2 — fresh-batch re-verification (the commit gate): 7x12 fresh
+//            lanes re-check the winner before it may commit.
+//   Tier 3 — the concrete cross-probe: when self-test is enabled, the
+//            Tier-4 encoder re-evaluates the ORIGINAL window on the batch-0
+//            seed values and must agree with the simulator bit-for-bit
+//            (the differential lock binding the two semantic sources).
+//   Tier 4 — SMT equivalence proof (Z3): the original window and the
+//            candidate are encoded symbolically over the live-in contract;
+//            Z3 proves equivalence on ALL inputs (not a sample). Refuted
+//            candidates are rejected even though sampling passed them.
+//
+// SEMANTIC STRENGTHENING over sampling (deliberate, documented):
+//   * faults are exact: a candidate that does not fault wherever the
+//     original faults (or vice versa, on ANY input) is refuted;
+//   * undefined flags are UNCONSTRAINED symbols, not the simulator's
+//     deterministic per-lane poison — a candidate may not exploit
+//     poison-value coincidences the sampled lanes cannot refute;
+//   * entry flags are symbolic and SHARED between both sides (the runtime
+//     value is the same for both; the proof covers every valuation);
+//   * non-live-in locations (U_R/U_S) are single symbols SHARED by both
+//     sides and unconstrained — the definedness rule makes both sides
+//     write-before-read on them, so the sharing is sound, and the
+//     cross-probe surfaces any violation (an unbound symbol leaking into
+//     a contract term yields a model-dependent value and aborts).
+//
+// A Tier-4 verdict of Unknown (solver absent/timeout/unknown) degrades to
+// the Tier-2 sampling verdict unless JULES_SUPEROPT_SMT=2 (proof required).
+
+enum class Verdict { Proven, Refuted, Unknown };
+
+struct Tier4Query {
+    const LFunction* lf = nullptr; // the function (original window: [w0,w1))
+    u32 w0 = 0, w1 = 0;
+    const Inst* cand = nullptr;   // the replacement (may be null/empty = erase)
+    u32 ncand = 0;
+    const VState* seed = nullptr;       // batch-0 seed (probe values: lane 0)
+    const VState* orig_final = nullptr; // original's batch-0 final state
+    u32 livein_gpr = 0;   // bit i = GPR i is a symbolic input
+    u32 livein_slots = 0; // bit k = window slot k is a symbolic input
+    u32 contract_gpr = 0;   // bit i = GPR i must match at exit
+    u32 contract_slots = 0; // bit k = window slot k must match at exit
+    bool contract_flags = false;
+    i32 slots[kMaxSlot] = {0}; // window slot k -> absolute slot id
+    u32 nslots = 0;
+};
+
 // ---- budgets (single definitions; env-overridable at the pass layer) ----
 struct Opts {
     // Pop budgets are DRAIN-sized: after the construction caps fire, a pop
@@ -161,6 +212,15 @@ struct Opts {
     u32 slot_pool_cap = kMaxSlot;
     u32 max_slots_fn = 512;     // function slot count ceiling (liveness)
     u32 max_regions_fn = 4096;  // function region count ceiling
+
+    // Tier-4 hooks (target-supplied; null = the tier is absent and the
+    // ladder stops at Tier-2 sampling). tier4_selftest receives
+    // cand == nullptr and runs the Tier-3 cross-probe on the original.
+    Verdict (*tier4)(const Tier4Query&) = nullptr;
+    bool (*tier4_selftest)(const Tier4Query&) = nullptr;
+    // Proof-required policy: an Unknown verdict (solver absent/timeout)
+    // rejects the commit instead of degrading to the sampling verdict.
+    bool tier4_required = false;
 };
 
 struct Report {
@@ -173,6 +233,15 @@ struct Report {
     u32 skipped_undef_flags = 0; // windows skipped (undefined flags live-out)
     u32 budget_exhausted = 0;  // windows that ran out of pops/candidates/states
     u64 pops = 0;          // search nodes expanded
+    u64 constructions = 0; // candidate bindings constructed (the throughput
+                            // unit: every operand/variant binding the search
+                            // materialized, gated or not)
+    u64 simulations = 0;    // candidates that reached the simulator (passed
+                            // the validity/dom gates) — the work unit
+    u32 tier4_proven = 0;   // commits certified by the SMT equivalence proof
+    u32 tier4_refuted = 0;  // tier-2-passing winners REJECTED by the proof
+    u32 tier4_unknown = 0;  // solver absent/timeout/unknown (degraded)
+    u32 smt_selfchecks = 0; // Tier-3 cross-probes executed
     i64 attempted_cost = 0;  // latency units summed over ALL attempted windows
     i64 committed_before = 0; // originals of the windows actually replaced
     i64 committed_after = 0; // replacements' latency units

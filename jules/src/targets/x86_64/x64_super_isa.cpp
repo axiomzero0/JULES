@@ -21,7 +21,9 @@
 //     live-out are skipped by the engine.
 #include "superopt/superopt.h"
 #include "x64_dp_isel.h"
+#include "x64_super_smt.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -1003,23 +1005,67 @@ bool x64_superopt_module(LinearModule& lin) {
     o.candidates_per_window = env_u32("JULES_SUPEROPT_WIN_CANDS",
                                       o.candidates_per_window);
     o.states_per_window = env_u32("JULES_SUPEROPT_STATES", o.states_per_window);
+    // Tier-4 policy (JULES_SUPEROPT_SMT): 0 = off; 1 = best-effort when the
+    // solver is found (default); 2 = proof required (Unknown rejects).
+    // The cross-probe (JULES_SUPEROPT_SMT_SELFTEST=1) runs the differential
+    // lock on every attempted window and aborts on disagreement.
+    int smt_mode = 1;
+    if (const char* v = std::getenv("JULES_SUPEROPT_SMT"))
+        if (*v) smt_mode = std::atoi(v);
+    if (smt_mode > 0 && x64_super_smt_available()) {
+        o.tier4 = &x64_super_tier4;
+        o.tier4_required = smt_mode >= 2;
+        if (env_flag("JULES_SUPEROPT_SMT_SELFTEST", false))
+            o.tier4_selftest = &x64_super_smt_selftest;
+    }
     bool any = false;
     const bool stats = env_flag("JULES_SUPEROPT_STATS", false);
+    const bool tput = env_flag("JULES_SUPEROPT_TPUT", false);
+    // Throughput telemetry uses wall clock for the RATES ONLY — search
+    // behavior, budgets and results are still pop-count driven and
+    // fully deterministic; this clock never gates anything.
+    std::chrono::steady_clock::time_point t0, t1;
+    u64 tp_pops = 0, tp_con = 0, tp_sim = 0;
+    if (tput) t0 = std::chrono::steady_clock::now();
     for (LFunction& lf : lin.fns) {
         superopt::Report r = superopt::run(lf, isa, o);
+        if (tput) {
+            tp_pops += r.pops;
+            tp_con += r.constructions;
+            tp_sim += r.simulations;
+        }
         if (r.improved || r.erased) any = true;
         if (stats && (r.windows || r.skipped_dead_def || r.skipped_flag_in ||
                     r.skipped_orig_fault))
             std::fprintf(stderr,
                          "[superopt] fn %d: windows=%u improved=%u erased=%u "
                          "pops=%llu saved=%lld units (attempted=%lld, dead_def=%u "
-                         "flag_in=%u undef=%u fault=%u exhaust=%u)\n",
+                         "flag_in=%u undef=%u fault=%u exhaust=%u, "
+                         "t4: proven=%u refuted=%u unknown=%u probe=%u)\n",
                          static_cast<int>(lf.fid), r.windows, r.improved, r.erased,
                          static_cast<unsigned long long>(r.pops),
                          static_cast<long long>(r.committed_before - r.committed_after),
                          static_cast<long long>(r.attempted_cost), r.skipped_dead_def,
                          r.skipped_flag_in, r.skipped_undef_flags,
-                         r.skipped_orig_fault, r.budget_exhausted);
+                         r.skipped_orig_fault, r.budget_exhausted,
+                         r.tier4_proven, r.tier4_refuted, r.tier4_unknown,
+                         r.smt_selfchecks);
+    }
+    if (tput) {
+        t1 = std::chrono::steady_clock::now();
+        double sec =
+            std::chrono::duration<double>(t1 - t0).count();
+        if (sec > 0.0)
+            std::fprintf(stderr,
+                         "[superopt] search-core throughput: %.3fs | "
+                         "pops=%llu (%.2fM/s) constructions=%llu (%.2fM/s) "
+                         "simulations=%llu (%.2fM/s)\n",
+                         sec, static_cast<unsigned long long>(tp_pops),
+                         static_cast<double>(tp_pops) / sec / 1e6,
+                         static_cast<unsigned long long>(tp_con),
+                         static_cast<double>(tp_con) / sec / 1e6,
+                         static_cast<unsigned long long>(tp_sim),
+                         static_cast<double>(tp_sim) / sec / 1e6);
     }
     return any;
 }

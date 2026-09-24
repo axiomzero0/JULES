@@ -223,6 +223,25 @@ else
     pass=$((pass + 1))
 fi
 
+# Tier-4 verification (Z3): when the solver is present, the pass-92 commits
+# on t_superopt must be PROVEN equivalent (t4: proven>0, refuted=0). When
+# z3 is absent the assertion is skipped (the tier degrades to sampling).
+if command -v z3 >/dev/null 2>&1 || [ -x "$HOME/.venv/bin/z3" ]; then
+    t4=$(JULES_SUPEROPT_STATS=1 JULES_SUPEROPT_SMT_TIMEOUT=60 timeout 120 $JULESC tests/programs/t_superopt.jules -o "$WORK/a.bin" -O3 2>&1 |
+         awk '/superopt.*t4:/ {for (i = 1; i <= NF; ++i) if ($i ~ /^proven=/) {split($i, a, "="); p += a[2]} if ($i ~ /^refuted=/) {split($i, a, "="); r += a[2]}} END {print p + 0, r + 0}')
+    t4p=$(echo "$t4" | cut -d' ' -f1)
+    t4r=$(echo "$t4" | cut -d' ' -f2)
+    if [ "$t4p" = "0" ] || [ "$t4r" != "0" ]; then
+        echo "FAIL t_superopt [tier-4 proven=$t4p refuted=$t4r — expected proven>0 refuted=0]"
+        fail=$((fail + 1))
+    else
+        echo "PASS t_superopt [tier-4 Z3: proven=$t4p refuted=$t4r]"
+        pass=$((pass + 1))
+    fi
+else
+    echo "SKIP t_superopt [tier-4: no z3 binary on PATH]"
+fi
+
 # PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
 # Asserts: the instrumented binary's output is UNCHANGED (instrumentation
 # must not alter semantics), the profile exists and is non-trivial, the

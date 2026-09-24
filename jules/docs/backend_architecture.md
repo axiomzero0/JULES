@@ -322,10 +322,53 @@ the original's read+write set), and the never-fires-condition vector hole
 review; the first one caught two more latent soundness holes (imul/shift
 flag-truth, LeaSlot escape) after self-review and the suite were green.
 
-Honest limits (README has the full list): equivalence is sampled (12
-search + 84 commit lanes — the table is the substrate for a future
-SMT/BMC exhaustive verifier), the search is budget-incomplete by design
-(deterministic pop/candidate/state caps; missed wins acceptable, wrong
-code not), and the goal-first pop ordering trades minimality for
+Honest limits (README has the full list): the search is budget-incomplete
+by design (deterministic pop/candidate/state caps; missed wins acceptable,
+wrong code not), and the goal-first pop ordering trades minimality for
 reachability (the winner is strictly better than the original, not
 necessarily minimal).
+
+### The incremental verification ladder (Tier 4 = Z3)
+
+Equivalence verification is now TIERED, strongest last, each tier paying
+only for the survivors of the previous one — the structure that makes deep
+search affordable (Tier 1, the in-search goal test, refutes ~all candidates
+for ~300ns each; only the handful of committed winners reach the solver):
+
+1. Tier 1 — in-search vector equivalence (batch-0 lanes).
+2. Tier 2 — the commit gate's 7 fresh batches (84 lanes).
+3. Tier 3 — the concrete cross-probe: the SMT encoder re-evaluates the
+   ORIGINAL on the batch-0 inputs and must agree with the simulator
+   bit-for-bit (`JULES_SUPEROPT_SMT_SELFTEST=1`; aborts on disagreement —
+   the differential lock binding the two semantic sources).
+4. Tier 4 — the SMT equivalence proof (`x64_super_smt.cpp`): original and
+   candidate encoded symbolically over shared inputs, Z3 decides
+   equivalence on ALL inputs. Proven => commit certified; Refuted =>
+   commit rejected (catches unsampled fault inputs and poison-flag
+   coincidences the sampled lanes cannot see); Unknown (solver absent /
+   timeout) => degrades to the Tier-2 verdict unless
+   `JULES_SUPEROPT_SMT=2` requires proof.
+
+The encoder is a second semantic source, deliberately placed next to the
+sims in the same target directory and pinned to them by the Tier-3 lock
+(full suite passes under it). Policy via `JULES_SUPEROPT_SMT`
+(0 off / 1 best-effort default / 2 proof-required), solver as a subprocess
+(no link dependency; `JULES_Z3_BIN` overrides discovery).
+
+### Search-core throughput
+
+The per-node costs were restructured (2026-09-25) after measuring the
+engine at ~0.6M constructions/sec — every node paid a full-state
+fingerprint (240+ serially-chained splitmix64 calls), a 2.5KB state copy,
+and every pop re-seeded and re-simulated its whole program (~99% of pops
+under lazy Dijkstra are stale re-pops). The restructure: incremental
+XOR-fold fingerprints over per-position Zobrist terms, write-set journal
+in-place simulation (the Effects row IS the write set; the audit mode
+proves it), once-per-window seeds with replay only on non-stale pops, flat
+open-addressing dedup, fingerprints carried by queue entries. Measured on
+the throughput kernel with identical exploration (same pop/construction
+counts, same results): pops 0.23M -> 1.09M/sec, constructions 0.64M ->
+3.07M/sec, wall 5.16s -> 1.09s (4.75x). The remaining levers, in order:
+SIMD lane simulation (12 lanes fit 2 zmm vectors per location),
+lane-count-adaptive verification for the JIT path, and window-level
+parallelism for AOT.

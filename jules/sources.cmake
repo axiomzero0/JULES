@@ -120,5 +120,6 @@ src/core/son/passes/p42_loop_unrolling.cpp
     src/targets/x86_64/x64_emit.cpp
     src/targets/x86_64/x64_ra.cpp
     src/targets/x86_64/x64_super_isa.cpp
+    src/targets/x86_64/x64_super_smt.cpp
     src/targets/x86_64/x64_target.cpp
 )

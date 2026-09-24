@@ -112,16 +112,230 @@ bool row_effects(const TableIndex& idx, const Inst& i, Effects& e) {
     return true;
 }
 
-u64 fingerprint(const VState& st, u32 nslots) {
-    u64 h = 0x9E3779B97F4A7C15ull;
-    auto mix = [&](u64 x) { h = splitmix64(h ^ x); };
+// ---- incremental fingerprint (the throughput-critical restructure) -------
+//
+// The search constructs MILLIONS of candidate states per window; hashing
+// each from scratch (the splitmix chain above) costs ~1.3us per candidate
+// and dominated the entire engine. Instead the fingerprint is an XOR-fold
+// of per-position terms:
+//
+//     fp(S) = XOR over hashed positions p of term(Z[p], S[p])
+//     term(z, x) = avalanche((z ^ x) * PHI)
+//
+// Hashed positions: (gpr, lane), (window slot, lane), (flag, lane) — the
+// SAME location set the chain above hashes. The fold is a PURE function of
+// the state: any two paths that reach the same state produce the same
+// fingerprint, so it is path-independent under incremental update — remove
+// the old term, add the new one. A write updates only its own positions.
+//
+// Collision behavior is unchanged in KIND from the previous 64-bit hash:
+// a collision can only lose a win (a candidate is discarded as a duplicate
+// state), never invent one — the goal test compares exact states.
+
+inline u64 term64(u64 z, u64 x) {
+    u64 t = (z ^ x) * 0x9E3779B97F4A7C15ull;
+    return t ^ (t >> 31);
+}
+
+struct Zobrist {
+    // [position][lane]; positions: kMaxGpr GPRs, kMaxSlot slots, kNF flags
+    u64 z[kMaxGpr + kMaxSlot + kNF][kVecSearch];
+    Zobrist() {
+        u64 s = 0x5DEECE66Dull;
+        for (auto& row : z)
+            for (u64& x : row) x = splitmix64(s = splitmix64(s));
+    }
+};
+const Zobrist& ztable() {
+    static Zobrist z;
+    return z;
+}
+
+u64 fp_full(const VState& st, u32 nslots) {
+    const Zobrist& Z = ztable();
+    u64 h = 0;
     for (u32 v = 0; v < kVecSearch; ++v) {
-        for (u32 g = 0; g < kMaxGpr; ++g) mix(static_cast<u64>(st.r[v][g]));
-        for (u32 k = 0; k < nslots; ++k) mix(static_cast<u64>(st.s[v][k]));
-        for (u32 f = 0; f < kNF; ++f) mix(static_cast<u64>(st.f[v][f]));
+        for (u32 g = 0; g < kMaxGpr; ++g)
+            h ^= term64(Z.z[g][v], static_cast<u64>(st.r[v][g]));
+        for (u32 k = 0; k < nslots; ++k)
+            h ^= term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[v][k]));
+        for (u32 f = 0; f < kNF; ++f)
+            h ^= term64(Z.z[kMaxGpr + kMaxSlot + f][v],
+                        static_cast<u64>(st.f[v][f]));
     }
     return h;
 }
+
+// ---- write-set journal -------------------------------------------------
+//
+// Candidates simulate IN PLACE on the parent state (the 2.5KB VState copy
+// per construction was the second-largest cost). The journal saves the
+// write set BEFORE the sim (the set comes from the ISA row's Effects — the
+// same single source the liveness dataflow trusts) and restores it after,
+// keeping the parent pristine for the next construction.
+struct Journal {
+    u32 gr[4];               // written GPR indices (e.g. IDiv/MulHi write 2)
+    u32 ngr = 0;
+    i64 r[kVecSearch][4];
+    bool slot = false;      // window-local index of a written slot
+    u32 slot_idx = 0;
+    i64 s[kVecSearch];
+    bool flags = false;     // ANY flag write (defined or undefined-poison)
+    i64 f[kVecSearch][kNF];
+};
+
+void journal_save(Journal& j, const VState& st, const Effects& e,
+                  const i32* wslots, u32 nslots) {
+    j.ngr = 0;
+    for (u32 g = 0; g < kMaxGpr; ++g)
+        if (e.gpr_write & (1u << g)) {
+            // A row writing more than 4 GPRs would silently corrupt the
+            // parent state (the journal would drop writes). No current row
+            // exceeds 2 (IDiv/MulHi: rax+rdx) — this abort is the invariant
+            // gate for future ISA rows.
+            if (j.ngr == 4) {
+                std::fprintf(stderr,
+                             "[superopt] journal overflow: op writes >4 GPRs "
+                             "(raise Journal::gr)\n");
+                std::abort();
+            }
+            j.gr[j.ngr++] = g;
+        }
+    for (u32 v = 0; v < kVecSearch; ++v)
+        for (u32 i = 0; i < j.ngr; ++i) j.r[v][i] = st.r[v][j.gr[i]];
+    j.slot = false;
+    if (e.slot_write >= 0) {
+        for (u32 s = 0; s < nslots; ++s) {
+            if (wslots[s] == e.slot_write) {
+                j.slot = true;
+                j.slot_idx = s;
+                break;
+            }
+        }
+        if (j.slot)
+            for (u32 v = 0; v < kVecSearch; ++v) j.s[v] = st.s[v][j.slot_idx];
+    }
+    j.flags = e.writes_flags || e.undef_flags;
+    if (j.flags)
+        for (u32 v = 0; v < kVecSearch; ++v)
+            for (u32 f = 0; f < kNF; ++f) j.f[v][f] = st.f[v][f];
+}
+
+void journal_restore(VState& st, const Journal& j) {
+    for (u32 v = 0; v < kVecSearch; ++v) {
+        for (u32 i = 0; i < j.ngr; ++i) st.r[v][j.gr[i]] = j.r[v][i];
+        if (j.slot) st.s[v][j.slot_idx] = j.s[v];
+        if (j.flags)
+            for (u32 f = 0; f < kNF; ++f) st.f[v][f] = j.f[v][f];
+    }
+}
+
+// XOR-fold delta over the journaled positions: old terms out, new in.
+u64 journal_fp_delta(const VState& st, const Journal& j, u32 nslots) {
+    const Zobrist& Z = ztable();
+    u64 d = 0;
+    for (u32 v = 0; v < kVecSearch; ++v) {
+        for (u32 i = 0; i < j.ngr; ++i) {
+            const u32 g = j.gr[i];
+            d ^= term64(Z.z[g][v], static_cast<u64>(j.r[v][i])) ^
+                 term64(Z.z[g][v], static_cast<u64>(st.r[v][g]));
+        }
+        if (j.slot) {
+            const u32 k = j.slot_idx;
+            d ^= term64(Z.z[kMaxGpr + k][v], static_cast<u64>(j.s[v])) ^
+                 term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[v][k]));
+        }
+        if (j.flags)
+            for (u32 f = 0; f < kNF; ++f)
+                d ^= term64(Z.z[kMaxGpr + kMaxSlot + f][v],
+                            static_cast<u64>(j.f[v][f])) ^
+                     term64(Z.z[kMaxGpr + kMaxSlot + f][v],
+                            static_cast<u64>(st.f[v][f]));
+    }
+    return d;
+}
+
+// ---- flat open-addressing maps (dedup + expanded-set) --------------------
+// Linear probing, fixed capacity per window (bounded by the states budget —
+// never grows, never rehashes; the std::unordered_map traffic was the last
+// measurable per-construction cost after the fingerprint and the copy).
+struct FlatMap {
+    std::vector<u64> fps;
+    std::vector<i32> costs;
+    std::vector<u8> used;
+    size_t mask = 0;
+    size_t count = 0;
+    size_t cap = 0;
+
+    void init(size_t want) {
+        size_t n = 16;
+        while (n < want * 2) {
+            n <<= 1;
+            if (n == 0) { n = 1; break; } // overflow guard (absurd budgets)
+        }
+        fps.assign(n, 0);
+        costs.assign(n, 0);
+        used.assign(n, 0);
+        mask = n - 1;
+        count = 0;
+        cap = n;
+    }
+
+    // True when `cost` improves on the recorded cost for `fp` (or the fp
+    // is new) — i.e. the caller should push. Mirrors the old
+    // find-then-maybe-insert on the unordered_map.
+    bool improve(u64 fp, i32 cost) {
+        size_t i = fp & mask;
+        while (used[i]) {
+            if (fps[i] == fp) {
+                if (costs[i] <= cost) return false;
+                costs[i] = cost;
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+        if (count * 2 >= cap) return false; // load factor gate (treat as cap)
+        used[i] = 1;
+        fps[i] = fp;
+        costs[i] = cost;
+        ++count;
+        return true;
+    }
+};
+
+struct FlatSet {
+    std::vector<u64> fps;
+    std::vector<u8> used;
+    size_t mask = 0;
+    size_t count = 0;
+    size_t cap = 0;
+
+    void init(size_t want) {
+        size_t n = 16;
+        while (n < want * 2) {
+            n <<= 1;
+            if (n == 0) { n = 1; break; }
+        }
+        fps.assign(n, 0);
+        used.assign(n, 0);
+        mask = n - 1;
+        count = 0;
+        cap = n;
+    }
+
+    bool insert(u64 fp) {
+        size_t i = fp & mask;
+        while (used[i]) {
+            if (fps[i] == fp) return false;
+            i = (i + 1) & mask;
+        }
+        if (count * 2 >= cap) return true; // full: claim present (stop)
+        used[i] = 1;
+        fps[i] = fp;
+        ++count;
+        return true;
+    }
+};
 
 // ---- regions (label-delimited basic blocks of the machine code) ----------
 
@@ -386,6 +600,23 @@ bool simulate(VState& st, const WindowCtx& c, const TableIndex& idx,
 
 Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
     Report rep;
+        // Hot-loop env lookups are hoisted ONCE (getenv is a linear scan of the
+    // environment; per-pop calls were measurable at the new rates). Same
+    // 0-disables semantics as the pass-layer knobs.
+    const bool trace = [] {
+        const char* v = std::getenv("JULES_SUPEROPT_TRACE");
+        return v && *v != '0';
+    }();
+    // AUDIT MODE: recompute the full XOR-fold after every in-place
+    // simulation and after every restore, and against the replayed
+    // state at every pop, and abort on mismatch. This is
+    // the differential lock proving the journal's write set (Effects)
+    // exactly covers what the sims write — the load-bearing assumption of
+    // the in-place restructure. Run the suite once with it on.
+    const bool audit = [] {
+        const char* v = std::getenv("JULES_SUPEROPT_AUDIT");
+        return v && *v != '0';
+    }();
     TableIndex idx(isa);
     if (lf.code.empty()) return rep;
     if (static_cast<u32>(lf.slot_count) > o.max_slots_fn) return rep;
@@ -634,6 +865,7 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
         u32 avail_slots;
         u8 avail_flags;
         u16 match; // contract locations already equal to the goal
+        u64 fp;   // the node's state fingerprint (incremental fold)
     };
     // POP ORDER: goal-distance first (match DESC), then cost, length,
     // insertion. A state whose match equals the full contract IS a goal
@@ -655,6 +887,15 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
         Inst inst;
         u32 parent;
     };
+    // STATES ARE NOT STORED per node (2.5KB x every pushed candidate was
+    // 300MB+ under large budgets, and the page-fault churn ate 40% of wall
+    // time). Instead: the seed is computed ONCE per window; a pop that
+    // survives the stale check materializes its state by replaying its
+    // <=40-instruction program from the cached seed. Stale pops (the
+    // overwhelming majority under lazy Dijkstra) just compare the
+    // fingerprint carried by the queue entry — no state, no replay.
+    // Self-healing by construction: every expanded state is derived from
+    // the seed + true instruction semantics, never from a mutated cache.
 
     u32 fn_pops_left = o.pops_per_fn;
 
@@ -674,6 +915,34 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
         }
         rep.attempted_cost += c.orig_cost;
         ++rep.windows;
+
+        // The batch-0 seed is a pure function of the window — compute it
+        // ONCE (the old code re-derived it per pop: 312 splitmix64 calls).
+        // Needed by the cross-probe below, the Dijkstra root, and pop replay.
+        VState seed0;
+        seed_state(seed0, 0, c.nslots, c.immpool.data(),
+                   static_cast<u32>(c.immpool.size()));
+
+        // Tier-3 cross-probe: the SMT encoder must reproduce the simulator's
+        // ORIGINAL-window result on the batch-0 concrete inputs, bit for bit,
+        // before any of its equivalence verdicts may be trusted this run.
+        if (o.tier4_selftest) {
+            Tier4Query q;
+            q.lf = &lf;
+            q.w0 = c.w0;
+            q.w1 = c.w1;
+            q.seed = &seed0;
+            q.orig_final = &orig_final;
+            q.livein_gpr = c.livein_gpr;
+            q.livein_slots = c.livein_slots;
+            q.contract_gpr = c.contract_gpr;
+            q.contract_slots = c.contract_slots;
+            q.contract_flags = c.contract_flags;
+            for (u32 s = 0; s < c.nslots; ++s) q.slots[s] = c.slots[s];
+            q.nslots = c.nslots;
+            o.tier4_selftest(q); // aborts loudly on any disagreement
+            ++rep.smt_selfchecks;
+        }
 
         // -- pools ---------------------------------------------------------
         pool_r.clear();
@@ -712,22 +981,25 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
         // CONSTRUCTED FIRST — the expensive one blocks the cheap one
         // forever. The correct structure: keep the best known cost per
         // state, push improvements, skip stale entries at pop time.
-        std::unordered_map<u64, i32> best;
-        std::unordered_set<u64> expanded;
+        FlatMap best;
+        best.init(o.states_per_window + 8);
+        FlatSet expanded;
+        // pops <= pops_per_window (the while-condition budget); improvements
+        // can out-pop it, so clamp — a full set claims "fresh" (extra work,
+        // still sound: dedup is a budget device, equivalence is tested
+        // exactly).
+        expanded.init(std::min<size_t>(o.pops_per_window, 500000u) + 8);
         std::priority_queue<QEnt, std::vector<QEnt>, QEntGreater> pq;
         u32 seq = 0;
         u32 pops = 0;
         bool state_cap_hit = false;
 
-        {
-            VState seed;
-            seed_state(seed, 0, c.nslots, c.immpool.data(),
-                       static_cast<u32>(c.immpool.size()));
-            best[fingerprint(seed, c.nslots)] = 0;
-            QEnt root{0, 0, seq++, 0, c.livein_gpr, c.livein_slots, 0,
-                      static_cast<u16>(contract_matches(seed, orig_final, c))};
-            pq.push(root);
-        }
+        const u64 root_fp = fp_full(seed0, c.nslots);
+        best.improve(root_fp, 0);
+        QEnt root{0, 0, seq++, 0, c.livein_gpr, c.livein_slots, 0,
+                  static_cast<u16>(contract_matches(seed0, orig_final, c)),
+                  root_fp};
+        pq.push(root);
 
         std::vector<Inst> winner;
         bool have_winner = false;
@@ -744,25 +1016,46 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
             --fn_pops_left;
             rep.pops += 1;
 
-            // rebuild the program and its state
+            if (!expanded.insert(e.fp)) continue; // stale queue entry
+
+            // Materialize the popped state: replay this node's program from
+            // the cached seed (self-healing: derived from true semantics,
+            // never from a mutated cache). Only non-stale pops pay this.
             Inst prog[40];
             u32 n = 0;
-            for (u32 node = e.node; node != 0 && n < 40; node = arena[node].parent)
+            for (u32 node = e.node; node != 0 && n < 40;
+                 node = arena[node].parent)
                 prog[n++] = arena[node].inst;
             if (n > 1) // (n == 0 is the root: the empty program)
-                for (u32 a = 0, b = n - 1; a < b; ++a, --b) std::swap(prog[a], prog[b]);
+                for (u32 a = 0, b = n - 1; a < b; ++a, --b)
+                    std::swap(prog[a], prog[b]);
 
-            VState st;
-            if (!simulate(st, c, idx, prog, n, 0)) continue; // cannot happen
+            VState st = seed0;
+            bool replay_ok = true;
+            for (u32 k = 0; k < n; ++k) {
+                if (static_cast<u32>(prog[k].op) >= idx.by_op.size() ||
+                    !idx.by_op[static_cast<size_t>(prog[k].op)] ||
+                    !idx.by_op[static_cast<size_t>(prog[k].op)]->sim(
+                        st, c.slots, c.nslots, prog[k])) {
+                    replay_ok = false; // cannot happen (the construction
+                                        // sim succeeded for this program)
+                    break;
+                }
+            }
+            if (!replay_ok) continue;
+            if (audit && fp_full(st, c.nslots) != e.fp) {
+                std::fprintf(stderr,
+                             "[so-audit] POP CHAIN MISMATCH: the incremental "
+                             "fingerprint disagrees with the replayed state\n");
+                std::abort();
+            }
 
-            const u64 stfp = fingerprint(st, c.nslots);
-            if (!expanded.insert(stfp).second) continue; // stale queue entry
-
-            if (std::getenv("JULES_SUPEROPT_TRACE") && n <= 2)
+            if (trace && e.len <= 2)
                 std::fprintf(stderr,
                              "[so-trace] pop len=%u cost=%d match=%u cands=%u "
                              "states=%zu pq=%zu op=%d\n",
-                             n, e.cost, e.match, cands, best.size(), pq.size(),
+                             e.len, e.cost, e.match, cands, best.count,
+                             pq.size(),
                              n ? static_cast<int>(prog[n - 1].op) : -1);
             if (contract_ok(st, orig_final, c)) {
                 // first goal pop under match-first ordering (see above)
@@ -873,6 +1166,7 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
                         }
                     }
                     ++made_this_pop;
+                    ++rep.constructions;
                     if (cands++ >= o.candidates_per_window) {
                         cand_cap = true;
                         break;
@@ -899,33 +1193,64 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
                     if (ncost > c.orig_cost || nlen > c.orig_len + o.max_growth)
                         continue;
 
-                    VState child = st;
-                    if (!row.sim(child, c.slots, c.nslots, tin)) continue;
-                    const u64 fp = fingerprint(child, c.nslots);
-                    {
-                        auto it = best.find(fp);
-                        if (it != best.end() && it->second <= ncost) continue;
-                        best[fp] = ncost;
+                    // -- in-place extension (journal) ------------------------
+                    // The child state IS the parent state plus one write set;
+                    // the 2.5KB full-state copy per construction is gone.
+                    // Save the write set, simulate in place, fold the
+                    // fingerprint delta over the SAME positions, then
+                    // restore — win or lose, the parent ends pristine.
+                    Journal jr;
+                    journal_save(jr, st, ef, c.slots, c.nslots);
+                    ++rep.simulations;
+                    if (row.sim(st, c.slots, c.nslots, tin)) {
+                        const u64 nfp = e.fp ^ journal_fp_delta(st, jr, c.nslots);
+                        if (audit && fp_full(st, c.nslots) != nfp) {
+                            std::fprintf(stderr,
+                                         "[so-audit] FOLD MISMATCH after sim: "
+                                         "op=%d (journal missed a write)\n",
+                                         static_cast<int>(tin.op));
+                            std::abort();
+                        }
+                        if (best.improve(nfp, ncost)) {
+                            if (best.count > o.states_per_window) {
+                                state_cap_hit = true;
+                                journal_restore(st, jr);
+                                if (audit && fp_full(st, c.nslots) != e.fp) {
+                                    std::fprintf(stderr,
+                                                 "[so-audit] RESTORE MISMATCH "
+                                                 "(state cap): op=%d "
+                                                 "(parent state corrupted)\n",
+                                                 static_cast<int>(tin.op));
+                                    std::abort();
+                                }
+                                break;
+                            }
+                            const u16 q_match = static_cast<u16>(
+                                contract_matches(st, orig_final, c));
+                            arena.push_back(ArenaNode{tin, e.node});
+                            QEnt q{ncost, static_cast<u16>(nlen), seq++,
+                                   static_cast<u32>(arena.size() - 1),
+                                   e.avail_gpr | ef.gpr_write, e.avail_slots,
+                                   (e.avail_flags || ef.writes_flags ||
+                                    ef.undef_flags)
+                                       ? u8(1)
+                                       : u8(0),
+                                   q_match, nfp};
+                            if (ef.slot_write >= 0)
+                                for (u32 s = 0; s < c.nslots; ++s)
+                                    if (c.slots[s] == ef.slot_write)
+                                        q.avail_slots |= (1u << s);
+                            pq.push(q);
+                        }
                     }
-                    if (best.size() > o.states_per_window) {
-                        state_cap_hit = true;
-                        break;
+                    journal_restore(st, jr);
+                    if (audit && fp_full(st, c.nslots) != e.fp) {
+                        std::fprintf(stderr,
+                                     "[so-audit] RESTORE MISMATCH: op=%d "
+                                     "(parent state corrupted)\n",
+                                     static_cast<int>(tin.op));
+                        std::abort();
                     }
-                    const u16 q_match =
-                        static_cast<u16>(contract_matches(child, orig_final, c));
-                    arena.push_back({tin, e.node});
-                    QEnt q{ncost, static_cast<u16>(nlen), seq++,
-                           static_cast<u32>(arena.size() - 1),
-                           e.avail_gpr | ef.gpr_write, e.avail_slots,
-                           (e.avail_flags || ef.writes_flags || ef.undef_flags)
-                               ? u8(1)
-                               : u8(0),
-                           q_match};
-                    if (ef.slot_write >= 0)
-                        for (u32 s = 0; s < c.nslots; ++s)
-                            if (c.slots[s] == ef.slot_write)
-                                q.avail_slots |= (1u << s);
-                    pq.push(q);
                 }
                 if (state_cap_hit || cand_cap) break;
             }
@@ -950,6 +1275,39 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
                 if (!contract_ok(c2, o2, c)) ok = false;
             }
             if (ok) {
+                // Tier 4 — the SMT equivalence proof (Z3). Refuted winners
+                // are rejected HERE, after passing all the sampled lanes:
+                // this is the tier that catches what sampling cannot see
+                // (unsampled fault inputs, poison-flag coincidences).
+                if (o.tier4) {
+                    Tier4Query q;
+                    q.lf = &lf;
+                    q.w0 = c.w0;
+                    q.w1 = c.w1;
+                    q.cand = winner.data();
+                    q.ncand = static_cast<u32>(winner.size());
+                    q.seed = &seed0;
+                    q.orig_final = &orig_final;
+                    q.livein_gpr = c.livein_gpr;
+                    q.livein_slots = c.livein_slots;
+                    q.contract_gpr = c.contract_gpr;
+                    q.contract_slots = c.contract_slots;
+                    q.contract_flags = c.contract_flags;
+                    for (u32 s = 0; s < c.nslots; ++s) q.slots[s] = c.slots[s];
+                    q.nslots = c.nslots;
+                    const Verdict v = o.tier4(q);
+                    if (v == Verdict::Refuted) {
+                        ok = false;
+                        ++rep.tier4_refuted;
+                    } else if (v == Verdict::Proven) {
+                        ++rep.tier4_proven;
+                    } else {
+                        ++rep.tier4_unknown;
+                        if (o.tier4_required) ok = false;
+                    }
+                }
+            }
+            if (ok) {
                 if (winner.empty()) ++rep.erased;
                 else ++rep.improved;
                 i32 after = 0;
@@ -961,7 +1319,7 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
                                 : 1;
                 rep.committed_before += c.orig_cost;
                 rep.committed_after += after;
-                if (std::getenv("JULES_SUPEROPT_TRACE"))
+                if (trace)
                     std::fprintf(stderr,
                                  "[so-commit] win [%u,%u) orig_cost=%d -> %d "
                                  "len=%zu contract gpr=%x slots=%x flags=%d\n",
@@ -973,12 +1331,12 @@ Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
         } else if (pops >= o.pops_per_window || state_cap_hit || cand_cap) {
             ++rep.budget_exhausted;
         }
-        if (std::getenv("JULES_SUPEROPT_TRACE"))
+        if (trace)
             std::fprintf(stderr,
                          "[so-trace] window [%u,%u) done: winner=%d pops=%u "
                          "cands=%u states=%zu pq=%zu cap=%d orig_cost=%d\n",
                          c.w0, c.w1, have_winner ? 1 : 0, pops, cands,
-                         best.size(), pq.size(), state_cap_hit ? 1 : 0,
+                         best.count, pq.size(), state_cap_hit ? 1 : 0,
                          c.orig_cost);
     }
 
