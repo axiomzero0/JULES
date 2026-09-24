@@ -8564,3 +8564,2283 @@ If code cannot prove:
 then it does not belong in the codebase.
 
 It is either fixed, quarantined, or exterminated.
+
+
+Add this as a new normative chapter.
+
+I am using **HPC** here as **High-Performance Compiler**. If you meant **High-Performance Computing**, the chapter can be renamed and retargeted, but the strictness model stays the same.
+
+---
+
+# 38. HPC: High-Performance Compiler Conformance
+
+This chapter extends CEP&CC for compilers, linkers, assemblers, JIT compilers, IR transformers, profile-guided optimizers, code generators, and binary instrumentation tools.
+
+This chapter is normative.
+
+A compiler is not compliant merely because it produces fast output. A compiler is compliant only if its translation behavior is correct, deterministic, measurable, secure, auditable, and reproducible.
+
+For HPC compilers, the following are first-class correctness requirements:
+
+1. semantic correctness,
+2. deterministic translation,
+3. bounded compile time,
+4. bounded compile memory,
+5. explicit optimization legality,
+6. explicit target assumptions,
+7. measurable codegen quality,
+8. reproducible artifacts,
+9. secure handling of untrusted input,
+10. provable or evidence-backed optimality claims.
+
+This chapter does not replace CEP&CC. It extends it. Where this chapter is stricter, this chapter wins. Where this chapter is silent, the rest of CEP&CC applies.
+
+---
+
+## 38.1 Scope
+
+This chapter applies to all of the following:
+
+- ahead-of-time compilers,
+- JIT compilers,
+- interpreters with optimizing tiers,
+- IR-to-IR transformers,
+- linkers,
+- LTO pipelines,
+- assemblers,
+- disassemblers used as verification tools,
+- binary rewriting tools,
+- profile-guided optimization pipelines,
+- code generators,
+- instruction schedulers,
+- register allocators,
+- vectorizers,
+- loop transformers,
+- target-specific backends,
+- compiler plugins,
+- compiler driver pipelines,
+- build-time code generators that emit compiler-relevant artifacts.
+
+If a tool can change observable program semantics, it is inside the HPC boundary.
+
+If a tool can affect generated machine code quality, it is inside the HPC boundary.
+
+If a tool can affect compile-time performance determinism, it is inside the HPC boundary.
+
+---
+
+## 38.2 HPC prime law
+
+The HPC prime law is:
+
+> A compiler must never silently change the meaning of a program.
+> A compiler must never silently trade correctness for performance.
+> A compiler must never silently introduce nondeterministic translation.
+> A compiler must never silently exceed compile-time budgets.
+> A compiler must never silently exploit an assumption that is not documented and enforced.
+
+Violations of the HPC prime law are Severity 0 unless proven otherwise by an explicit, reviewed, temporary waiver.
+
+---
+
+## 38.3 HPC conformance classes
+
+HPC defines compiler component classes. These map onto CEP classes but add compiler-specific meaning.
+
+### 38.3.1 HPC-0: Compiler-critical hot code
+
+HPC-0 is the strictest compiler class.
+
+HPC-0 code includes:
+
+- lexer hot paths,
+- parser hot paths,
+- preprocessor hot paths,
+- module import hot paths,
+- AST lowering,
+- IR construction,
+- IR verification,
+- IR normalization,
+- optimization passes,
+- alias analysis,
+- value tracking,
+- dependence analysis,
+- loop analysis,
+- vectorization,
+- instruction selection,
+- register allocation,
+- instruction scheduling,
+- machine IR lowering,
+- emission,
+- relocation handling,
+- JIT patching,
+- runtime code generation,
+- deoptimization,
+- binary hot rewriting.
+
+HPC-0 components must satisfy all CEP-0 requirements unless explicitly waived.
+
+HPC-0 components must additionally satisfy this chapter.
+
+### 38.3.2 HPC-1: Deterministic compiler support code
+
+HPC-1 includes compiler code that must be deterministic but is not necessarily cycle-exact.
+
+Examples:
+
+- diagnostics,
+- configuration loading,
+- target description loading,
+- symbol table management,
+- debug info construction,
+- LTO merging,
+- serialization,
+- module cache handling,
+- profile ingestion,
+- remark generation,
+- compile orchestration,
+- linker script parsing,
+- archive handling.
+
+HPC-1 must be deterministic unless explicitly documented otherwise.
+
+HPC-1 must satisfy CEP-1 requirements.
+
+### 38.3.3 HPC-2: Offline compiler tooling
+
+HPC-2 includes offline tools where runtime determinism is less important, but output correctness remains mandatory.
+
+Examples:
+
+- table generators,
+- opcode generators,
+- diagnostic generators,
+- target description generators,
+- benchmark harnesses,
+- fuzz harness generators,
+- documentation generators,
+- compile-database tools.
+
+HPC-2 tools must produce deterministic outputs if those outputs enter the compiler build.
+
+Generated code is subject to the same rules as handwritten code.
+
+---
+
+## 38.4 Compiler correctness hierarchy
+
+HPC compilers must obey the following correctness hierarchy.
+
+Highest priority:
+
+1. semantic correctness,
+2. memory safety,
+3. deterministic translation,
+4. security,
+5. compile-time boundedness,
+6. generated-code performance,
+7. compile-time speed,
+8. compiler maintainability,
+9. compiler convenience.
+
+A lower-priority goal must never defeat a higher-priority requirement.
+
+Examples:
+
+- Faster compilation must not cause miscompilation.
+- Better optimization must not break determinism.
+- Better diagnostics must not change codegen silently.
+- Smaller binaries must not remove required security checks.
+- Simpler pass code must not rely on silent IR assumptions.
+
+---
+
+## 38.5 Miscompilation policy
+
+Miscompilation is a Severity 0 defect.
+
+A miscompilation exists if the compiler emits code that violates the observable behavior of the source program under the documented language standard, target ABI, and selected compiler options.
+
+Miscompilation includes:
+
+- incorrect control flow,
+- incorrect data flow,
+- incorrect memory ordering,
+- incorrect floating-point behavior under selected flags,
+- incorrect exception behavior,
+- incorrect lifetime handling,
+- incorrect initialization,
+- incorrect destructor ordering,
+- incorrect volatile behavior,
+- incorrect atomic behavior,
+- incorrect thread-local behavior,
+- incorrect inline assembly handling,
+- incorrect relocation,
+- incorrect debug info that changes codegen semantics,
+- incorrect profile-guided transformation,
+- incorrect LTO merging,
+- incorrect JIT patching,
+- incorrect deoptimization state.
+
+A miscompilation discovered after merge requires:
+
+1. immediate revert or quarantine,
+2. regression test,
+3. minimal reproducer,
+4. root-cause analysis,
+5. lint or CI rule where possible,
+6. extermination report.
+
+---
+
+## 38.6 Internal compiler error policy
+
+An internal compiler error is a compiler crash, assertion failure, abort, or uncontrolled diagnostic failure.
+
+### 38.6.1 Valid input
+
+An internal compiler error on valid input is Severity 0.
+
+Valid input means source code, IR, profile data, object files, or link inputs accepted by the documented compiler interface.
+
+### 38.6.2 Invalid input
+
+An internal compiler error on invalid input is Severity 1 unless it is exploitable.
+
+For invalid input, the compiler should emit:
+
+- clear diagnostics,
+- source location where possible,
+- no secret leakage,
+- no unbounded resource usage,
+- no memory unsafety.
+
+### 38.6.3 Compiler robustness
+
+The compiler must not:
+
+- crash on malformed but syntactically bounded input without diagnostics,
+- hang indefinitely,
+- consume unbounded memory,
+- emit partial invalid artifacts silently,
+- continue translation after unrecoverable semantic failure.
+
+If compilation cannot continue, the compiler must fail loudly and deterministically.
+
+---
+
+## 38.7 Language conformance requirements
+
+An HPC compiler must document its language conformance state.
+
+Required documentation:
+
+- supported language standard,
+- unsupported language features,
+- partially supported features,
+- implementation-defined behavior catalog,
+- target-specific behavior catalog,
+- ABI assumptions,
+- library assumptions,
+- feature-test macro behavior,
+- module support status,
+- contract support status,
+- reflection support status,
+- floating-point model,
+- exception model,
+- thread model,
+- atomic model.
+
+For C++26 compilers, the compiler must maintain a feature matrix.
+
+Example:
+
+```text
+docs/compiler/cxx26_feature_matrix.md
+```
+
+The feature matrix must include:
+
+```text
+feature | status | gate | notes | tests | evidence
+```
+
+Silent language-feature fallback is banned.
+
+If a feature is unavailable, the compiler must either:
+
+1. reject the code with a clear diagnostic, or
+2. gate the feature through an explicit documented mechanism.
+
+---
+
+## 38.8 Implementation-defined behavior policy
+
+Implementation-defined behavior is allowed only if it is:
+
+- named,
+- documented,
+- target-controlled,
+- tested,
+- visible in diagnostics where relevant.
+
+The compiler must provide an implementation-defined behavior catalog.
+
+The catalog must include:
+
+- type sizes,
+- signedness of `char`,
+- alignment rules,
+- endianness,
+- floating-point model,
+- exception ABI,
+- name mangling rules,
+- TLS model,
+- attribute behavior,
+- pragma behavior,
+- diagnostic behavior,
+- module cache behavior,
+- initialization order rules,
+- linkage rules,
+- visibility rules.
+
+Undocumented implementation-defined behavior is a Severity 1 defect.
+
+If implementation-defined behavior affects security or optimization legality, it is Severity 0 until documented.
+
+---
+
+## 38.9 Undefined behavior policy
+
+Compilers must not use undefined behavior as a silent optimization license.
+
+Allowed optimization based on undefined behavior is only permitted if all of the following are true:
+
+1. The language standard permits the assumption.
+2. The compiler option explicitly enables the behavior.
+3. The behavior is documented.
+4. The optimization is diagnosable where possible.
+5. The optimization does not break security-critical bounds checks unless explicitly allowed.
+6. The optimization is testable.
+7. The optimization can be disabled.
+
+Banned:
+
+- silently removing security checks because of UB assumptions,
+- silently deleting overflow checks,
+- silently removing bounds checks,
+- silently assuming unreachable code is dead,
+- silently transforming suspicious code into faster but semantically different code.
+
+If a compiler exploits UB, the pass must state:
+
+```cpp
+// CEP:HPC-UB: Uses strict-aliasing UB assumption.
+// CEP:HPC-UB-GATE: -fstrict-aliasing.
+// CEP:HPC-UB-PROOF: no type-punning across analyzed region.
+```
+
+---
+
+## 38.10 Deterministic translation
+
+HPC compilers must be deterministic by default.
+
+Deterministic translation means:
+
+> Same source + same compiler version + same flags + same target configuration + same dependencies + same profile data + same environment contract = same diagnostics, same IR, same object output, same disassembly, same remarks, same debug artifacts.
+
+Allowed exceptions must be explicit and documented.
+
+Examples of allowed intentional variation:
+
+- embedded build timestamp if enabled by explicit option,
+- embedded source path if enabled by explicit option,
+- randomized ASLR-related runtime behavior not present in object output.
+
+Banned sources of nondeterminism:
+
+- pointer address hashing,
+- unordered container iteration order,
+- hash map iteration order,
+- file iteration order,
+- directory iteration order,
+- environment variables unless explicitly declared,
+- locale,
+- timezone,
+- current time,
+- random seeds,
+- thread scheduling order,
+- unstable module cache keys,
+- unstable pass IDs,
+- unstable symbol ordering,
+- unstable diagnostic ordering,
+- unstable temporary file names embedded into output,
+- unstable build paths embedded into output unless remapped.
+
+Parallel compilation must produce deterministic output.
+
+If parallel compilation cannot be made deterministic, parallelism must be disabled by default or explicitly gated.
+
+---
+
+## 38.11 Compile-time performance class
+
+Compile time is a performance cost.
+
+HPC compilers must treat compile-time and compile-memory as CEP costs.
+
+Every HPC-0 component must document:
+
+- expected compile time,
+- worst-case compile time,
+- expected memory usage,
+- worst-case memory usage,
+- input-size complexity,
+- IR-node complexity,
+- token complexity,
+- instantiation complexity,
+- pass repetition behavior,
+
+Required comment fields:
+
+```cpp
+// CEP:HPC-COMPILE-COST:
+// CEP:HPC-COMPILE-MEM:
+// CEP:HPC-COMPLEXITY:
+```
+
+Example:
+
+```cpp
+// CEP:HPC-COMPILE-COST: 18 ms for 10k IR nodes on reference machine.
+// CEP:HPC-COMPILE-MEM: 96 MB peak for 10k IR nodes.
+// CEP:HPC-COMPLEXITY: O(N) expected, O(N log N) worst-case.
+```
+
+Unbounded compile-time behavior is banned in HPC-0.
+
+Quadratic or worse behavior is allowed only if:
+
+- it is documented,
+- input bounds exist,
+- evidence exists,
+- regression gates exist.
+
+---
+
+## 38.12 Compile-time budgets
+
+HPC compiler projects must define compile-time budgets.
+
+Recommended budget categories:
+
+- lexer,
+- parser,
+- preprocessor,
+- module import,
+- template instantiation,
+- `constexpr` evaluation,
+- reflection expansion,
+- AST lowering,
+- IR construction,
+- IR verification,
+- optimization pipeline,
+- target lowering,
+- register allocation,
+- scheduling,
+- emission,
+- debug info,
+- link,
+- LTO,
+- JIT compilation,
+- profile loading.
+
+Budgets must be named constants, not magic numbers.
+
+Bad:
+
+```cpp
+if (pass_time > 500) fail();
+```
+
+Good:
+
+```cpp
+if (pass_time > cep::limit::hpc_pass_max_ms) fail();
+```
+
+Budget violations are CI failures unless waived.
+
+---
+
+## 38.13 Compiler input trust model
+
+Compiler input is untrusted until validated.
+
+Compiler inputs include:
+
+- source code,
+- headers,
+- modules,
+- precompiled headers,
+- IR,
+- bitcode,
+- object files,
+- archives,
+- linker scripts,
+- profiles,
+- configuration files,
+- target descriptions,
+- plugin binaries,
+- debug info,
+- symbol files.
+
+The compiler must define trust boundaries for each input class.
+
+Required questions:
+
+- What input is trusted?
+- What input is untrusted?
+- What input can be malicious?
+- What input can be huge?
+- What input can be recursive?
+- What input can exhaust memory?
+- What input can exhaust compile time?
+- What input can trigger code generation?
+- What input can trigger plugin loading?
+- What input can affect codegen legality?
+
+If no trust model exists, all compiler input is treated as untrusted.
+
+---
+
+## 38.15 Diagnostics
+
+Diagnostics are compiler output and therefore subject to determinism and security rules.
+
+Diagnostics must be:
+
+- stable across runs,
+- deterministic in order,
+- source-location accurate,
+- machine-parseable where possible,
+- free of pointer addresses,
+- free of hash seeds,
+- free of environment leaks,
+- free of secret data,
+- bounded in count,
+- bounded in size.
+
+Diagnostics must not affect codegen unless explicitly documented.
+
+If diagnostics affect codegen, the effect must be gated and tested.
+
+Required diagnostic metadata:
+
+```text
+diagnostic ID
+severity
+source location
+component
+message
+suggestion
+note
+```
+
+Diagnostic IDs must be stable.
+
+Diagnostic text may change, but diagnostic meaning must not silently change.
+
+---
+
+## 38.16 Optimization remarks
+
+Optimization remarks are evidence of compiler behavior.
+
+HPC compilers should emit machine-readable remarks for:
+
+- inlining,
+- vectorization,
+- loop unrolling,
+- loop interchange,
+- loop fusion,
+- loop distribution,
+- LICM,
+- common subexpression elimination,
+- dead code elimination,
+- function specialization,
+- register allocation spills,
+- scheduling changes,
+- branch elimination,
+- profile use,
+- PGO mismatches,
+- target-specific lowering.
+
+Remarks must be deterministic.
+
+Remarks must not leak:
+
+- secrets,
+- environment paths unless remapped,
+- unstable IDs,
+- nondeterministic ordering.
+
+Remarks are not a substitute for evidence, but they are useful evidence.
+
+---
+
+## 38.17 IR contract
+
+The intermediate representation is a contract.
+
+An HPC compiler IR must be:
+
+- printable,
+- hashable,
+- versioned,
+- verifiable,
+- stable,
+- canonicalizable,
+- target-aware but not target-contaminated,
+- serializable if used across stages,
+- round-trippable if text IR is normative,
+- documented with semantic invariants.
+
+IR must not rely on:
+
+- pointer identity,
+- address order,
+- hash iteration order,
+- uninitialized metadata,
+- hidden target assumptions,
+- hidden pass ordering,
+- hidden global state.
+
+IR nodes must have stable identity within a compilation unit unless identity is explicitly documented as unstable.
+
+---
+
+## 38.18 IR verification
+
+Every IR mutation must be verified.
+
+Required verifier checks:
+
+- type correctness,
+- use-def validity,
+- dominance validity,
+- terminator validity,
+- block linkage validity,
+- metadata validity,
+- target constraint validity,
+- alignment validity,
+- attribute validity,
+- linkage validity,
+- calling convention validity,
+- debug info consistency if debug info is IR-visible.
+
+IR verification must run:
+
+- after parsing/lowering,
+- after each HPC-0 pass,
+- before target lowering,
+- before emission,
+- after JIT patching where feasible.
+
+If verification is too expensive for a hot pass, the verifier may be split into cheap and full modes, but the full verifier must run in CI.
+
+Skipping IR verification in release is allowed only if:
+
+- the verifier cost is measured,
+- the safety argument is documented,
+- CI still runs full verification.
+
+---
+
+## 38.19 IR determinism
+
+IR must be deterministic.
+
+IR printing must use stable ordering:
+
+- stable function order,
+- stable block order,
+- stable instruction order,
+- stable metadata order,
+- stable attribute order,
+- stable debug order.
+
+IR hashing must not depend on:
+
+- pointer values,
+- allocation order,
+- hash seed,
+- map iteration order,
+- thread order.
+
+If IR is serialized, serialization must be deterministic.
+
+Serialized IR must include:
+
+- IR version,
+- compiler version,
+- target configuration hash,
+- pass pipeline hash,
+- feature gate hash.
+
+---
+
+## 38.20 Pass pipeline contract
+
+The pass pipeline must be explicit.
+
+Required pipeline documentation:
+
+- pass order,
+- pass version,
+- pass dependencies,
+- pass options,
+- pass enable/disable gates,
+- pass cost model,
+- pass target restrictions,
+- pass required analyses,
+- pass invalidated analyses,
+- pass preserved invariants,
+- pass evidence.
+
+The pass pipeline must be versioned.
+
+Bad:
+
+```text
+run optimizer
+```
+
+Good:
+
+```text
+pipeline: hpc-opt-2026-09
+passes: verify, canonicalize, inline, licm, gv, dce, lower-target
+```
+
+Changing pass order is a semantic event.
+
+Pass-order changes require:
+
+- review,
+- benchmark evidence,
+- golden IR update,
+- disassembly review,
+- regression test.
+
+---
+
+## 38.21 Pass certification
+
+Every HPC-0 pass must be certified.
+
+A pass is certified only if it has:
+
+1. purpose,
+2. legality conditions,
+3. input requirements,
+4. output guarantees,
+5. preserved invariants,
+6. invalidated analyses,
+7. cost model,
+8. failure policy,
+9. target dependencies,
+10. tests,
+11. golden IR,
+12. benchmark evidence,
+13. fuzz evidence where applicable.
+
+Required pass comment fields:
+
+```cpp
+// CEP:HPC-PASS:
+// CEP:HPC-PASS-KIND:
+// CEP:HPC-PASS-INPUT:
+// CEP:HPC-PASS-OUTPUT:
+// CEP:HPC-PASS-ANALYSIS-REQUIRED:
+// CEP:HPC-PASS-ANALYSIS-PRODUCED:
+// CEP:HPC-PASS-ANALYSIS-INVALIDATED:
+// CEP:HPC-PASS-LEGALITY:
+// CEP:HPC-PASS-PRESERVES:
+// CEP:HPC-PASS-COST:
+// CEP:HPC-PASS-FAILURE:
+// CEP:HPC-PASS-TARGET:
+// CEP:HPC-PASS-EVIDENCE:
+```
+
+Example:
+
+```cpp
+// CEP:HPC-PASS: licm
+// CEP:HPC-PASS-KIND: loop transformation
+// CEP:HPC-PASS-INPUT: SSA IR with loop info
+// CEP:HPC-PASS-OUTPUT: SSA IR with hoisted invariant operations
+// CEP:HPC-PASS-ANALYSIS-REQUIRED: loop, dominance, alias, side-effect
+// CEP:HPC-PASS-ANALYSIS-PRODUCED: updated loop invariants
+// CEP:HPC-PASS-ANALYSIS-INVALIDATED: dominance, scalar evolution
+// CEP:HPC-PASS-LEGALITY: no side effects, no alias conflict, no control dependence change
+// CEP:HPC-PASS-PRESERVES: program semantics, memory ordering, exception behavior
+// CEP:HPC-PASS-COST: O(N) expected, O(N log N) worst-case
+// CEP:HPC-PASS-FAILURE: aborts transformation if legality cannot be proven
+// CEP:HPC-PASS-TARGET: target-independent
+// CEP:HPC-PASS-EVIDENCE: golden IR licm_01, fuzz licm_fuzz_04, bench HPC-113
+```
+
+---
+
+## 38.22 Pass legality
+
+A pass must not transform code unless legality is proven.
+
+Legality proof may include:
+
+- type rules,
+- alias analysis,
+- dependence analysis,
+- control-flow analysis,
+- memory-order analysis,
+- overflow analysis,
+- alignment analysis,
+- initialization analysis,
+- exception analysis,
+- target constraint analysis.
+
+If legality cannot be proven, the pass must not perform the transformation.
+
+Silent conservative fallback is allowed only if documented.
+
+Banned:
+
+- transforming because it is usually safe,
+- transforming because no test failed,
+- transforming because profiling suggests it,
+- transforming because target prefers it,
+- transforming because another compiler does it.
+
+Every transformation must answer:
+
+> Under what exact conditions is this transformation legal?
+
+If the answer is unknown, the transformation is not allowed.
+
+---
+
+## 38.23 Optimization assumption policy
+
+Optimizations often rely on assumptions.
+
+All optimization assumptions must be explicit.
+
+Examples:
+
+- no aliasing,
+- aligned access,
+- no overflow,
+- no NaN,
+- no side effects,
+- no exception,
+- no atomic synchronization,
+- no volatile access,
+- no signal interaction,
+- no interrupt interaction,
+- no concurrent mutation,
+- initialized memory,
+- finite loop,
+- known trip count,
+- known function visibility,
+- no interposition,
+- no dynamic loading interference.
+
+Each assumption must be one of:
+
+1. proven statically,
+2. enforced by runtime check,
+3. documented and gated by compiler option,
+4. documented as target-specific,
+5. rejected.
+
+Comment-only assumptions are banned.
+
+---
+
+## 38.24 Floating-point optimization policy
+
+Floating-point transformations are restricted.
+
+HPC compilers must not change floating-point semantics unless explicitly enabled.
+
+Banned by default:
+
+- reassociation,
+- contraction unless allowed,
+- fast-math behavior,
+- NaN elimination,
+- infinity elimination,
+- signed-zero elimination,
+- reciprocal transformation,
+- division-to-multiplication transformation,
+- vectorization that changes rounding,
+- errno behavior changes,
+- math library substitution without proof.
+
+Allowed floating-point optimizations must document:
+
+- rounding mode assumptions,
+- exception assumptions,
+- NaN assumptions,
+- infinity assumptions,
+- errno assumptions,
+- contraction policy,
+- vector-width impact,
+- target FMA behavior.
+
+If floating-point behavior is target-specific, it must live in target policy.
+
+---
+
+## 38.25 Loop transformation policy
+
+Loop transformations require dependence proof.
+
+Loop transformations include:
+
+- unrolling,
+- peeling,
+- fusion,
+- fission,
+- interchange,
+- reversal,
+- tiling,
+- vectorization,
+- parallelization,
+- invariant code motion,
+- induction variable simplification,
+- bound strengthening,
+- loop deletion,
+- loop rotation.
+
+Each loop transformation must document:
+
+- loop bounds,
+- trip count,
+- dependence proof,
+- alignment proof,
+- side-effect proof,
+- exit condition proof,
+- overflow proof,
+- exception behavior,
+- floating-point behavior,
+- vector legality,
+- scalar fallback behavior.
+
+Loop deletion is especially dangerous.
+
+A loop may be deleted only if the compiler proves:
+
+- no side effects,
+- no observable memory effects,
+- no volatile effects,
+- no atomic effects,
+- no exception effects,
+- no observable control-flow effects,
+- bounded or irrelevant execution.
+
+---
+
+## 38.26 Vectorization policy
+
+Vectorization is allowed only when legality is proven.
+
+Vectorizer must prove:
+
+- data dependence safety,
+- alignment,
+- trip count,
+- masked remainder handling,
+- scalar fallback,
+- memory ordering,
+- exception behavior,
+- floating-point semantics,
+- target vector ABI,
+- target register pressure,
+- target cost benefit.
+
+Vectorizer must not vectorize if:
+
+- dependence is unknown,
+- alignment is unknown and target requires alignment,
+- floating-point semantics would change,
+- exceptions would change,
+- atomics are present,
+- volatile accesses are present,
+- target cost model predicts regression,
+- code size regression exceeds budget.
+
+Vectorization evidence must include:
+
+- vector width,
+- vector instruction used,
+- scalar fallback path,
+- remainder handling,
+- alignment assumption,
+- measured performance,
+- disassembly hash.
+
+---
+
+## 38.27 Inlining policy
+
+Inlining is an optimization with semantic and compile-time consequences.
+
+Inlining decisions must be explainable.
+
+Required inlining data:
+
+- caller,
+- callee,
+- inlining cost,
+- inlining benefit,
+- code size impact,
+- compile time impact,
+- register pressure impact,
+- recursion safety,
+- exception safety,
+- debug impact,
+- target constraints.
+
+Inlining must not:
+
+- cause unbounded compile-time growth,
+- cause unbounded code size growth,
+- change observable initialization order,
+- change exception semantics,
+- change linkage semantics,
+- expose private symbols incorrectly,
+- break determinism.
+
+Inline heuristics must be versioned.
+
+---
+
+## 38.28 Interprocedural optimization policy
+
+Interprocedural optimization requires explicit visibility and linkage analysis.
+
+IPO includes:
+
+- cross-module inlining,
+- constant propagation across modules,
+- dead argument elimination,
+- function specialization,
+- global value numbering,
+- LTO optimization,
+- cross-TU alias analysis,
+- cross-TU devirtualization,
+- cross-TU whole-program analysis.
+
+IPO must prove:
+
+- linkage,
+- visibility,
+- interposition rules,
+- dynamic loading constraints,
+- symbol resolution rules,
+- initialization order constraints,
+- thread visibility constraints,
+- exception ABI constraints.
+
+If whole-program assumptions are used, they must be documented.
+
+Banned:
+
+- assuming no interposition without evidence,
+- assuming no dynamic loading without evidence,
+- assuming symbol visibility without checking,
+- assuming no concurrent access without proof.
+
+---
+
+## 38.29 Profile-guided optimization policy
+
+Profile data is compiler input.
+
+Profile data is untrusted until validated.
+
+Required profile validation:
+
+- schema version,
+- compiler version,
+- target hash,
+- binary hash,
+- source revision,
+- function ID validity,
+- counter validity,
+- checksum,
+- timestamp policy,
+- path normalization,
+- size bounds,
+- counter bounds.
+
+PGO must not change program semantics.
+
+PGO may influence:
+
+- inlining order,
+- block layout,
+- branch prediction hints,
+- function order,
+- cold/hot splitting,
+- register allocation heuristics,
+- unrolling thresholds.
+
+PGO must not:
+
+- remove required checks,
+- change memory ordering,
+- change floating-point semantics,
+- change exception behavior,
+- change observable initialization,
+- change diagnostics semantics.
+
+Profile mismatch must be detected.
+
+If profile mismatch is detected, the compiler must either:
+
+1. fail,
+2. ignore profile with diagnostic,
+3. fall back to non-PGO pipeline.
+
+Silent use of stale profile is banned.
+
+---
+
+## 38.30 Target hooks
+
+All target-specific compiler behavior must go through explicit target hooks.
+
+Banned in generic compiler code:
+
+```cpp
+if (is_arm64) ...
+```
+
+```cpp
+if (is_x86_64) ...
+```
+
+```cpp
+#if defined(__riscv)
+...
+#endif
+```
+
+Allowed:
+
+```cpp
+target.hook.lower_instruction(insn);
+```
+
+or:
+
+```cpp
+target_policy.schedule(instruction);
+```
+
+Target hooks must be:
+
+- versioned,
+- documented,
+- deterministic,
+- tested,
+- measured,
+- isolated in target directories.
+
+Target hooks must declare:
+
+- target name,
+- target revision,
+- ISA level,
+- ABI,
+- endianness,
+- pointer width,
+- register file,
+- alignment rules,
+- vector width,
+- cache parameters,
+- latency model,
+- cost model version.
+
+---
+
+## 38.31 Target cost model
+
+A target cost model is mandatory for HPC compilers.
+
+The cost model must include:
+
+- instruction latency,
+- instruction throughput,
+- issue width,
+- register pressure,
+- spill cost,
+- branch cost,
+- misprediction cost,
+- memory latency,
+- cache behavior,
+- alignment cost,
+- vector operation cost,
+- scalar-to-vector transition cost,
+- relocation cost,
+- call cost,
+- return cost,
+- exception cost,
+- TLS access cost,
+- atomic cost,
+- barrier cost.
+
+Cost model values must not be magic numbers.
+
+They must be named and sourced.
+
+Good:
+
+```cpp
+// CEP:HPC-TARGET-COST: arm64-a78 load latency = 4 cycles, target manual rev B.
+```
+
+Bad:
+
+```cpp
+constexpr int load_latency = 4;
+```
+
+Cost model changes require evidence.
+
+---
+
+## 38.32 Register allocation policy
+
+Register allocation is HPC-0.
+
+Register allocator must document:
+
+- register classes,
+- allocation order,
+- spill policy,
+- eviction policy,
+- coalescing policy,
+- rematerialization policy,
+- live range splitting,
+- interference graph construction,
+- target constraints,
+- debug behavior.
+
+Register allocation must be deterministic.
+
+Required evidence:
+
+- register pressure,
+- spill count,
+- spill code size,
+- rematerialization count,
+- copy count,
+- coalescing success rate,
+- allocation time,
+- allocation memory.
+
+Register allocator heuristics must be versioned.
+
+---
+
+## 38.33 Instruction scheduling policy
+
+Instruction scheduling is HPC-0.
+
+Scheduler must document:
+
+- dependence graph,
+- latency model,
+- issue model,
+- hazard model,
+- register pressure feedback,
+- branch handling,
+- memory ordering constraints,
+- target barriers,
+- anti-dependence handling,
+- output-dependence handling.
+
+Scheduler must preserve:
+
+- program order where required,
+- memory ordering,
+- volatile semantics,
+- atomic semantics,
+- exception semantics,
+- signal/interrupt constraints where documented.
+
+Scheduler must be deterministic.
+
+If scheduling is target-specific, it must be isolated in target code.
+
+---
+
+## 38.34 Emission policy
+
+Object emission is HPC-0.
+
+Emitter must guarantee:
+
+- deterministic object layout,
+- deterministic section order,
+- deterministic symbol order,
+- deterministic relocation order,
+- deterministic debug info order,
+- deterministic exception table order,
+- deterministic unwind info,
+- deterministic note sections.
+
+Emitter must not embed:
+
+- absolute source paths unless remapped,
+- user names,
+- host names,
+- timestamps unless explicitly enabled,
+- environment variables,
+- random values,
+- unstable temporary identifiers.
+
+Emitter evidence must include:
+
+- object hash,
+- section list,
+- symbol table hash,
+- relocation table hash,
+- disassembly hash.
+
+---
+
+## 38.35 Codegen evidence
+
+HPC compilers must provide codegen evidence for hot paths.
+
+Required evidence categories:
+
+- disassembly,
+- instruction count,
+- branch count,
+- call count,
+- indirect call count,
+- memory load count,
+- memory store count,
+- alignment behavior,
+- vector usage,
+- spill count,
+- stack usage,
+- code size,
+- relocation count,
+- exception table size,
+- debug info impact,
+- target cost estimate.
+
+For HPC-0 emitted functions, the compiler should provide:
+
+```cpp
+// CEP:HPC-CODEGEN:
+// CEP:HPC-CODEGEN-PROOF:
+```
+
+Example:
+
+```cpp
+// CEP:HPC-CODEGEN: target-optimal scalar loop for checksum on arm64-a78.
+// CEP:HPC-CODEGEN-PROOF: bench HPC-201, 1 load/add per element, 0 spills.
+```
+
+---
+
+## 38.36 Debug info policy
+
+Debug info must not silently change codegen.
+
+If debug info affects codegen, the effect must be documented.
+
+Examples:
+
+- debug intrinsics affecting scheduling,
+- debug variables affecting register allocation,
+- line tables affecting block layout,
+- debug labels affecting symbol order.
+
+Debug info must be deterministic.
+
+Debug info must not contain:
+
+- secrets,
+- environment variables,
+- absolute paths unless remapped,
+- unstable IDs,
+- nondeterministic ordering.
+
+Debug info generation must be budgeted.
+
+---
+
+## 38.37 Linker and LTO policy
+
+Linking is part of the compiler translation system.
+
+Linker requirements:
+
+- deterministic symbol resolution,
+- deterministic archive member order,
+- deterministic section placement,
+- deterministic relocation processing,
+- deterministic output hash,
+- no environment dependence,
+- no time dependence,
+- no locale dependence.
+
+LTO requirements:
+
+- deterministic bitcode merging,
+- deterministic partitioning,
+- deterministic optimization order,
+- deterministic symbol internalization,
+- deterministic dead stripping,
+- deterministic profile use.
+
+ThinLTO or equivalent parallel LTO must produce deterministic final output.
+
+If deterministic parallel LTO is impossible, it must be disabled by default or gated.
+
+---
+
+## 38.38 Binary layout policy
+
+Binary layout must be explicit.
+
+Required documentation:
+
+- section layout,
+- segment permissions,
+- alignment,
+- page size assumptions,
+- relocation types,
+- symbol visibility,
+- export table,
+- import table,
+- exception tables,
+- unwind tables,
+- TLS model,
+- note sections,
+- debug sections.
+
+Executable stack is banned unless explicitly required and documented.
+
+Writable and executable memory is banned unless required by JIT policy and security-reviewed.
+
+---
+
+## 38.39 JIT policy
+
+JIT compilers are HPC-0 when they generate executable code at runtime.
+
+JIT compilation must have explicit budgets:
+
+- compile latency,
+- compile memory,
+- code cache size,
+- patch time,
+- invalidation time,
+- deoptimization time,
+- relocation time,
+- symbol resolution time.
+
+JIT must enforce:
+
+- W^X,
+- code cache bounds,
+- relocation correctness,
+- patchpoint validity,
+- instruction alignment,
+- target hazard constraints,
+- thread synchronization during patching,
+- safe publication of generated code.
+
+JIT must be deterministic for the same:
+
+- input IR,
+- runtime configuration,
+- target state,
+- profile data,
+- patchpoint state.
+
+If deterministic JIT is impossible due to runtime state, the nondeterminism must be documented and bounded.
+
+JIT deoptimization must preserve program semantics.
+
+JIT must not execute untrusted generated code without:
+
+- validation,
+- sandboxing,
+- capability limits,
+- security review.
+
+---
+
+## 38.40 Runtime patching policy
+
+Runtime code patching is Severity 0 territory.
+
+Patching must prove:
+
+- target instruction sequence is safe to modify,
+- no thread can observe a partially patched state,
+- instruction boundaries are valid,
+- relocations are valid,
+- branch targets are valid,
+- cache coherency is handled,
+- pipeline hazards are handled,
+- rollback is possible if required.
+
+Patching must be logged or diagnosable in debug builds.
+
+Patching must not leak secrets.
+
+Patching failures must fail safely.
+
+---
+
+## 38.41 Compiler plugin policy
+
+Compiler plugins are security-critical.
+
+Plugins must be:
+
+- versioned,
+- reviewed,
+- deterministic,
+- sandboxed where possible,
+- explicitly loaded,
+- documented,
+- tested,
+- hash-pinned.
+
+Plugins must not:
+
+- silently change codegen,
+- silently change diagnostics,
+- silently change pass ordering,
+- introduce nondeterminism,
+- access network without approval,
+- access environment without approval,
+- leak source code,
+- leak secrets.
+
+A plugin that affects HPC-0 behavior is itself HPC-0-relevant.
+
+---
+
+## 38.42 Compiler supply chain
+
+Compiler supply chain is part of HPC security.
+
+Required:
+
+- pinned compiler version,
+- pinned assembler version,
+- pinned linker version,
+- pinned standard library version,
+- pinned runtime library version,
+- pinned target description version,
+- pinned pass pipeline version,
+- pinned cost model version,
+- pinned profile schema version,
+- artifact hashes,
+- reproducible builds.
+
+Banned:
+
+- fetching arbitrary compiler plugins during release builds,
+- fetching arbitrary target descriptions during release builds,
+- telemetry in release compiler builds,
+- nondeterministic package resolution,
+- mutable compiler toolchain tags,
+- unsigned compiler artifacts where signature policy exists.
+
+Self-hosted compilers must have bootstrap validation.
+
+Bootstrap validation should include:
+
+- stage comparison,
+- artifact hash comparison,
+- behavioral test suite,
+- benchmark comparison,
+- diagnostics comparison.
+
+---
+
+## 38.43 Compiler testing requirements
+
+HPC compilers require aggressive testing.
+
+Required test classes:
+
+1. language conformance tests,
+2. unit tests,
+3. IR golden tests,
+4. disassembly golden tests,
+5. diagnostic golden tests,
+6. pass legality tests,
+7. pass negative tests,
+8. target-specific tests,
+9. ABI tests,
+10. layout tests,
+11. exception tests,
+12. floating-point tests,
+13. atomic tests,
+14. concurrency tests,
+15. linker tests,
+16. LTO tests,
+17. PGO tests,
+18. JIT tests,
+19. deoptimization tests,
+20. fuzz tests,
+21. differential tests,
+22. miscompilation regression tests,
+23. compile-time benchmark tests,
+24. code-quality benchmark tests,
+25. determinism tests.
+
+A compiler change that cannot be tested is not mergeable.
+
+---
+
+## 38.44 Fuzzing requirements
+
+HPC compilers must fuzz:
+
+- lexer,
+- parser,
+- preprocessor,
+- module importer,
+- IR parser,
+- object parser,
+- linker input parser,
+- profile parser,
+- debug info parser,
+- target description parser,
+- plugin interface where possible.
+
+Fuzzing must detect:
+
+- crashes,
+- hangs,
+- memory safety bugs,
+- unbounded recursion,
+- unbounded memory,
+- unbounded compile time,
+- invalid diagnostics,
+- invalid IR generation,
+- invalid codegen,
+- assertion failures.
+
+Fuzz failures must be reducible.
+
+Every fuzz regression must have:
+
+- minimal reproducer,
+- test,
+- severity classification,
+- extermination report if merged previously.
+
+---
+
+## 38.45 Differential testing
+
+Differential testing is required where feasible.
+
+Differential testing compares compiler behavior against:
+
+- reference interpreter,
+- older stable compiler version,
+- alternative optimization level,
+- alternative backend,
+- sanitized execution,
+- formal model,
+- target simulator,
+- known-good disassembly.
+
+Differential testing must not assume the newer compiler is correct.
+
+When differential disagreement occurs, the compiler team must determine:
+
+- which behavior is standard-correct,
+- which behavior is target-correct,
+- which behavior is option-correct,
+- which compiler is defective.
+
+Differential mismatches are Severity 0 if they indicate miscompilation.
+
+---
+
+## 38.46 Translation validation
+
+Translation validation is strongly recommended.
+
+Where possible, HPC compilers should use:
+
+- SMT-based equivalence checking,
+- alive-style transformation validation,
+- IR invariant checking,
+- symbolic execution,
+- property-based testing,
+- proof-producing optimizers.
+
+Translation validation is not required for every pass, but passes with high miscompilation risk should prefer it.
+
+High-risk passes:
+
+- alias-based transformations,
+- loop transformations,
+- vectorization,
+- memory reordering,
+- dead code elimination,
+- speculative devirtualization,
+- profile-guided transformations,
+- floating-point transformations,
+- link-time optimizations.
+
+---
+
+## 38.47 Benchmarking HPC compilers
+
+HPC compiler benchmarking must measure both compiler cost and output quality.
+
+Required compiler-cost metrics:
+
+- wall compile time,
+- CPU time,
+- peak memory,
+- pass time,
+- pass memory,
+- template instantiation time,
+- constexpr evaluation time,
+- module import time,
+- LTO time,
+- link time,
+- JIT compile time.
+
+Required output-quality metrics:
+
+- runtime performance,
+- code size,
+- static object size,
+- instruction count,
+- branch count,
+- load/store count,
+- vectorization rate,
+- spill count,
+- stack usage,
+- relocation count,
+- debug info size.
+
+Benchmarks must be deterministic.
+
+Benchmark artifacts must include:
+
+- compiler version,
+- flags,
+- target,
+- input,
+- profile data hash,
+- environment contract,
+- artifact hashes,
+- measured results.
+
+---
+
+## 38.48 HPC CI gates
+
+CI must enforce HPC requirements.
+
+Required gates:
+
+1. C++26 or relevant language standard mode.
+2. Warnings as errors.
+3. Sanitizers clean.
+4. Determinism check.
+5. Golden IR check.
+6. Golden disassembly check.
+7. Diagnostic stability check.
+8. Pass legality test.
+9. Miscompilation regression suite.
+10. Fuzz suite.
+11. Compile-time benchmark gate.
+12. Compile-memory benchmark gate.
+13. Output-size gate.
+14. Runtime benchmark gate.
+15. Target matrix tests.
+16. PGO profile validation.
+17. LTO determinism check.
+18. JIT safety tests where applicable.
+19. Plugin policy check where applicable.
+20. Supply-chain pinning check.
+
+If any Severity 0 gate fails, merge is blocked.
+
+---
+
+## 38.49 HPC comment fields
+
+The following comment fields are added for HPC compilers.
+
+Required where relevant:
+
+```cpp
+// CEP:HPC-CLASS:
+// CEP:HPC-PASS:
+// CEP:HPC-PASS-KIND:
+// CEP:HPC-PASS-INPUT:
+// CEP:HPC-PASS-OUTPUT:
+// CEP:HPC-PASS-ANALYSIS-REQUIRED:
+// CEP:HPC-PASS-ANALYSIS-PRODUCED:
+// CEP:HPC-PASS-ANALYSIS-INVALIDATED:
+// CEP:HPC-PASS-LEGALITY:
+// CEP:HPC-PASS-PRESERVES:
+// CEP:HPC-PASS-COST:
+// CEP:HPC-PASS-FAILURE:
+// CEP:HPC-PASS-TARGET:
+// CEP:HPC-PASS-EVIDENCE:
+// CEP:HPC-IR:
+// CEP:HPC-TRANSFORM:
+// CEP:HPC-UB:
+// CEP:HPC-UB-GATE:
+// CEP:HPC-UB-PROOF:
+// CEP:HPC-COMPILE-COST:
+// CEP:HPC-COMPILE-MEM:
+// CEP:HPC-COMPLEXITY:
+// CEP:HPC-TARGET-MODEL:
+// CEP:HPC-CODEGEN:
+// CEP:HPC-CODEGEN-PROOF:
+// CEP:HPC-PGO:
+// CEP:HPC-JIT:
+// CEP:HPC-DETERMINISM:
+```
+
+---
+
+## 38.50 `CEP:HPC-CLASS`
+
+Use this field to identify HPC class.
+
+Allowed values:
+
+```text
+HPC-0
+HPC-1
+HPC-2
+```
+
+Example:
+
+```cpp
+// CEP:HPC-CLASS: HPC-0
+```
+
+---
+
+## 38.51 `CEP:HPC-IR`
+
+Use this field to describe IR role.
+
+Examples:
+
+```cpp
+// CEP:HPC-IR: Builds target-independent SSA from lowered AST.
+```
+
+```cpp
+// CEP:HPC-IR: Verifies dominance and use-def chains after optimization.
+```
+
+---
+
+## 38.52 `CEP:HPC-TRANSFORM`
+
+Use this field to describe transformation role.
+
+Examples:
+
+```cpp
+// CEP:HPC-TRANSFORM: Hoists loop-invariant memory loads.
+```
+
+```cpp
+// CEP:HPC-TRANSFORM: Vectorizes aligned fixed-trip-count loops.
+```
+
+---
+
+## 38.53 `CEP:HPC-DETERMINISM`
+
+Use this field to state deterministic behavior.
+
+Examples:
+
+```cpp
+// CEP:HPC-DETERMINISM: deterministic; no hash-order dependence.
+```
+
+```cpp
+// CEP:HPC-DETERMINISM: deterministic if parallelism disabled.
+```
+
+If nondeterminism exists:
+
+```cpp
+// CEP:HPC-DETERMINISM: nondeterministic due to optional parallel LTO; disabled by default.
+```
+
+---
+
+## 38.54 HPC review checklist
+
+A compiler change is HPC-compliant only if all relevant items are true.
+
+### Correctness
+
+- [ ] No miscompilation.
+- [ ] No silent semantic change.
+- [ ] No UB exploitation without gate.
+- [ ] No floating-point semantic change without gate.
+- [ ] No memory-order change.
+- [ ] No exception behavior change.
+- [ ] No initialization order change.
+- [ ] No ABI break.
+
+### Determinism
+
+- [ ] Diagnostics deterministic.
+- [ ] IR deterministic.
+- [ ] Object output deterministic.
+- [ ] Disassembly deterministic.
+- [ ] Remarks deterministic.
+- [ ] LTO deterministic.
+- [ ] PGO pipeline deterministic.
+- [ ] Parallel compilation deterministic or gated.
+
+### Compile-time performance
+
+- [ ] Compile-time budget documented.
+- [ ] Compile-memory budget documented.
+- [ ] Complexity documented.
+- [ ] No unbounded recursion.
+- [ ] No unbounded instantiation.
+- [ ] No unbounded pass repetition.
+- [ ] Benchmark evidence present.
+
+### Pass certification
+
+- [ ] Pass contract present.
+- [ ] Legality conditions present.
+- [ ] Analyses documented.
+- [ ] Invalidations documented.
+- [ ] Failure policy documented.
+- [ ] Target dependence documented.
+- [ ] Evidence present.
+
+### Target
+
+- [ ] No target checks in generic code.
+- [ ] Target hooks explicit.
+- [ ] Target cost model documented.
+- [ ] Target assumptions enforced.
+- [ ] Target changes measured.
+
+### Codegen
+
+- [ ] Disassembly reviewed.
+- [ ] Instruction count reviewed.
+- [ ] Spills reviewed.
+- [ ] Stack usage reviewed.
+- [ ] Relocations reviewed.
+- [ ] Code size reviewed.
+- [ ] Debug impact reviewed.
+
+### Security
+
+- [ ] Untrusted input validated.
+- [ ] Resource limits enforced.
+- [ ] No secret leakage.
+- [ ] No unsafe plugin behavior.
+- [ ] No executable writable memory outside policy.
+- [ ] Profile data validated.
+- [ ] Supply chain pinned.
+
+---
+
+## 38.55 HPC violation severity
+
+### Severity 0 HPC violations
+
+Examples:
+
+- miscompilation,
+- nondeterministic object output,
+- invalid IR accepted silently,
+- pass transforms without legality proof,
+- UB-based optimization without gate,
+- floating-point semantic change without gate,
+- profile silently stale,
+- JIT patch race,
+- W^X violation,
+- compiler crash on valid input,
+- secret leakage in diagnostics,
+- hard-coded target assumption in generic code,
+- target hook missing layout proof,
+- linker nondeterminism,
+- LTO semantic change without evidence,
+- untrusted input causing unbounded compile time,
+- generated compiler table without golden test.
+
+Response:
+
+1. Block merge.
+2. Revert or quarantine if merged.
+3. Add regression test.
+4. Add minimal reproducer.
+5. Add extermination report.
+6. Add lint or CI rule if possible.
+
+### Severity 1 HPC violations
+
+Examples:
+
+- missing pass evidence,
+- missing compile-time budget,
+- missing IR verifier in non-critical path,
+- missing deterministic remark ordering,
+- missing target cost source,
+- missing diagnostic ID stability,
+- missing PGO schema documentation,
+- missing JIT budget documentation.
+
+Response:
+
+1. Block merge unless emergency waiver.
+2. Require repair.
+3. Waiver must expire.
+
+### Severity 2 HPC violations
+
+Examples:
+
+- poor pass naming,
+- vague compiler comment,
+- stale remark text,
+- missing optional HPC comment field,
+- unclear target documentation.
+
+Response:
+
+- reject or request repair.
+
+---
+
+## 38.56 HPC extermination examples
+
+### Example 1: Silent vectorization with unknown dependence
+
+Violation:
+
+```cpp
+// Vectorize loop.
+for (...)
+```
+
+No dependence proof.
+
+Response:
+
+```text
+EXTERMINATE
+Reason: vectorization without dependence proof.
+Rule: CEP&CC 38.26
+Action: disable vectorization or add legality proof.
+```
+
+### Example 2: Nondeterministic pass order
+
+Violation:
+
+```cpp
+for (auto& pass : pass_map) run(pass);
+```
+
+`pass_map` iteration order is unstable.
+
+Response:
+
+```text
+EXTERMINATE
+Reason: nondeterministic pass execution order.
+Rule: CEP&CC 38.20
+Action: use explicit ordered pipeline.
+```
+
+### Example 3: PGO uses stale profile silently
+
+Violation:
+
+Compiler ignores profile version mismatch.
+
+Response:
+
+```text
+EXTERMINATE
+Reason: stale profile used silently.
+Rule: CEP&CC 38.29
+Action: fail or fall back with diagnostic.
+```
+
+### Example 4: Generic backend contains target if
+
+Violation:
+
+```cpp
+if (target == Target::arm64) {
+  emit_arm64_sequence();
+}
+```
+
+Response:
+
+```text
+FAIL
+Reason: target-specific logic in generic backend.
+Rule: CEP&CC 38.30
+Action: move to target hook.
+```
+
+### Example 5: JIT patch without synchronization
+
+Violation:
+
+JIT patches live code without safe publication.
+
+Response:
+
+```text
+EXTERMINATE
+Reason: unsafe runtime patching.
+Rule: CEP&CC 38.40
+Action: revert and implement safe patch protocol.
+```
+
+---
+
+## 38.57 HPC example: compliant optimization pass
+
+```cpp
+// CEP:WHAT: Hoists loop-invariant scalar loads from inner loops.
+// CEP:WHY: Reduces redundant memory traffic in hot compiler IR transformations.
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns PassError::unsupported if legality cannot be proven.
+// CEP:ASSUMES: SSA form, loop info, alias analysis available.
+// CEP:COST: O(N) expected, O(N log N) worst-case on IR nodes.
+// CEP:EVIDENCE: golden IR licm_01, fuzz licm_fuzz_04, bench HPC-113.
+// CEP:SECURITY: IR input may be untrusted; verifier runs before pass.
+// CEP:HPC-CLASS: HPC-0
+// CEP:HPC-PASS: licm
+// CEP:HPC-PASS-KIND: loop transformation
+// CEP:HPC-PASS-INPUT: SSA IR with loop and alias analysis
+// CEP:HPC-PASS-OUTPUT: SSA IR with hoisted invariant loads
+// CEP:HPC-PASS-ANALYSIS-REQUIRED: loop, dominance, alias, side-effect
+// CEP:HPC-PASS-ANALYSIS-PRODUCED: updated invariant set
+// CEP:HPC-PASS-ANALYSIS-INVALIDATED: dominance, scalar evolution
+// CEP:HPC-PASS-LEGALITY: no side effects, no alias conflict, no control dependence change
+// CEP:HPC-PASS-PRESERVES: semantics, memory order, exception behavior
+// CEP:HPC-PASS-COST: 14 ms for 10k IR nodes on reference machine
+// CEP:HPC-PASS-FAILURE: aborts transformation conservatively
+// CEP:HPC-PASS-TARGET: target-independent
+// CEP:HPC-PASS-EVIDENCE: bench HPC-113
+// CEP:HPC-COMPILE-COST: 14 ms / 10k IR nodes
+// CEP:HPC-COMPILE-MEM: 64 MB peak
+// CEP:HPC-COMPLEXITY: O(N) expected
+// CEP:HPC-DETERMINISM: deterministic; pass iterates stable IR order
+```
+
+---
+
+## 38.58 HPC example: compliant JIT patchpoint
+
+```cpp
+// CEP:WHAT: Patches a direct call site to a validated runtime stub.
+// CEP:WHY: Runtime specialization requires replacing a call target safely.
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns PatchError::unsafe if instruction boundaries are invalid.
+// CEP:ASSUMES: patchpoint is quiescent; no thread observes partial patch.
+// CEP:COST: bounded patch latency; measured HPC-JIT-201.
+// CEP:EVIDENCE: jit_patch_test_07, disassembly artifact jit-9921.
+// CEP:SECURITY: target stub is validated; W^X enforced.
+// CEP:HPC-CLASS: HPC-0
+// CEP:HPC-JIT: runtime patching
+// CEP:HPC-DETERMINISM: deterministic for same patchpoint state
+// CEP:HPC-CODEGEN: direct call replacement with target-safe sequence
+// CEP:HPC-CODEGEN-PROOF: golden disassembly jit_patch_07
+```
+
+---
+
+## 38.59 HPC release qualification
+
+A compiler release is HPC-qualified only if it provides:
+
+1. language conformance report,
+2. target matrix report,
+3. implementation-defined behavior catalog,
+4. pass pipeline manifest,
+5. target cost model version,
+6. profile schema version,
+7. deterministic build evidence,
+8. compile-time benchmark report,
+9. code-quality benchmark report,
+10. miscompilation regression suite,
+11. fuzz report,
+12. security threat model,
+13. supply-chain manifest,
+14. toolchain hashes,
+15. known defect list,
+16. waiver list,
+17. extermination report summary.
+
+If any required artifact is missing, the compiler release is not HPC-qualified.
+
+---
+
+## 38.60 Final HPC clause
+
+An HPC compiler must prove itself before it is trusted to transform code.
+
+If a compiler component cannot show:
+
+- what it transforms,
+- why the transformation is legal,
+- what assumptions it uses,
+- what target it assumes,
+- what cost it imposes,
+- what evidence supports it,
+- how it fails,
+- how it remains deterministic,
+- how it remains secure,
+
+then it is not HPC-compliant.
+
+It must be repaired, quarantined, or exterminated.
