@@ -10844,3 +10844,1122 @@ If a compiler component cannot show:
 then it is not HPC-compliant.
 
 It must be repaired, quarantined, or exterminated.
+
+---
+
+# 39. Resource-Constrained Systems (RCS) Overview
+
+This chapter extends CEP&CC for systems where resources are not merely limited, but are part of the correctness contract. A resource-constrained system is not compliant because it runs. It is compliant only if every resource is bounded, owned, measured, documented, monitored, and failure-handled.
+
+This chapter applies whenever any of the following are true:
+- RAM is limited,
+- flash or ROM is limited,
+- stack is limited,
+- heap is absent or constrained,
+- CPU time is budgeted,
+- deadlines exist,
+- WCET (Worst-Case Execution Time) matters,
+- energy is budgeted,
+- battery capacity is finite,
+- thermal envelope is bounded,
+- storage endurance is finite,
+- I/O bandwidth is bounded,
+- queue capacity is bounded,
+- safe-state reachability is required,
+- radiation tolerance is required,
+- deterministic recovery is required.
+
+Target domains include:
+- spacecraft avionics,
+- flight controllers,
+- satellite subsystems,
+- radiation-tolerant CPUs,
+- industrial controllers,
+- medical embedded controllers,
+- automotive ECUs,
+- bare-metal firmware,
+- RTOS-based control systems,
+- sensor nodes,
+- motor controllers,
+- power converters,
+- battery-powered devices,
+- safety-critical actuators,
+- deterministic network endpoints,
+- bootloaders,
+- secure elements.
+
+Where this chapter is stricter than the general CEP&CC rules, this chapter wins. Where this chapter is silent, the rest of CEP&CC applies.
+
+---
+
+## 39.1 RCS prime law
+
+The RCS prime law is:
+
+> No resource may be hidden, unbounded, unmeasured, or silently exhaustible.
+> Every resource must have a budget, an owner, evidence, and a failure policy.
+> Resource exhaustion is not a surprise condition. It must be predicted, prevented, detected, contained, and handled through a documented safe-state or degraded-mode transition.
+
+This law has five binding clauses.
+
+### 39.1.1 No hidden resource
+Every resource consumer must be identifiable.
+Banned:
+- hidden allocation,
+- hidden stack growth,
+- hidden queue growth,
+- hidden retry,
+- hidden lock wait,
+- hidden flash write,
+- hidden log write,
+- hidden peripheral access,
+- hidden power-state transition,
+- hidden thermal throttle,
+- hidden cache maintenance,
+- hidden DMA transfer.
+
+If a resource consumer cannot be named, it is not allowed.
+
+### 39.1.2 No unbounded resource
+Every resource consumer must have a bound.
+Banned:
+- unbounded loops,
+- unbounded recursion,
+- unbounded retry,
+- unbounded queue depth,
+- unbounded log size,
+- unbounded stack usage,
+- unbounded heap usage,
+- unbounded flash writes,
+- unbounded blocking,
+- unbounded ISR execution,
+- unbounded interrupt disable time.
+
+If a bound cannot be proven, the feature is not allowed in RCS-0.
+
+### 39.1.3 No unmeasured resource
+Every bounded resource must be measured or analyzed.
+Required evidence:
+- static analysis,
+- high-water measurement,
+- WCET analysis,
+- utilization analysis,
+- endurance estimate,
+- energy measurement,
+- thermal measurement,
+- queue high-water measurement.
+
+A budget without evidence is a wish, not a constraint.
+
+### 39.1.4 No resource without an owner
+Every resource region, pool, queue, task, interrupt, and fault must have an owner.
+Owner means:
+- a named component,
+- a named module,
+- a named team,
+- a named review authority.
+
+Unowned resources are defects.
+
+### 39.1.5 No resource exhaustion without a failure policy
+Every resource must define what happens when its budget is exhausted.
+Allowed failure policies:
+- return explicit error,
+- drop non-critical item,
+- enter degraded mode,
+- enter safe state,
+- reset subsystem,
+- escalate fault,
+- trigger watchdog.
+
+Banned:
+- silent continuation,
+- undefined behavior,
+- crash without diagnostics,
+- partial artifact emission,
+- hidden corruption.
+
+Violations of the RCS prime law are Severity 0 in RCS-0 code.
+
+---
+
+## 39.2 RCS conformance classes
+
+RCS defines three system classes.
+
+### 39.2.1 RCS-0: Hard real-time or safety-critical constrained code
+RCS-0 is the strictest class.
+RCS-0 applies when any of the following are true:
+- missing a deadline can cause hazard,
+- resource exhaustion can cause unsafe behavior,
+- power loss can cause unsafe behavior,
+- storage corruption can cause unsafe behavior,
+- watchdog failure can cause unsafe behavior,
+- radiation upset can cause unsafe behavior,
+- the system must enter a safe state on fault,
+- the system is certifiable or safety-related,
+- the system controls actuators,
+- the system controls power delivery,
+- the system controls propulsion,
+- the system controls life-critical functions.
+
+RCS-0 requirements:
+- static allocation by default,
+- no general-purpose heap after initialization,
+- bounded stacks,
+- bounded execution paths,
+- WCET evidence,
+- schedulability evidence,
+- energy budget evidence,
+- storage endurance evidence,
+- explicit failure policy,
+- explicit safe-state policy,
+- watchdog policy,
+- degraded-mode policy,
+- recovery policy,
+- deterministic I/O queue policy,
+- fault table,
+- fault injection evidence,
+- memory protection where safety demands it.
+
+RCS-0 code must not throw exceptions.
+RCS-0 code must not panic.
+RCS-0 code must not abort without a documented fault path.
+RCS-0 code must not rely on operating-system convenience services unless those services are proven deterministic and bounded.
+
+### 39.2.2 RCS-1: Soft real-time constrained code
+RCS-1 applies to embedded or constrained systems where deadlines matter but are not safety-critical.
+Examples:
+- telemetry aggregators,
+- user-interface controllers,
+- data loggers,
+- non-critical sensor hubs,
+- diagnostics panels,
+- non-safety gateways.
+
+RCS-1 requirements:
+- bounded memory,
+- bounded CPU time,
+- bounded queues,
+- bounded retries,
+- explicit timeout policy,
+- explicit failure policy,
+- measured or estimated WCET where practical,
+- log quotas,
+- storage budgets,
+- watchdog where practical.
+
+RCS-1 may use controlled dynamic allocation if the allocator is deterministic and documented.
+
+### 39.2.3 RCS-2: Offline or support tooling for constrained systems
+RCS-2 applies to:
+- host tools,
+- firmware generators,
+- image builders,
+- flash tools,
+- telemetry analyzers,
+- test harnesses,
+- simulation tools,
+- configuration generators,
+- linker script generators,
+- table generators.
+
+RCS-2 is not runtime constrained code, but its outputs must not violate RCS rules.
+
+---
+
+## 39.3 Resource budget document
+
+Every RCS project must maintain a resource budget.
+The resource budget is a normative artifact.
+It is not a comment. It is not a wiki page. It is a versioned, reviewed, enforced artifact.
+
+### 39.3.1 Required budget categories
+The resource budget must include:
+- RAM regions,
+- ROM/flash regions,
+- static object sizes,
+- stack budgets,
+- heap pools,
+- queue capacities,
+- buffer sizes,
+- CPU utilization,
+- WCET budgets,
+- ISR latency budgets,
+- energy budgets,
+- thermal thresholds,
+- storage write budgets,
+- log quotas,
+- watchdog deadlines,
+- timeout constants,
+- safe-state requirements,
+- recovery budgets,
+- degraded-mode budgets.
+
+### 39.3.2 Budget entry format
+Each budget entry must include:
+- name,
+- unit,
+- value,
+- owner,
+- source,
+- evidence ID,
+- margin,
+- last verified date,
+- verification method.
+
+Example:
+```text
+name: control_pool
+unit: bytes
+value: 4096
+owner: control-team
+source: system configuration table v7
+evidence: RCS-MEM-014
+margin: 768 bytes
+last_verified: 2026-09-10
+method: static analysis + runtime high-water
+```
+
+---
+
+# 40. RCS Memory and Allocation Policy
+
+Memory is a first-class constrained resource.
+RCS code must know:
+- where every byte lives,
+- who owns it,
+- when it is initialized,
+- when it is freed,
+- how much margin remains,
+- what happens on exhaustion,
+- what happens on corruption,
+- what happens on power loss.
+
+---
+
+## 40.1 RAM usage
+
+All RAM usage must be classified.
+
+### 40.1.1 Required RAM categories
+- code resident in RAM,
+- constants copied to RAM,
+- static data,
+- zero-initialized data,
+- stacks,
+- interrupt stacks,
+- heap pools,
+- DMA buffers,
+- peripheral buffers,
+- communication buffers,
+- log buffers,
+- diagnostic buffers,
+- storage cache,
+- filesystem buffers,
+- scratch memory,
+- secure memory,
+- retention memory,
+- ECC/parity overhead,
+- MPU/MMU table memory,
+- vector table memory.
+
+### 40.1.2 RAM region contract
+Every RAM region must have:
+- name,
+- size,
+- owner,
+- alignment,
+- cacheability,
+- initialization policy,
+- access policy,
+- high-water mark,
+- margin,
+- evidence,
+- corruption policy,
+- power-loss policy.
+
+Unowned RAM is a defect.
+Uninitialized RAM is a defect unless explicitly documented as scratch.
+
+---
+
+## 40.2 Static allocation
+
+Static allocation is the default for RCS-0.
+
+### 40.2.1 Allowed static allocation uses
+- fixed control blocks,
+- fixed task stacks,
+- fixed message buffers,
+- fixed I/O queues,
+- fixed DMA descriptors,
+- fixed lookup tables,
+- fixed state machines,
+- fixed log ring buffers,
+- fixed configuration objects,
+- fixed calibration tables,
+- fixed fault records.
+
+### 40.2.2 Static sizing rules
+Static allocation must be sized by named constants.
+Bad:
+```cpp
+ControlBlock blocks[64];
+```
+Good:
+```cpp
+ControlBlock blocks[cep::rcs::kMaxControlBlocks];
+```
+and:
+```cpp
+// CEP:WHAT: Maximum number of simultaneous control blocks.
+// CEP:WHY: Derived from system configuration and actuator count.
+// CEP:ASSUMES: kMaxControlBlocks matches hardware configuration table.
+// CEP:EVIDENCE: config review RCS-CFG-007.
+inline constexpr std::size_t kMaxControlBlocks = 12;
+```
+
+### 40.2.3 Static overflow rules
+Static allocation must not silently exceed its region.
+Required:
+- static assertions on size,
+- linker map analysis,
+- region boundary checks,
+- high-water instrumentation where practical.
+
+Example:
+```cpp
+static_assert(
+    sizeof(ControlBlock) * cep::rcs::kMaxControlBlocks
+        <= cep::rcs::limit::control_pool_bytes,
+    "control pool overflow");
+```
+
+---
+
+## 40.3 Heap policy
+
+General-purpose heap is banned in RCS-0 after initialization unless explicitly waived.
+
+### 40.3.1 Allowed allocator types
+If heap is used, it must be one of:
+- fixed-size pool allocator,
+- arena allocator,
+- slab allocator,
+- static buffer allocator,
+- project-approved deterministic allocator.
+
+### 40.3.2 Banned heap patterns in RCS-0
+Banned:
+- global `new` in control paths,
+- global `delete` in control paths,
+- `malloc` in control paths,
+- `free` in control paths,
+- `realloc`,
+- unbounded container growth,
+- exception-based allocation failure handling,
+- hidden allocator callbacks,
+- polymorphic allocators without review,
+- `std::vector` growth in control paths,
+- `std::string` growth in control paths,
+- `std::function` capture allocation,
+- `std::shared_ptr` control block allocation in hot paths,
+- iostream allocation,
+- formatting allocation.
+
+---
+
+## 40.4 Bounded stacks
+
+Every thread, task, interrupt handler, and exception context must have a bounded stack.
+
+### 40.4.1 Banned stack patterns in RCS-0
+- no unbounded recursion,
+- no direct recursion unless bounded and proven,
+- no indirect recursion,
+- no `alloca`,
+- no variable-length arrays,
+- no large automatic aggregates unless budgeted,
+- no deep call chains without evidence,
+- no exception unwind stacks,
+- no coroutine heap frames,
+- no hidden compiler-generated temporaries on the stack,
+- no large by-value parameters,
+- no large by-value returns,
+- no formatted output on stack buffers without bound.
+
+### 40.4.2 Stack overflow response
+Stack overflow detection must not silently continue.
+Allowed responses:
+- safe-state transition,
+- fatal fault,
+- subsystem reset,
+- watchdog escalation.
+
+Banned:
+- logging and continuing,
+- ignoring overflow flag,
+- resetting high-water mark without analysis.
+
+---
+
+# 41. RCS CPU, WCET, and Execution Paths
+
+CPU time is a constrained resource.
+RCS code must not merely be fast on average. It must be bounded in the worst case.
+Average performance is irrelevant. Worst-case performance is the contract.
+
+---
+
+## 41.1 WCET requirement
+
+Every RCS-0 task, control loop, interrupt handler, and time-critical function must have a WCET estimate.
+WCET means worst-case execution time.
+
+### 41.1.1 WCET evidence contents
+WCET evidence must include:
+- target CPU,
+- target frequency,
+- cache state,
+- flash wait states,
+- RAM/ROM placement,
+- branch prediction state,
+- interrupt exposure,
+- preemption exposure,
+- memory contention,
+- peripheral latency,
+- compiler version,
+- compile flags,
+- analysis method,
+- measurement method,
+- artifact ID,
+- worst-case input,
+- worst-case path.
+
+### 41.1.2 WCET comment
+WCET claims require:
+```cpp
+// CEP:RCS-WCET:
+```
+Example:
+```cpp
+// CEP:RCS-WCET: 210 us on leon3-gr712 at 200 MHz, worst-case I-cache miss,
+// artifact RCS-WCET-014.
+```
+
+---
+
+## 41.2 Bounded execution paths
+
+All execution paths in RCS-0 must be bounded.
+
+### 41.2.1 Banned unbounded patterns
+- unbounded loops,
+- unbounded recursion,
+- unbounded retry loops,
+- unbounded spin waits,
+- unbounded search over dynamically growing data,
+- unbounded queue traversal,
+- unbounded linked-list traversal,
+- unbounded tree traversal,
+- unbounded dynamic dispatch chains,
+- unbounded state machine cycles.
+
+### 41.2.2 Retry policy
+Every bounded retry policy must have:
+- max attempts,
+- delay policy,
+- timeout policy,
+- failure action,
+- evidence.
+
+Bad:
+```cpp
+while (!ready()) {
+    retry();
+}
+```
+Good:
+```cpp
+for (std::uint32_t attempt = 0; attempt < cep::rcs::limit::max_device_retries;
+     ++attempt) {
+    if (ready()) return std::expected<void, DeviceError>{};
+    wait_one_tick();
+}
+return std::unexpected(DeviceError::timeout);
+```
+
+---
+
+## 41.3 Interrupt latency
+
+Interrupt latency must be bounded.
+
+### 41.3.1 ISR rules
+ISRs must be short and bounded.
+ISRs must not:
+- allocate,
+- block,
+- wait on locks,
+- wait on queues without bounded timeout,
+- perform filesystem operations,
+- perform flash writes unless explicitly budgeted,
+- perform formatting,
+- perform logging beyond bounded trace buffers,
+- perform long computation,
+- perform recovery,
+- perform network operations.
+
+ISRs should:
+- acknowledge hardware,
+- capture minimal state,
+- post to bounded queue,
+- schedule deferred work,
+- return.
+
+### 41.3.2 Interrupt disable time
+Interrupt disable time must be bounded.
+Required:
+- maximum disable time,
+- named constant,
+- evidence,
+- review.
+
+Banned:
+- disabling interrupts around long operations,
+- disabling interrupts around flash writes,
+- disabling interrupts around formatting,
+- disabling interrupts around allocation.
+
+---
+
+# 42. RCS Storage, Flash, and Persistence
+
+Storage is not infinite, not infinitely fast, and not infinitely durable.
+RCS storage must be bounded, predictable, corruption-aware, and power-loss-aware.
+
+---
+
+## 42.1 Bounded logs
+
+Logs must be bounded.
+
+### 42.1.1 Banned log patterns
+- unbounded log files,
+- unbounded fault histories,
+- unbounded debug traces,
+- unbounded telemetry buffers,
+- logs that allocate without quota,
+- logs that block control loops,
+- logs that cause flash wear without budget,
+- logs that contain secrets,
+- logs that contain unbounded formatted strings.
+
+### 42.1.2 Allowed log designs
+- fixed ring buffer in RAM,
+- selective persistence,
+- severity-based throttling,
+- fault-only persistent logs,
+- circular fault history with fixed record count.
+
+---
+
+## 42.2 Flash wear management
+
+Flash wear is a reliability constraint.
+Every flash write must be justified.
+
+### 42.2.1 Banned flash patterns
+- writing logs every tick without budget,
+- rewriting unchanged data,
+- unbounded journal growth,
+- unbalanced erase cycles,
+- ignoring wear counters,
+- ignoring bad-block detection,
+- writing during hard real-time paths without budget.
+
+### 42.2.2 Flash latency rules
+Flash write operations in hard real-time paths must be budgeted.
+If flash write latency can violate a deadline, the write must be deferred or partitioned.
+
+---
+
+## 42.3 Power-loss atomicity
+
+Persistent writes must survive power loss.
+
+### 42.3.1 Required properties
+- writes are atomic or journaled,
+- partially written records are detectable,
+- old valid state remains reachable,
+- commit points are explicit,
+- rollback is possible,
+- metadata consistency is validated at boot.
+
+### 42.3.2 Banned power-loss patterns
+- in-place multi-sector updates without journaling,
+- assuming power will remain stable during write,
+- writing configuration directly without commit marker,
+- corrupting golden image during update.
+
+---
+
+# 43. RCS Power, Energy, and Thermal
+
+Power is a correctness constraint.
+A system that violates its energy budget may fail even if its code is functionally correct.
+
+---
+
+## 43.1 Sleep and wake behavior
+
+Sleep states must be explicit.
+
+### 43.1.1 Required sleep-state table
+- state name,
+- power draw,
+- entry latency,
+- exit latency,
+- retained memory,
+- lost state,
+- wake sources,
+- peripheral availability,
+- clock behavior,
+- interrupt behavior,
+- brownout behavior,
+- watchdog behavior,
+- security behavior.
+
+### 43.1.2 Banned sleep patterns
+- hidden sleep state transitions,
+- sleep entry with interrupts unsafely enabled,
+- sleep entry with peripherals left in unsafe state,
+- sleep entry with pending DMA,
+- wake sources undocumented,
+- wake latency omitted from deadline analysis.
+
+---
+
+## 43.2 Brownout and power rail behavior
+
+The system must define behavior for:
+- undervoltage,
+- overvoltage,
+- brownout,
+- power rail droop,
+- power-good loss,
+- battery exhaustion,
+- capacitor holdup exhaustion.
+
+### 43.2.1 Power-fault safety
+Power-fault handling must not rely on uninitialized memory.
+Power-fault handling must not rely on heap.
+Power-fault handling must be reachable from any state.
+
+---
+
+# 44. RCS I/O, DMA, and Peripherals
+
+I/O is where resource constraints meet the physical world.
+I/O must be bounded, timeout-aware, and failure-aware.
+
+---
+
+## 44.1 Bounded queues
+
+Every queue must have a capacity.
+
+### 44.1.1 Banned queue patterns
+- unbounded queues,
+- dynamically growing mailboxes,
+- queues with no overflow policy,
+- queues that block ISR without bounded timeout,
+- queues that hide allocation,
+- queues with no high-water tracking.
+
+### 44.1.2 Queue overflow policy
+Queue overflow policy must be one of:
+- reject new item,
+- drop newest,
+- drop oldest,
+- overwrite critical-safe item,
+- escalate fault,
+- apply backpressure.
+
+The policy must be documented.
+
+---
+
+## 44.2 Timeout behavior
+
+Every blocking I/O operation in RCS-1 and RCS-0 must have a timeout unless proven unnecessary.
+
+### 44.2.1 Banned timeout patterns
+- infinite waits in control paths,
+- waits without timeout constants,
+- timeouts hard-coded without rationale,
+- timeouts that allow deadline violation,
+- timeouts that hide hardware faults.
+
+Good:
+```cpp
+// CEP:RCS-TIMEOUT: sensor read timeout 2 ms; retry 3 times; then sensor fault.
+```
+Bad:
+```cpp
+wait_forever();
+```
+
+---
+
+## 44.3 DMA rules
+
+DMA is powerful and dangerous.
+
+### 44.3.1 DMA safety rules
+DMA must not access memory outside its approved window.
+DMA must not corrupt static data.
+DMA must not introduce nondeterministic memory latency unless WCET includes it.
+DMA must not be configured by untrusted input without validation.
+
+---
+
+# 45. RCS Concurrency and Interrupts
+
+Concurrency must be bounded and analyzable.
+RCS concurrency is not about throughput alone. It is about predictable, safe completion.
+
+---
+
+## 45.1 Deadlock analysis
+
+Deadlocks must be prevented by design.
+
+### 45.1.1 Banned deadlock patterns
+- circular lock dependencies,
+- unbounded lock nesting,
+- lock acquisition in ISR,
+- lock acquisition with interrupts disabled unless budgeted,
+- recursive mutexes without proof,
+- hidden lock acquisition through callbacks.
+
+### 45.1.2 Lock-order table
+If locks are used, the project must maintain a lock-order table.
+Example:
+```text
+lock order:
+1. system_state_lock
+2. telemetry_lock
+3. storage_lock
+```
+Any code acquiring locks out of order is a Severity 0 defect.
+
+---
+
+## 45.2 Priority inversion
+
+Priority inversion must be bounded.
+
+### 45.2.1 Banned priority inversion patterns
+- unbounded priority inversion,
+- priority donation cycles,
+- priority inversion through long flash writes,
+- priority inversion through I/O calls,
+- priority inversion through logging.
+
+---
+
+# 46. RCS Failure, Watchdogs, and Safe States
+
+RCS systems must assume failure.
+Failure is not exceptional. It is part of the environment.
+
+---
+
+## 46.1 Watchdogs
+
+Watchdogs are mandatory for RCS-0 unless explicitly waived with a safety argument.
+
+### 46.1.1 Banned watchdog patterns
+- blindly kicking the watchdog,
+- kicking the watchdog inside a timer ISR without health validation,
+- disabling the watchdog without review,
+- extending watchdog timeout to hide deadline misses,
+- allowing one failed component to keep the system alive falsely.
+
+### 46.1.2 Good watchdog policy
+```text
+Kick watchdog only if:
+- control loop completed within deadline,
+- no fatal fault active,
+- stack watermark valid,
+- queue overflow counter below threshold,
+- power state valid,
+- storage health valid.
+```
+
+---
+
+## 46.2 Safe-state transitions
+
+Safe state is mandatory for RCS-0 systems that can cause hazard.
+
+### 46.2.1 Safe-state reachability
+Safe-state transitions must be reachable even if:
+- control task missed deadline,
+- watchdog expired,
+- stack overflow detected,
+- memory corruption detected,
+- configuration invalid,
+- sensor invalid,
+- communication lost,
+- power droop occurred,
+- thermal limit exceeded.
+
+Example:
+```cpp
+// CEP:RCS-SAFE-STATE: De-energize actuators within 5 ms of fatal fault.
+// CEP:EVIDENCE: fault injection test RCS-FI-031.
+```
+
+---
+
+# 47. RCS C++26 Language and Library Restrictions
+
+This section defines how C++26 features apply to RCS environments.
+
+---
+
+## 47.1 `std::expected` in RCS
+### Use
+Use `std::expected` for recoverable errors in RCS-1.
+In RCS-0, use `std::expected` only if:
+- the error type is trivially destructible,
+- the error type requires no allocation,
+- the return value optimization (RVO) is guaranteed or measured,
+- the unwrapping does not introduce hidden branches that violate WCET.
+### When not to use
+Do not use `std::expected` if the error payload contains `std::string` or `std::vector`.
+
+---
+
+## 47.2 `std::inplace_vector` in RCS
+### Use
+Use `std::inplace_vector` for bounded, stack-allocated dynamic sequences in RCS-0.
+### Why
+It provides vector-like semantics without heap allocation.
+### Rules
+- Capacity must be a named constant.
+- Overflow behavior must be documented (e.g., `bad_alloc` equivalent or assert).
+- Do not use it if the capacity exceeds the stack budget.
+
+---
+
+## 47.3 `std::mdspan` in RCS
+### Use
+Use `std::mdspan` for mapping hardware buffers, DMA regions, and memory-mapped I/O.
+### Why
+It provides bounds-checked, layout-aware access without allocation.
+### When not to use
+Do not use dynamic extents in RCS-0 if static extents can be proven.
+Do not use complex layout policies that hide stride calculations in hot loops.
+
+---
+
+## 47.4 Coroutines in RCS
+### Policy
+Banned in RCS-0.
+### Why
+Coroutines inherently require heap allocation for the coroutine frame unless a custom, deterministic, bounded allocator is provided and proven. Even with custom allocators, the state machine resumption cost and hidden branches make WCET analysis extremely difficult.
+### Allowed
+Only in RCS-1 if the promise type, allocator, and resumption overhead are fully measured and bounded.
+
+---
+
+## 47.5 `std::print` and `std::format` in RCS
+### Policy
+Banned in RCS-0 and RCS-1 control paths.
+### Why
+Formatting allocates, locks, and performs I/O.
+### Allowed
+Only in RCS-2 tooling or cold diagnostic dumps where CPU and memory budgets are explicitly reserved.
+
+---
+
+# 48. RCS Comment Standard
+
+RCS requires specific comment fields to document resource constraints.
+
+---
+
+## 48.1 Required RCS comment fields
+```cpp
+// CEP:RCS-CLASS:
+// CEP:RCS-MEM:
+// CEP:RCS-STACK:
+// CEP:RCS-HEAP:
+// CEP:RCS-WCET:
+// CEP:RCS-SCHEDULE:
+// CEP:RCS-FLASH:
+// CEP:RCS-POWER:
+// CEP:RCS-THERMAL:
+// CEP:RCS-QUEUE:
+// CEP:RCS-TIMEOUT:
+// CEP:RCS-WATCHDOG:
+// CEP:RCS-SAFE-STATE:
+```
+
+---
+
+## 48.2 RCS comment example
+```cpp
+// CEP:FILE: hot/control/motor_control.cpp
+// CEP:WHAT: Periodic motor control task for RCS-0 actuator loop.
+// CEP:WHY: Maintains bounded, deterministic actuator response.
+// CEP:CLASS: CEP-0, RCS-0
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns ControlError on sensor timeout, queue overflow, or
+//              safe-state request. No allocation. No throw.
+// CEP:ASSUMES: sensor queue is bounded; actuator table is static.
+// CEP:COST: WCET 210 us on leon3-gr712, artifact RCS-WCET-014.
+// CEP:EVIDENCE: bench RCS-CTRL-011, fault injection RCS-FI-031.
+// CEP:SECURITY: sensor input untrusted; range checked before use.
+// CEP:RCS-CLASS: RCS-0
+// CEP:RCS-MEM: static motor_pool only; no heap after boot.
+// CEP:RCS-STACK: 1024 bytes budget; high-water 640 bytes; margin 384 bytes.
+// CEP:RCS-WCET: 210 us worst-case, artifact RCS-WCET-014.
+// CEP:RCS-SCHEDULE: 10 ms period; 8 ms deadline; max blocking 90 us.
+// CEP:RCS-QUEUE: sensor queue depth 4; overflow rejects newest sample.
+// CEP:RCS-TIMEOUT: sensor read timeout 2 ms; retry 3 times.
+// CEP:RCS-WATCHDOG: contributes control heartbeat each successful period.
+// CEP:RCS-SAFE-STATE: actuator de-energized within 5 ms on fatal fault.
+```
+
+---
+
+# 49. RCS Review Checklist and Extermination
+
+---
+
+## 49.1 RCS Review Checklist
+
+### Memory
+- [ ] RAM regions documented.
+- [ ] Static allocation used where required.
+- [ ] Heap policy explicit.
+- [ ] No hidden allocation.
+- [ ] Stack budget documented.
+- [ ] Stack high-water measured.
+- [ ] Stack margin sufficient.
+- [ ] Fragmentation analyzed if dynamic allocation exists.
+- [ ] Memory protection configured where required.
+- [ ] Linker map reviewed.
+
+### CPU and scheduling
+- [ ] WCET documented.
+- [ ] Execution paths bounded.
+- [ ] No unbounded loops.
+- [ ] No unbounded retries.
+- [ ] CPU budget documented.
+- [ ] Schedulability evidence present.
+- [ ] Interrupt latency bounded.
+- [ ] Blocking time bounded.
+- [ ] Priority inversion controlled.
+- [ ] Task table updated.
+
+### Storage
+- [ ] Persistent data bounded.
+- [ ] Logs bounded.
+- [ ] Flash wear budget documented.
+- [ ] Corruption detection present.
+- [ ] Power-loss recovery tested.
+- [ ] Rollback path documented.
+- [ ] Update failure path tested.
+
+### Failure
+- [ ] Fault table updated.
+- [ ] Watchdog policy valid.
+- [ ] Degraded mode documented.
+- [ ] Recovery path documented.
+- [ ] Safe-state transition tested.
+- [ ] Fault injection evidence present.
+
+---
+
+## 49.2 RCS Extermination Examples
+
+### Example 1: Hidden allocation in control loop
+Violation:
+```cpp
+void control_tick() {
+    auto buffer = std::vector<std::uint8_t>(256);
+    ...
+}
+```
+Response:
+```text
+EXTERMINATE
+Reason: heap allocation in RCS-0 control loop.
+Rule: CEP&CC 40.3
+Action: replace with static buffer or pool.
+```
+
+### Example 2: Unbounded retry
+Violation:
+```cpp
+while (!sensor_ready()) {
+    wait();
+}
+```
+Response:
+```text
+EXTERMINATE
+Reason: unbounded retry loop in RCS-0.
+Rule: CEP&CC 41.2
+Action: bound retries and add timeout fault path.
+```
+
+### Example 3: Blind watchdog kick
+Violation:
+```cpp
+void timer_isr() {
+    kick_watchdog();
+}
+```
+Response:
+```text
+EXTERMINATE
+Reason: watchdog kicked without health validation.
+Rule: CEP&CC 46.1
+Action: gate kick on health checks.
+```
+
+### Example 4: In-place config update
+Violation:
+```cpp
+write_config_in_place(new_config);
+```
+Response:
+```text
+EXTERMINATE
+Reason: persistent write without power-loss atomicity.
+Rule: CEP&CC 42.3
+Action: use A/B or journaled write.
+```
+
+### Example 5: Lock acquired in ISR
+Violation:
+```cpp
+void isr() {
+    std::lock_guard lock(state_mutex);
+    ...
+}
+```
+Response:
+```text
+EXTERMINATE
+Reason: lock acquisition in ISR.
+Rule: CEP&CC 41.3 / 45.1
+Action: post to bounded queue; defer locking.
+```
