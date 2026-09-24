@@ -4358,7 +4358,2085 @@ auto lower_vector_intrinsics([[maybe_unused]] const VectorOp& op) noexcept
 
 ---
 
-# 21. Short enforcement summary
+Added. The following are new normative chapters to append to **CEP&CC 0.1**.
+
+These additions introduce:
+
+1. **Security requirements**.
+2. **Literal optimal code definition**.
+3. **Multi-language companion policy** for:
+   - Rust,
+   - C,
+   - Zig,
+   - Python/Lua tooling.
+
+These chapters are written as direct additions to the existing standard.
+
+---
+
+# 22. Security
+
+Security is a first-class correctness requirement in CEP&CC.
+
+A function is not compliant if it is fast but exploitable.
+
+Security rules apply to all code classes, with stricter rules for CEP-0 and FFI boundaries.
+
+---
+
+## 22.1 Security objective
+
+The security objective is:
+
+> No input, environment state, toolchain artifact, or FFI boundary may cause undefined behavior, memory unsafety, privilege escalation, secret leakage, denial of service, or silent corruption beyond the documented failure policy.
+
+Security defects include:
+
+- buffer overflow,
+- out-of-bounds read,
+- use-after-free,
+- double-free,
+- uninitialized read,
+- uninitialized write,
+- integer overflow,
+- signed overflow,
+- unchecked truncation,
+- stack overflow,
+- uncontrolled recursion,
+- format string injection,
+- path traversal,
+- command injection,
+- deserialization attack,
+- TOCTOU race,
+- side-channel leakage,
+- secret leakage in logs,
+- secret leakage in error messages,
+- untrusted allocator control,
+- untrusted code generation,
+- supply-chain compromise,
+- compiler/toolchain tampering.
+
+---
+
+## 22.2 Threat model requirement
+
+Every component must have a threat model.
+
+At minimum, the component must answer:
+
+- What input is trusted?
+- What input is untrusted?
+- What boundaries exist?
+- What privileges does the component have?
+- What secrets does the component touch?
+- What resources can be exhausted?
+- What failure mode is acceptable under attack?
+- What failure mode is forbidden under attack?
+
+If no threat model exists, the component must treat all external input as untrusted.
+
+---
+
+## 22.3 Trust boundaries
+
+Trust boundaries must be explicit.
+
+Examples of trust boundaries:
+
+- user input,
+- network input,
+- file input,
+- IPC input,
+- environment variables,
+- command-line arguments,
+- configuration files,
+- plugin APIs,
+- FFI calls,
+- kernel interfaces,
+- hypervisor interfaces,
+- hardware registers,
+- generated code,
+- toolchain output,
+- third-party libraries.
+
+Data crossing a trust boundary must be validated before use.
+
+Validation must include:
+
+- size bounds,
+- type bounds,
+- alignment,
+- encoding,
+- lifetime,
+- ownership,
+- permissions,
+- resource limits,
+- semantic invariants.
+
+A trust boundary must not be crossed by raw pointers, raw lengths, or unchecked enums without validation.
+
+---
+
+## 22.4 Memory safety
+
+Memory safety is mandatory.
+
+CEP&CC memory-safety rules:
+
+- No out-of-bounds access.
+- No use-after-free.
+- No double-free.
+- No uninitialized reads.
+- No uninitialized writes.
+- No dangling references.
+- No dangling spans.
+- No dangling string views.
+- No hidden lifetime extension.
+- No unsafe pointer arithmetic without bounds proof.
+- No aliasing violations.
+- No type punning through invalid casts.
+- No stack overflow from recursion.
+- No unbounded alloca-like behavior.
+- No variable-length arrays.
+
+In C++, use:
+
+- `std::span` for contiguous views,
+- `std::string_view` only with lifetime proof,
+- `std::expected` for recoverable errors,
+- RAII for resource ownership,
+- static assertions for layout assumptions,
+- sanitizers in CI.
+
+In unsafe languages, unsafe blocks must be isolated and documented.
+
+---
+
+## 22.5 Input validation
+
+All external input is untrusted until validated.
+
+Input validation must be explicit.
+
+Validation must answer:
+
+- What is the minimum size?
+- What is the maximum size?
+- What is the required alignment?
+- What is the required encoding?
+- What is the required lifetime?
+- What resource limits apply?
+- What happens if validation fails?
+- Does failure leak information?
+
+Bad:
+
+```cpp
+parse_packet(data);
+```
+
+Good:
+
+```cpp
+auto packet = validate_packet(data);
+if (!packet) return packet.error();
+process_packet(*packet);
+```
+
+Validation functions must be documented with:
+
+```cpp
+// CEP:SECURITY: Validates untrusted network input.
+// CEP:FAILURE: Returns error on malformed bounds. No allocation. No throw.
+```
+
+---
+
+## 22.6 Integer safety
+
+Integer misuse is a security defect.
+
+Required rules:
+
+- Use fixed-width integer types.
+- Do not allow silent narrowing.
+- Do not allow silent signed/unsigned mixing.
+- Do not allow unchecked overflow.
+- Do not allow unchecked underflow.
+- Do not allow unchecked multiplication used for allocation sizing.
+- Do not allow unchecked array index calculation.
+- Do not allow unchecked pointer arithmetic.
+
+Use:
+
+- `std::uint8_t`,
+- `std::uint16_t`,
+- `std::uint32_t`,
+- `std::uint64_t`,
+- `std::int8_t`,
+- `std::int16_t`,
+- `std::int32_t`,
+- `std::int64_t`,
+- `std::size_t` for sizes,
+- `std::ptrdiff_t` for differences.
+
+Use safe comparison helpers:
+
+- `std::cmp_less`,
+- `std::cmp_equal`,
+- `std::cmp_greater`,
+- `std::in_range`.
+
+If wrapping is intentional, it must be documented:
+
+```cpp
+// CEP:ASSUMES: u32 wrapping is intentional and part of checksum semantics.
+```
+
+If overflow is impossible, prove it:
+
+```cpp
+static_assert(kMaxEntries <= SIZE_MAX / sizeof(Entry));
+```
+
+---
+
+## 22.7 Unsafe code
+
+Unsafe code is restricted.
+
+Unsafe code includes:
+
+C++:
+
+- raw pointer arithmetic,
+- `reinterpret_cast`,
+- union type punning where not permitted,
+- inline assembly,
+- `volatile` hardware access,
+- manual lifetime management,
+- placement new,
+- custom allocator code.
+
+Rust:
+
+- `unsafe` blocks,
+- raw pointers,
+- FFI declarations,
+- manual layout assumptions,
+- `MaybeUninit`,
+- inline assembly.
+
+C:
+
+- all pointer arithmetic,
+- casts,
+- unions,
+- volatile,
+- inline assembly.
+
+Zig:
+
+- pointer casts,
+- `@ptrCast`,
+- `@bitCast`,
+- `@intFromPtr`,
+- volatile loads/stores,
+- inline assembly.
+
+Unsafe code must have:
+
+```cpp
+// CEP:SECURITY: unsafe block
+// CEP:WHAT:
+// CEP:WHY:
+// CEP:FAILURE:
+// CEP:ASSUMES:
+// CEP:COST:
+// CEP:EVIDENCE:
+```
+
+Unsafe code must be isolated in small modules.
+
+Unsafe code must not leak unsafe invariants into safe APIs.
+
+---
+
+## 22.8 FFI security
+
+FFI is a security boundary.
+
+FFI rules:
+
+- Every FFI type must have explicit layout.
+- Every FFI pointer must be validated where possible.
+- Every FFI length must be validated.
+- Every FFI enum must be validated before conversion.
+- Every FFI callback must be documented.
+- Every FFI error contract must be documented.
+- Every FFI allocation ownership must be documented.
+- Every FFI deallocation owner must be documented.
+- Every FFI string encoding must be documented.
+- Every FFI struct must be `repr(C)` or equivalent.
+- Every FFI function must specify calling convention.
+- Every FFI function must be `noexcept`/`extern "C"` or equivalent unless intentionally propagating exceptions, which is banned in CEP-0.
+
+Do not assume safety guarantees cross language boundaries.
+
+Rust references, C pointers, Zig slices, and C++ spans all lose validity guarantees at FFI boundaries unless explicitly checked.
+
+---
+
+## 22.9 Secrets and side channels
+
+Secrets require special treatment.
+
+Secrets include:
+
+- cryptographic keys,
+- passwords,
+- tokens,
+- session identifiers,
+- private user data,
+- hardware secrets,
+- signing keys,
+- decrypt keys,
+- authentication material.
+
+Rules:
+
+- Secrets must not be logged.
+- Secrets must not be formatted into error messages.
+- Secrets must not appear in crash dumps unless redacted.
+- Secrets must not be copied unnecessarily.
+- Secrets must be zeroized according to policy if required.
+- Secret-dependent branches are banned in cryptographic hot paths unless explicitly allowed.
+- Secret-dependent memory indexing is banned in constant-time paths.
+- Timing side channels must be documented.
+- Cache side channels must be considered.
+- Speculative execution side channels must be considered for security-critical targets.
+
+Security-sensitive code must state:
+
+```cpp
+// CEP:SECURITY: constant-time path; no secret-dependent branches.
+```
+
+or:
+
+```cpp
+// CEP:SECURITY: not constant-time; must not process secret material.
+```
+
+---
+
+## 22.10 Denial of service
+
+CEP&CC security treats resource exhaustion as a security defect.
+
+Components must define limits for:
+
+- input size,
+- recursion depth,
+- allocation count,
+- allocation size,
+- file descriptors,
+- threads,
+- stack usage,
+- CPU time,
+- memory usage,
+- open handles,
+- queue depth,
+- timeout behavior.
+
+Hot paths must not allow untrusted input to cause unbounded work.
+
+Banned:
+
+- unbounded recursion,
+- unbounded loop over untrusted length,
+- unbounded allocation,
+- unbounded string construction,
+- unbounded container growth,
+- unbounded regex matching,
+- unbounded parsing depth,
+- unbounded deserialization nesting.
+
+If limits are enforced, the limit value must not be hard-coded without justification.
+
+Bad:
+
+```cpp
+if (size > 4096) return error::too_large;
+```
+
+Good:
+
+```cpp
+if (size > cep::limit::max_packet_bytes) return error::too_large;
+```
+
+---
+
+## 22.11 Supply-chain security
+
+Dependencies must be controlled.
+
+Required:
+
+- pinned dependency versions,
+- dependency lockfiles,
+- dependency hashes,
+- vendored third-party code where practical,
+- SBOM generation,
+- review of new dependencies,
+- no network fetch during deterministic release builds unless explicitly approved.
+
+Banned:
+
+- unpinned dependencies,
+- mutable dependency tags,
+- build scripts that fetch arbitrary remote code in release builds,
+- telemetry in build tools,
+- undocumented post-install scripts,
+- dependency code that violates CEP&CC security rules.
+
+Generated code from dependencies is subject to the same review as handwritten code.
+
+---
+
+## 22.12 Toolchain security
+
+The compiler toolchain is part of the trusted computing base.
+
+Required:
+
+- pinned compiler version,
+- compiler hash or signature,
+- reproducible builds,
+- deterministic flags,
+- no hidden environment dependence,
+- no telemetry in release builds,
+- audited linker behavior,
+- audited standard library version.
+
+If a compiler plugin is used, it is security-critical.
+
+Compiler plugins must be:
+
+- reviewed,
+- versioned,
+- deterministic,
+- sandboxed where possible,
+- documented.
+
+---
+
+## 22.13 Logging and diagnostics security
+
+Logs are a security surface.
+
+Rules:
+
+- Logs must not contain secrets.
+- Logs must not contain unvalidated user-controlled format strings.
+- Logs must not contain unbounded user input.
+- Logs must be rate-limited where appropriate.
+- Error messages must not leak sensitive internal state.
+- Stack traces must be disabled or redacted in production where required.
+- Debug assertions must not expose secrets.
+
+In CEP-0, logging is banned unless:
+
+- logging is cold,
+- logging is lock-free where required,
+- logging cannot block the hot path,
+- logging cannot allocate in the hot path.
+
+---
+
+## 22.14 Security comment fields
+
+Security-sensitive code must include additional comment fields.
+
+Required where relevant:
+
+```cpp
+// CEP:SECURITY:
+// CEP:TRUST:
+// CEP:THREAT:
+// CEP:UNSAFE:
+```
+
+### `CEP:SECURITY`
+
+Describes security role.
+
+Examples:
+
+```cpp
+// CEP:SECURITY: Parses untrusted binary input.
+```
+
+```cpp
+// CEP:SECURITY: constant-time comparison of authentication tags.
+```
+
+### `CEP:TRUST`
+
+Describes input trust level.
+
+Allowed values:
+
+```text
+trusted
+validated
+untrusted
+```
+
+Example:
+
+```cpp
+// CEP:TRUST: untrusted until validate_packet returns success.
+```
+
+### `CEP:THREAT`
+
+Describes threats considered.
+
+Example:
+
+```cpp
+// CEP:THREAT: malformed length, integer overflow, out-of-bounds read.
+```
+
+### `CEP:UNSAFE`
+
+Describes unsafe operations.
+
+Example:
+
+```cpp
+// CEP:UNSAFE: pointer arithmetic bounded by checked length.
+```
+
+If no unsafe behavior exists:
+
+```cpp
+// CEP:UNSAFE: none
+```
+
+---
+
+## 22.15 Security checklist
+
+A change is security-compliant only if:
+
+- [ ] Threat model is documented.
+- [ ] Trust boundaries are explicit.
+- [ ] All untrusted input is validated.
+- [ ] Integer operations are safe or explicitly documented.
+- [ ] Memory safety is enforced.
+- [ ] Unsafe code is isolated and documented.
+- [ ] FFI boundaries validate all inputs.
+- [ ] No secrets appear in logs or errors.
+- [ ] Side-channel policy is documented.
+- [ ] Resource limits are explicit.
+- [ ] Dependencies are pinned and reviewed.
+- [ ] Toolchain is pinned and reproducible.
+- [ ] Sanitizers pass.
+- [ ] Fuzz tests pass where input is untrusted.
+
+---
+
+# 23. Optimal code
+
+This chapter defines what CEP&CC means by “optimal code.”
+
+The term “optimal” must not be used as a vague compliment.
+
+In CEP&CC, optimality is a normative claim with evidence.
+
+---
+
+## 23.1 Literal optimal code definition
+
+CEP&CC defines three optimality classes.
+
+### OPT-0: Locally optimal
+
+A function is locally optimal if, under the documented target and cost model, no known implementation satisfying the same observable behavior has lower measured cost.
+
+This is the minimum required claim for CEP-0 hot code.
+
+### OPT-1: Lower-bound optimal
+
+A function is lower-bound optimal if the implementer provides a lower-bound argument showing that the function cannot be faster under the documented cost model.
+
+Examples of lower-bound arguments:
+
+- must read N bytes,
+- must write M bytes,
+- must execute at least K dependent operations,
+- must perform at least one branch due to input-dependent control flow,
+- must call a hardware instruction with known latency,
+- must touch at least P cache lines.
+
+### OPT-2: Provably optimal
+
+A function is provably optimal if a formal or exhaustive proof shows optimality under a precise cost model.
+
+This is rare and only required where justified.
+
+---
+
+## 23.2 Practical meaning of “literally optimal”
+
+For CEP&CC, “literally optimal” means:
+
+> The implementation performs no instruction, memory access, branch, allocation, synchronization, or hidden work that is not required by the observable specification, target cost model, and chosen failure policy.
+
+This means optimal code must not contain:
+
+- redundant loads,
+- redundant stores,
+- redundant branches,
+- redundant copies,
+- hidden temporaries,
+- hidden allocations,
+- hidden synchronization,
+- hidden initialization,
+- hidden exception machinery,
+- hidden type erasure,
+- hidden virtual dispatch,
+- hidden formatting,
+- hidden logging,
+- hidden locale behavior,
+- hidden I/O,
+- hidden allocator calls,
+- hidden bounds checks in release unless required by security policy,
+- hidden compiler runtime calls,
+- hidden dynamic initialization,
+- hidden destructor work,
+- hidden cleanup paths that are semantically unnecessary.
+
+---
+
+## 23.3 Optimality is target-relative
+
+There is no universal optimal code.
+
+Optimality is always relative to:
+
+- target ISA,
+- target microarchitecture,
+- compiler version,
+- compile flags,
+- memory hierarchy,
+- branch predictor state,
+- cache state,
+- input distribution,
+- failure policy,
+- security policy,
+- determinism policy.
+
+Therefore every optimality claim must specify the target.
+
+Bad:
+
+```cpp
+// optimal
+```
+
+Good:
+
+```cpp
+// CEP:OPTIMAL: target-optimal on arm64-a78 for aligned 64-byte cache-line inputs.
+```
+
+---
+
+## 23.4 Optimality evidence
+
+An optimality claim requires evidence.
+
+Evidence may include:
+
+- disassembly,
+- instruction count,
+- dependency-chain analysis,
+- measured cycles,
+- measured uops,
+- measured cache misses,
+- measured branch mispredictions,
+- lower-bound argument,
+- exhaustive search,
+- compiler output comparison,
+- handwritten assembly comparison,
+- benchmark suite artifact.
+
+Required comment fields:
+
+```cpp
+// CEP:OPTIMAL:
+// CEP:OPTPROOF:
+```
+
+Examples:
+
+```cpp
+// CEP:OPTIMAL: target-optimal
+// CEP:OPTPROOF: bench CEP-201; minimum required loads = 8; measured loads = 8.
+```
+
+```cpp
+// CEP:OPTIMAL: lower-bound optimal
+// CEP:OPTPROOF: function must read 32 bytes and write 16 bytes; measured memory ops match lower bound.
+```
+
+---
+
+## 23.5 Optimality requirements for CEP-0
+
+CEP-0 hot code must be at least OPT-0.
+
+To claim OPT-0, the following must be true:
+
+1. The function is measured.
+2. The target is documented.
+3. The input classes are documented.
+4. The cost model is documented.
+5. Alternatives were considered.
+6. Disassembly was reviewed.
+7. No hidden work exists.
+8. No cheaper known implementation exists.
+9. The claim is reviewed.
+10. The evidence is stored.
+
+A CEP-0 function cannot be marked:
+
+```cpp
+// CEP:STATUS: complete
+```
+
+unless it also has either:
+
+```cpp
+// CEP:OPTIMAL: target-optimal
+```
+
+or:
+
+```cpp
+// CEP:OPTIMAL: not-optimal
+```
+
+with an optimization ticket if performance matters.
+
+If the function is not optimal but acceptable, it must say:
+
+```cpp
+// CEP:OPTIMAL: not-optimal
+// CEP:OPTNOTE: acceptable due to maintainability; see CEP-771.
+```
+
+Do not lie about optimality.
+
+---
+
+## 23.6 Code-level optimality criteria
+
+Optimal code should satisfy the following where applicable.
+
+### 23.6.1 Minimal work
+
+The function must not do unnecessary work.
+
+Banned examples:
+
+- recomputing invariant values inside loops,
+- copying values that could be moved or referenced,
+- formatting strings that are not used,
+- checking conditions that are already proven,
+- initializing memory that will be immediately overwritten,
+- calling destructors for trivial objects unnecessarily,
+- performing virtual dispatch where static dispatch is possible.
+
+### 23.6.2 Minimal memory traffic
+
+Optimal code minimizes memory traffic.
+
+Required considerations:
+
+- read each required input once,
+- write each required output once,
+- avoid false sharing,
+- avoid cache-line splitting,
+- avoid misaligned access,
+- avoid unnecessary cache invalidation,
+- avoid pointer chasing where contiguous layout is possible,
+- prefer structure-of-arrays where vectorization matters.
+
+### 23.6.3 Minimal branching
+
+Optimal code avoids unnecessary branches.
+
+Branch reduction requires:
+
+- profile evidence,
+- branchless alternatives considered,
+- predication considered,
+- lookup tables considered,
+- jump tables considered,
+- switch lowering inspected.
+
+Do not remove branches if they are required for:
+
+- security checks,
+- overflow checks,
+- bounds checks,
+- failure handling,
+- correctness.
+
+Security checks are not “unnecessary work” unless proven redundant.
+
+### 23.6.4 Minimal indirection
+
+Optimal code avoids unnecessary indirection.
+
+Banned in hot optimal code unless required:
+
+- virtual functions,
+- function pointers,
+- `std::function`,
+- type-erased iterators,
+- dynamic dispatch,
+- pointer-to-pointer chains,
+- polymorphic allocators,
+- runtime polymorphic containers.
+
+### 23.6.5 Minimal allocation
+
+Optimal hot code does not allocate.
+
+Allocation is hidden work and usually nondeterministic.
+
+Allowed allocation only if:
+
+- done before entering hot path,
+- arena-based,
+- bounded,
+- measured,
+- documented.
+
+### 23.6.6 Minimal compile-time residue
+
+Optimal code should not leave unnecessary compile-time residue.
+
+Prefer:
+
+- `constexpr`,
+- `consteval`,
+- compile-time tables,
+- template specialization only where necessary,
+- static reflection only if generated code is audited.
+
+Compile-time work is not free. It must be budgeted.
+
+---
+
+## 23.7 Optimality and security
+
+Security checks may prevent some forms of micro-optimization.
+
+CEP&CC rule:
+
+> Security correctness beats micro-optimality.
+
+A function that is faster but exploitable is not optimal.
+
+If a security check costs cycles, it must be documented as required cost.
+
+Example:
+
+```cpp
+// CEP:OPTNOTE: bounds check retained; required for untrusted input security.
+```
+
+Do not remove bounds checks to claim optimality unless the input is trusted or proven safe.
+
+---
+
+## 23.8 Optimality and clean code
+
+Clean code is required for optimality because hidden cost hides in unclear code.
+
+A reviewer cannot certify optimal code if:
+
+- ownership is unclear,
+- lifetimes are unclear,
+- assumptions are unclear,
+- failure behavior is unclear,
+- branch probabilities are unclear,
+- memory layout is unclear,
+- target dependencies are unclear.
+
+Therefore clean-code violations are optimality blockers.
+
+---
+
+## 23.9 Optimality comment examples
+
+Good:
+
+```cpp
+// CEP:OPTIMAL: target-optimal
+// CEP:OPTPROOF: bench CEP-301; 16 loads, 16 stores, 0 branches; matches required memory lower bound.
+```
+
+Good:
+
+```cpp
+// CEP:OPTIMAL: not-optimal
+// CEP:OPTNOTE: uses scalar loop; vectorization blocked by target errata; see CEP-402.
+```
+
+Bad:
+
+```cpp
+// optimal
+```
+
+Bad:
+
+```cpp
+// fastest possible
+```
+
+Bad:
+
+```cpp
+// should inline well
+```
+
+---
+
+# 24. Multi-language companion policy
+
+CEP&CC recognizes that real systems are rarely pure C++.
+
+However, the standard remains C++26-primary unless otherwise stated.
+
+Companion languages are allowed only when their role is explicit and their code is adapted to CEP&CC rules.
+
+The companion languages defined here are:
+
+1. Rust — safe systems alternative / FFI boundary.
+2. C — legacy/hardware interface.
+3. Zig — modern low-level alternative.
+4. Python / Lua — CEP-2 tooling only.
+
+---
+
+## 24.1 General companion-language rules
+
+All companion-language code must obey the same high-level CEP&CC laws:
+
+- no hidden cost,
+- no silent assumptions,
+- no comment-only invariants,
+- no unmeasured hot code,
+- no unreadable hot code,
+- no unbounded failure,
+- no hard-coded assumptions,
+- no stale documentation,
+- explicit security policy,
+- explicit optimality policy.
+
+Companion-language code must use the same CEP comment schema:
+
+```text
+CEP:WHAT
+CEP:WHY
+CEP:STATUS
+CEP:FAILURE
+CEP:ASSUMES
+CEP:COST
+CEP:EVIDENCE
+CEP:SECURITY
+CEP:OPTIMAL
+CEP:OPTPROOF
+```
+
+If the language comment syntax differs, use the closest line-comment form.
+
+---
+
+# 25. Rust companion policy
+
+## 25.1 Role
+
+Rust is the primary safe-systems companion language.
+
+Its role is:
+
+- safe systems alternative,
+- FFI boundary language,
+- memory-safe component language,
+- tool for isolating unsafe logic behind safe APIs.
+
+Rust is allowed where:
+
+- memory safety is critical,
+- FFI boundaries require safer ownership,
+- components can be built deterministically,
+- runtime cost is compatible with CEP requirements.
+
+---
+
+## 25.2 Why Rust is allowed
+
+Rust is allowed because it provides:
+
+- zero-cost abstractions comparable to C++,
+- memory safety without garbage collection,
+- strong type system,
+- explicit lifetimes,
+- explicit ownership,
+- explicit mutability,
+- `no_std` support,
+- explicit unsafe boundaries.
+
+However, Rust is not automatically safe in performance-critical code. Rust can still hide:
+
+- allocation,
+- panics,
+- dynamic dispatch,
+- drop glue,
+- formatting,
+- iterator overhead,
+- atomics,
+- synchronization,
+- FFI undefined behavior.
+
+Therefore CEP&CC adapts Rust rules as follows.
+
+---
+
+## 25.3 Rust CEP-0 rules
+
+For Rust CEP-0 hot code:
+
+### 25.3.1 Runtime
+
+Banned:
+
+- `std` runtime dependence in hot code,
+- `Box`,
+- `Vec`,
+- `String`,
+- `format!`,
+- `println!`,
+- `eprintln!`,
+- `panic!`,
+- `unwrap`,
+- `expect`,
+- `todo!`,
+- `unimplemented!`,
+- `unreachable!` unless proven and documented,
+- `Rc`,
+- `Arc`,
+- `Mutex`,
+- `RwLock`,
+- channels,
+- thread spawning,
+- dynamic allocation,
+- `async` runtime dependence,
+- `Future` allocation in hot paths,
+- trait objects via `dyn`,
+- dynamic dispatch,
+- formatting machinery,
+- `std::io`,
+- `std::fs`,
+- `std::net`,
+- `std::env`,
+- `std::time` in hot paths unless budgeted.
+
+Required:
+
+- use `core::` over `std::` for hot code,
+- use fixed-size slices `&[T]` and `&mut [T]`,
+- use references with explicit lifetimes,
+- use explicit integer types,
+- use explicit error enums or result types that do not allocate,
+- use `#[inline]` only where justified,
+- use `#[repr(C)]` or explicit layout for FFI types,
+- use `#[no_mangle]` only for FFI exports,
+- use `extern "C"` or explicit ABI for FFI functions.
+
+---
+
+## 25.4 Rust panic policy
+
+CEP-0 Rust functions must be panic-free or have proof that panic cannot occur.
+
+Use one of:
+
+- `#![no_std]`,
+- `panic = "abort"` in release profile,
+- static analysis,
+- review,
+- tests,
+- contracts,
+- `#[should_panic]` banned in CEP-0 tests unless testing failure behavior.
+
+Banned in CEP-0:
+
+```rust
+.unwrap()
+.expect("...")
+panic!("...")
+```
+
+Allowed only if proof exists:
+
+```rust
+// CEP:ASSUMES: index is checked immediately above.
+// CEP:SECURITY: bounds check retained.
+```
+
+If a panic is possible, the function is not CEP-0-complete.
+
+---
+
+## 25.5 Rust allocation policy
+
+Allocation is banned in Rust CEP-0.
+
+Banned:
+
+- `Box::new`,
+- `Vec::new`,
+- `Vec::push`,
+- `String::new`,
+- `String::push_str`,
+- `alloc::vec::Vec` in hot paths,
+- any global allocator dependence.
+
+Allowed:
+
+- stack allocation,
+- fixed arrays,
+- slices,
+- caller-provided buffers,
+- arena allocation if the arena is initialized before hot path and deterministic.
+
+---
+
+## 25.6 Rust trait object policy
+
+Trait objects are banned in CEP-0.
+
+Banned:
+
+```rust
+&dyn Trait
+Box<dyn Trait>
+Arc<dyn Trait>
+```
+
+Reason:
+
+Trait objects introduce dynamic dispatch, which is equivalent to hidden virtual dispatch.
+
+Allowed alternatives:
+
+- generics,
+- static dispatch,
+- enums,
+- function pointer tables if measured,
+- compile-time polymorphism.
+
+---
+
+## 25.7 Rust unsafe policy
+
+Unsafe Rust is restricted.
+
+Allowed only when:
+
+- safe Rust cannot express the operation,
+- the unsafe block is isolated,
+- invariants are documented,
+- FFI requires it,
+- hardware access requires it.
+
+Every unsafe block must have:
+
+```rust
+// CEP:UNSAFE: pointer arithmetic bounded by checked slice length.
+// CEP:ASSUMES: ptr is aligned to 4 bytes; checked above.
+// CEP:SECURITY: input is untrusted; bounds validated.
+```
+
+Unsafe code must not leak invariants.
+
+A safe function wrapping unsafe code must uphold all safe guarantees.
+
+---
+
+## 25.8 Rust FFI policy
+
+Rust FFI types must have explicit layout.
+
+Required:
+
+```rust
+#[repr(C)]
+```
+
+or:
+
+```rust
+#[repr(transparent)]
+```
+
+where appropriate.
+
+FFI functions must specify ABI:
+
+```rust
+pub extern "C" fn cep_decode(...)
+```
+
+FFI functions must not unwind across the boundary.
+
+Use:
+
+```rust
+#[no_mangle]
+pub extern "C" fn ...
+```
+
+only when required.
+
+FFI inputs must be validated:
+
+- pointers checked for null if nullable,
+- lengths checked,
+- alignment checked,
+- enum values checked,
+- lifetimes cannot be assumed from C/C++.
+
+---
+
+## 25.9 Rust comment example
+
+```rust
+// CEP:WHAT: Decodes a fixed-size 32-bit opcode table entry.
+// CEP:WHY: Table lookup is faster than match for hot decoder path.
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns DecodeError::BadOpcode for invalid opcode.
+// CEP:ASSUMES: opcode < 128; checked by caller.
+// CEP:COST: 3 cycles expected on arm64-a78, artifact bench-rs-19.
+// CEP:EVIDENCE: bench CEP-RS-0019
+// CEP:SECURITY: opcode may come from untrusted input.
+// CEP:OPTIMAL: target-optimal
+// CEP:OPTPROOF: one table load, one branch, no allocation.
+#[no_mangle]
+pub extern "C" fn cep_decode_opcode(opcode: u8) -> DecodeResult {
+    if opcode >= 128 {
+        return DecodeResult::err(DecodeError::BadOpcode);
+    }
+
+    // CEP:WHAT: Safe table access.
+    // CEP:WHY: Bounds check ensures no out-of-bounds read.
+    // CEP:SECURITY: bounds check retained for untrusted input.
+    let entry = OPCODE_TABLE[opcode as usize];
+    DecodeResult::ok(entry)
+}
+```
+
+---
+
+# 26. C companion policy
+
+## 26.1 Role
+
+C is allowed for:
+
+- ABI stability,
+- kernel interfaces,
+- hypervisor interfaces,
+- embedded bare-metal code,
+- hardware registers,
+- legacy firmware interfaces,
+- stable C ABI boundaries.
+
+C is unavoidable in OS-adjacent and hardware-adjacent code.
+
+However, C is unsafe by default and must be restricted.
+
+---
+
+## 26.2 C standard subset
+
+C code must follow a strict subset.
+
+Acceptable baseline:
+
+- MISRA-C:2023, or
+- CERT-C, or
+- a project-defined subset that is at least as strict.
+
+If MISRA-C and CEP&CC conflict, the stricter rule applies unless waived.
+
+---
+
+## 26.3 C language restrictions
+
+For CEP-0 C code:
+
+Banned:
+
+- dynamic allocation,
+- `malloc`,
+- `calloc`,
+- `realloc`,
+- `free`,
+- `alloca`,
+- variable-length arrays,
+- recursion,
+- varargs,
+- floating point unless required,
+- standard library calls unless intrinsic-like and target-approved,
+- implicit integer promotion surprises,
+- implicit narrowing,
+- implicit signed/unsigned mixing,
+- macro logic,
+- undefined behavior,
+- uninitialized reads,
+- out-of-bounds access,
+- non-reentrant library functions,
+- locale-dependent functions,
+- I/O functions,
+- formatted printing,
+- file operations,
+- environment access.
+
+Required:
+
+- fixed-width types only,
+- explicit casts where conversion is intentional,
+- explicit bounds checks,
+- explicit alignment checks,
+- explicit volatile only for MMIO,
+- `_Static_assert` for compile-time assumptions,
+- `static inline` for small hot functions where appropriate,
+- deterministic failure behavior.
+
+---
+
+## 26.4 Fixed-width types
+
+C code must use fixed-width types exclusively for binary, hardware, ABI, and performance-critical code.
+
+Required headers:
+
+```c
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+```
+
+Use:
+
+```c
+uint8_t
+uint16_t
+uint32_t
+uint64_t
+int8_t
+int16_t
+int32_t
+int64_t
+uintptr_t
+size_t
+ptrdiff_t
+```
+
+Banned as primary types in hot or ABI code:
+
+```c
+int
+long
+unsigned
+unsigned long
+short
+char
+```
+
+unless required by a documented C ABI.
+
+---
+
+## 26.5 C macro policy
+
+Macros are treated as defects unless justified.
+
+Allowed macros:
+
+- include guards,
+- feature gates,
+- target configuration,
+- compiler workaround macros,
+- `CEP_` prefixed constants.
+
+Banned macros:
+
+- macro-generated control flow,
+- macro-generated loops,
+- macro-generated types,
+- macro-generated functions,
+- macro DSLs,
+- macro-based reflection,
+- macro-based serialization.
+
+If a macro is required, it must have:
+
+```c
+// CEP:WHAT:
+// CEP:WHY:
+// CEP:STATUS:
+// CEP:FAILURE:
+// CEP:ASSUMES:
+// CEP:COST:
+// CEP:EVIDENCE:
+```
+
+---
+
+## 26.6 C standard library policy
+
+CEP-0 C code must not call the standard library except for:
+
+- compiler intrinsics,
+- inline assembly wrappers,
+- freestanding headers,
+- target-specific runtime hooks explicitly approved.
+
+Banned:
+
+- `printf`,
+- `fprintf`,
+- `snprintf`, unless cold and bounded,
+- `memcpy`? Conditional.
+
+Important note: `memcpy`, `memset`, `memcmp` may be acceptable if target libc implementations are deterministic and measured. However, in strict CEP-0, even these must be approved because they may call optimized library routines with variable behavior.
+
+If `memcpy` is used, document:
+
+```c
+// CEP:ASSUMES: memcpy is inline or deterministic for size <= 64 bytes.
+```
+
+---
+
+## 26.7 C pointer rules
+
+Pointers must be explicit.
+
+Rules:
+
+- pointer arithmetic only within known bounds,
+- no NULL dereference,
+- no dangling pointers,
+- no aliasing violations,
+- no casts that violate alignment,
+- no casts that violate strict aliasing,
+- no pointer-to-integer assumptions unless target-defined.
+
+Use `uintptr_t` only for target-specific proven cases.
+
+---
+
+## 26.8 C volatile rules
+
+`volatile` is only for hardware registers and MMIO.
+
+Do not use `volatile` for:
+
+- locks,
+- atomics,
+- timing,
+- preventing optimization of benchmarks,
+- thread communication.
+
+---
+
+## 26.9 C comment example
+
+```c
+// CEP:WHAT: Reads a 32-bit MMIO register.
+// CEP:WHY: Hardware register must not be reordered or cached.
+// CEP:STATUS: complete
+// CEP:FAILURE: none if address is target-valid.
+// CEP:ASSUMES: addr is 4-byte aligned and target-mapped.
+// CEP:COST: one volatile load; target-specific latency.
+// CEP:EVIDENCE: target manual section 12.4, bench C-011.
+// CEP:SECURITY: MMIO input may be untrusted; caller validates value.
+// CEP:OPTIMAL: target-optimal
+// CEP:OPTPROOF: single required load.
+static inline uint32_t cep_mmio_read_u32(volatile uint32_t const* addr)
+{
+    return *addr;
+}
+```
+
+---
+
+# 27. Zig companion policy
+
+## 27.1 Role
+
+Zig is allowed as a modern low-level alternative.
+
+Its role is:
+
+- explicit allocator control,
+- comptime metaprogramming,
+- C-ABI interoperability,
+- embedded code,
+- explicit error handling,
+- replacement for some C/C++ template patterns.
+
+Zig is allowed where its explicitness improves CEP&CC compliance.
+
+---
+
+## 27.2 Why Zig is allowed
+
+Zig provides:
+
+- explicit allocators,
+- comptime evaluation,
+- no hidden function calls in many contexts,
+- explicit error unions,
+- straightforward C ABI interop,
+- packed/extern structs,
+- compile-time generics without C++ template syntax.
+
+However, Zig can still hide cost through:
+
+- allocator choice,
+- runtime safety checks,
+- comptime explosion,
+- `anytype` instantiation,
+- error handling paths,
+- standard library dependencies.
+
+Therefore CEP&CC adapts Zig rules as follows.
+
+---
+
+## 27.3 Zig CEP-0 rules
+
+For Zig CEP-0 hot code:
+
+Banned:
+
+- default allocator dependence,
+- heap allocation in hot paths,
+- `std.debug.print`,
+- `std.io`,
+- `std.fs`,
+- `std.Thread`,
+- `std.Mutex` in hot paths unless justified,
+- `panic` in hot paths,
+- `unreachable` unless proven and documented,
+- runtime recursion,
+- unbounded comptime expansion,
+- hidden error handling allocation,
+- dynamic dispatch in hot paths,
+- opaque interface-style dynamic dispatch unless measured.
+
+Required:
+
+- explicit allocator parameter where allocation is possible,
+- fixed buffer allocator or arena allocator for bounded allocation,
+- explicit error unions for recoverable errors,
+- explicit alignment checks,
+- explicit packed/extern structs for ABI,
+- explicit target configuration,
+- deterministic comptime output.
+
+---
+
+## 27.4 Zig allocator policy
+
+Zig’s explicit allocator model is a CEP&CC strength.
+
+Use it strictly.
+
+Banned in CEP-0:
+
+- `std.heap.page_allocator`,
+- `std.heap.c_allocator`,
+- `std.heap.wasm_allocator`,
+- any default allocator that may perform hidden OS allocation.
+
+Allowed:
+
+- stack allocation,
+- fixed buffer allocator,
+- caller-provided arena,
+- static arena initialized before hot path.
+
+Example:
+
+```zig
+// CEP:ASSUMES: allocator is a fixed buffer allocator initialized before hot path.
+```
+
+---
+
+## 27.5 Zig `anytype` policy
+
+`anytype` is restricted.
+
+Allowed:
+
+- compile-time-only contexts,
+- generic utilities with explicit instantiation list,
+- code where all instantiations are reviewed.
+
+Banned:
+
+- runtime-polymorphic use,
+- unbounded generic instantiation,
+- hidden dynamic behavior,
+- hot code where the concrete type is not obvious.
+
+`anytype` is analogous to C++ templates and generic lambdas. It must not hide cost.
+
+---
+
+## 27.6 Zig error policy
+
+CEP-0 Zig functions must use explicit error unions for recoverable failure.
+
+Required:
+
+```zig
+!ReturnType
+```
+
+or explicit error enum.
+
+Banned as primary failure mechanism in CEP-0:
+
+- `panic`,
+- `unreachable`,
+- `std.debug.assert` as release validation,
+- crash-on-error unless the failure policy is fatal.
+
+If `unreachable` is used, it must be proven:
+
+```zig
+// CEP:ASSUMES: state enum is exhaustive; invalid state prevented by type.
+// CEP:FAILURE: unreachable in valid builds.
+```
+
+---
+
+## 27.7 Zig comptime policy
+
+Comptime is powerful and must be controlled.
+
+Allowed:
+
+- compile-time tables,
+- compile-time validation,
+- compile-time code generation,
+- layout computation,
+- constant folding.
+
+Banned:
+
+- comptime code that produces unreadable generated code,
+- comptime code with nondeterministic output,
+- comptime code that explodes compile time,
+- comptime code that hides runtime branches,
+- comptime code that depends on unstable environment.
+
+Generated Zig code is subject to CEP&CC review.
+
+---
+
+## 27.8 Zig ABI and FFI
+
+FFI types must use explicit layout.
+
+Use:
+
+```zig
+extern struct
+```
+
+or:
+
+```zig
+packed struct
+```
+
+depending on ABI requirement.
+
+FFI functions must specify calling convention:
+
+```zig
+extern "C"
+```
+
+or Zig equivalent.
+
+FFI boundaries must validate:
+
+- pointers,
+- lengths,
+- alignment,
+- enum values,
+- error codes.
+
+---
+
+## 27.9 Zig comment example
+
+```zig
+// CEP:WHAT: Computes bounded checksum over u32 slice.
+// CEP:WHY: Validation requires allocation-free checksum.
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns error.Empty for empty slice.
+// CEP:ASSUMES: slice pointer is 4-byte aligned; Zig slice guarantees non-null.
+// CEP:COST: 1 cycle/element on target, bench ZIG-010.
+// CEP:EVIDENCE: bench CEP-ZIG-0010
+// CEP:SECURITY: input may be untrusted; length bounded by caller.
+// CEP:OPTIMAL: target-optimal
+// CEP:OPTPROOF: one load and one add per element.
+pub fn checksum(items: []const u32) !u64 {
+    if (items.len == 0) return error.Empty;
+
+    var sum: u64 = 0;
+    for (items) |x| {
+        sum += x;
+    }
+    return sum;
+}
+```
+
+---
+
+# 28. Python and Lua companion policy
+
+## 28.1 Role
+
+Python and Lua are allowed only for CEP-2 tooling.
+
+Allowed roles:
+
+- build scripts,
+- code generators,
+- test harnesses,
+- benchmark orchestration,
+- report generation,
+- configuration validation,
+- tooling glue.
+
+They are not allowed for CEP-0 or CEP-1 runtime components unless a separate waiver is granted.
+
+---
+
+## 28.2 Why Python/Lua are allowed
+
+They are useful for:
+
+- rapid tooling,
+- orchestration,
+- test automation,
+- code generation,
+- benchmark control,
+- report generation.
+
+Their runtime performance is usually irrelevant to CEP-0 because they operate offline.
+
+However, their output is security-critical and performance-critical.
+
+Therefore:
+
+> Python/Lua tool performance is not important. Tool determinism and output compliance are mandatory.
+
+---
+
+## 28.3 Determinism requirement
+
+Python/Lua tooling must be deterministic.
+
+Required:
+
+- stable iteration order,
+- sorted output where order is not semantic,
+- fixed seeds,
+- fixed locale,
+- fixed timezone if time is used,
+- no dependence on environment unless explicit,
+- no dependence on current working directory unless explicit,
+- no dependence on file iteration order,
+- no dependence on hash randomization,
+- no nondeterministic parallelism unless output is deterministic.
+
+Python-specific:
+
+- set `PYTHONHASHSEED` to fixed value,
+- sort directory listings,
+- use `pathlib` with explicit normalization,
+- avoid `set` iteration for output order,
+- avoid `dict` insertion-order nondeterminism if input order varies,
+- pin dependency versions.
+
+Lua-specific:
+
+- avoid `pairs` for output where order matters,
+- use sorted keys,
+- pin Lua version,
+- avoid OS-dependent behavior unless configured.
+
+---
+
+## 28.4 Generated code rule
+
+Generated C++, Rust, C, or Zig code is fully subject to CEP&CC.
+
+The generator is not exempt because it is written in Python or Lua.
+
+Generated code must include CEP comments or the generator must emit them.
+
+Generated code must not contain:
+
+- hard-coded assumptions,
+- magic numbers,
+- commented-out code,
+- unvalidated FFI,
+- unsafe constructs without comments,
+- nondeterministic layout,
+- unstable ordering,
+- hidden allocation in CEP-0.
+
+Generated code must be reviewed either as source or via golden-file tests.
+
+---
+
+## 28.5 Tool security
+
+Python/Lua tools are a supply-chain attack surface.
+
+Required:
+
+- pinned dependencies,
+- lockfiles,
+- no arbitrary network fetch during release builds,
+- no telemetry,
+- no secrets in scripts,
+- no undocumented subprocess execution,
+- sandboxed code generation where possible,
+- validated input files,
+- validated output paths.
+
+Banned:
+
+- `eval` of untrusted input,
+- `exec` of untrusted input,
+- dynamic import of untrusted modules,
+- shell injection,
+- path traversal,
+- unpickling untrusted data in Python,
+- loading untrusted Lua bytecode.
+
+---
+
+## 28.6 Python example: deterministic generator
+
+```python
+# CEP:WHAT: Generates opcode table header.
+# CEP:WHY: Keeps opcode metadata synchronized with specification.
+# CEP:STATUS: complete
+# CEP:FAILURE: Exits with error if spec file is malformed.
+# CEP:ASSUMES: spec file is UTF-8 and sorted by opcode value.
+# CEP:COST: offline tool; runtime cost irrelevant.
+# CEP:EVIDENCE: golden test cep_opcode_table.hpp.golden.
+# CEP:SECURITY: input is trusted repository file; no network.
+
+def generate_opcode_table(spec: list[OpcodeSpec]) -> str:
+    lines = []
+    lines.append("// Generated by cep_gen_opcode_table.py")
+    lines.append("// Do not edit manually.")
+    lines.append("")
+    lines.append("inline constexpr std::array<OpcodeInfo, 128> kOpcodeTable{{")
+
+    for entry in sorted(spec, key=lambda e: e.value):
+        lines.append(f"    OpcodeInfo{{ .opcode = {entry.value}, .flags = {entry.flags} }},")
+
+    lines.append("};")
+    lines.append("")
+    return "\n".join(lines)
+```
+
+---
+
+# 29. FFI and cross-language integration
+
+FFI is both a security boundary and a performance boundary.
+
+Therefore FFI receives special rules.
+
+---
+
+## 29.1 FFI ownership rules
+
+Every FFI API must answer:
+
+- Who allocates?
+- Who frees?
+- Who owns pointers?
+- Who owns buffers?
+- Who owns error strings?
+- Who owns callbacks?
+- What happens on error?
+- What is the alignment?
+- What is the lifetime?
+- What is the calling convention?
+- What is the threading policy?
+- What is the reentrancy policy?
+- What is the signal-safety policy?
+- What is the interrupt-safety policy?
+
+If any answer is unknown, the FFI API is incomplete.
+
+---
+
+## 29.2 FFI layout rules
+
+FFI structs must use explicit layout.
+
+C++:
+
+- use standard-layout types,
+- avoid virtual functions,
+- avoid exceptions in ABI,
+- avoid `std::vector`, `std::string`, `std::optional`, etc., in stable ABI unless private implementation is controlled.
+
+Rust:
+
+- use `#[repr(C)]`,
+- use explicit integer types,
+- avoid `Vec`, `String`, `Box` in ABI unless ownership is documented.
+
+Zig:
+
+- use `extern struct` or `packed struct`,
+- explicit integer types.
+
+C:
+
+- fixed-width types,
+- no bitfields unless target-defined,
+- no flexible array members unless reviewed.
+
+---
+
+## 29.3 FFI error rules
+
+Do not propagate exceptions across FFI.
+
+C++ FFI functions should be `extern "C"` and `noexcept`.
+
+Rust FFI functions must not unwind.
+
+Zig FFI functions must not panic across boundary.
+
+C FFI functions must return error codes.
+
+Error codes must be documented.
+
+---
+
+## 29.4 FFI validation
+
+All FFI inputs must be validated on entry.
+
+Even if the caller is trusted, validate where feasible because FFI callers may be wrong.
+
+Validation includes:
+
+- null checks,
+- alignment checks,
+- length checks,
+- enum range checks,
+- flag checks,
+- callback validity,
+- ownership validity.
+
+FFI validation is security work, not optional performance overhead.
+
+---
+
+# 30. Updated review checklist
+
+Add the following to the existing review checklist.
+
+## Security
+
+- [ ] Threat model documented.
+- [ ] Trust boundaries explicit.
+- [ ] Untrusted input validated.
+- [ ] Integer safety checked.
+- [ ] Memory safety checked.
+- [ ] Unsafe code isolated.
+- [ ] FFI boundary validated.
+- [ ] No secrets in logs.
+- [ ] Side-channel policy documented.
+- [ ] Resource limits explicit.
+- [ ] Supply chain pinned.
+- [ ] Toolchain pinned.
+
+## Optimality
+
+- [ ] Optimality class declared.
+- [ ] Target specified.
+- [ ] Cost model specified.
+- [ ] Evidence attached.
+- [ ] Disassembly reviewed.
+- [ ] Alternatives considered.
+- [ ] Lower-bound argument provided if claimed.
+- [ ] No hidden work.
+- [ ] Security checks not removed without proof.
+- [ ] Optimality comment present.
+
+## Companion languages
+
+- [ ] Language role justified.
+- [ ] CEP comment schema present.
+- [ ] Hot-path bans respected.
+- [ ] FFI layout explicit.
+- [ ] FFI errors explicit.
+- [ ] Allocator policy explicit.
+- [ ] Panic/abort policy explicit.
+- [ ] Generated code reviewed.
+- [ ] Tooling deterministic.
+
+---
+
+# 31. Updated short rule summary
+
+The updated CEP&CC rule summary is:
 
 Use C++26 features only when they are:
 
@@ -4366,8 +6444,18 @@ Use C++26 features only when they are:
 2. zero-runtime or measured,
 3. documented with what/why/failure/status/assumptions/cost/evidence,
 4. free of hard-coded assumptions,
-5. clean enough that their cost is obvious.
+5. clean enough that their cost is obvious,
+6. secure against documented threats,
+7. optimal or explicitly marked non-optimal with justification.
 
-Comments must be zero-cost documentation, but they must never be the only enforcement mechanism.
+Use companion languages only when:
 
-If a comment says it, the code must prove it.
+1. their role is explicit,
+2. their hot-path restrictions are enforced,
+3. FFI boundaries are validated,
+4. generated code is fully CEP&CC-compliant,
+5. tooling is deterministic and pinned.
+
+Comments must remain literal zero runtime cost.
+
+But if a comment says something, the code must prove it.
