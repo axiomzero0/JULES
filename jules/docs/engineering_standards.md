@@ -6434,28 +6434,2133 @@ Add the following to the existing review checklist.
 
 ---
 
-# 31. Updated short rule summary
+Added. Below are the new normative chapters for **file structure**, **naming**, and **violation handling**.
 
-The updated CEP&CC rule summary is:
+This includes the requested extermination policy.
 
-Use C++26 features only when they are:
+The rule is simple:
 
-1. gated by feature-test macros,
-2. zero-runtime or measured,
-3. documented with what/why/failure/status/assumptions/cost/evidence,
-4. free of hard-coded assumptions,
-5. clean enough that their cost is obvious,
-6. secure against documented threats,
-7. optimal or explicitly marked non-optimal with justification.
+> Non-compliant code is not merged.  
+> If non-compliant code is discovered after merge, it is quarantined, reverted, or deleted.  
+> We exterminate the code, not the person.
 
-Use companion languages only when:
+---
 
-1. their role is explicit,
-2. their hot-path restrictions are enforced,
-3. FFI boundaries are validated,
-4. generated code is fully CEP&CC-compliant,
-5. tooling is deterministic and pinned.
+# 32. File structure
 
-Comments must remain literal zero runtime cost.
+File structure is part of the standard because bad structure hides cost, ownership, assumptions, and security boundaries.
 
-But if a comment says something, the code must prove it.
+A compliant repository must make the following obvious from the directory tree alone:
+
+- what is hot,
+- what is cold,
+- what is target-specific,
+- what is generated,
+- what is third-party,
+- what is test code,
+- what is benchmark code,
+- what is tooling,
+- what is configuration,
+- what is security-sensitive,
+- what is FFI,
+- what is documentation.
+
+If a reviewer cannot determine these from the layout, the repository structure is non-compliant.
+
+---
+
+## 32.1 Top-level repository layout
+
+Recommended layout:
+
+```text
+repo/
+├── modules/
+├── source/
+├── include/
+├── target/
+├── hot/
+├── cold/
+├── ffi/
+├── generated/
+├── tests/
+├── benches/
+├── tools/
+├── config/
+├── security/
+├── docs/
+├── scripts/
+├── third_party/
+├── quarantine/
+└── .cep/
+```
+
+Meaning:
+
+| Directory | Purpose |
+|---|---|
+| `modules/` | First-party C++26 module interface units |
+| `source/` | First-party C++ implementation units |
+| `include/` | Public headers only when headers are unavoidable |
+| `target/` | Target-specific code: ISA, OS, ABI, hardware |
+| `hot/` | CEP-0 hot code only |
+| `cold/` | CEP-1/CEP-2 cold code |
+| `ffi/` | FFI boundaries for C, Rust, Zig, C++ |
+| `generated/` | Machine-generated code |
+| `tests/` | Unit, property, contract, and integration tests |
+| `benches/` | Benchmarks and cycle-cost evidence |
+| `tools/` | Build tools, generators, harnesses |
+| `config/` | Target configuration, feature configuration |
+| `security/` | Threat models, security policies, audits |
+| `docs/` | Human documentation |
+| `scripts/` | Python/Lua tooling scripts |
+| `third_party/` | Vendored third-party code |
+| `quarantine/` | Non-compliant code awaiting deletion or repair |
+| `.cep/` | CEP&CC lint config, waivers, evidence metadata |
+
+---
+
+## 32.2 Hot and cold separation
+
+Hot and cold code must not live in the same file unless absolutely unavoidable.
+
+Preferred:
+
+```text
+hot/decoder/opcode_decoder.cppm
+hot/decoder/opcode_decoder.cpp
+cold/decoder/opcode_decoder_diagnostics.cpp
+```
+
+Bad:
+
+```text
+decoder.cpp
+```
+
+where hot decoding, logging, file I/O, and diagnostics are mixed together.
+
+Why:
+
+- hot code must be auditable,
+- cold code must not accidentally enter hot paths,
+- benchmarking becomes easier,
+- security boundaries become clearer,
+- compile-time isolation improves.
+
+---
+
+## 32.3 Module directory rules
+
+C++ modules should mirror architecture.
+
+Example:
+
+```text
+modules/
+├── cep/
+│   ├── core/
+│   │   ├── core.cppm
+│   │   ├── types.cppm
+│   │   ├── result.cppm
+│   │   └── limits.cppm
+│   ├── hot/
+│   │   ├── decoder.cppm
+│   │   ├── checksum.cppm
+│   │   └── dispatch.cppm
+│   ├── cold/
+│   │   ├── diagnostics.cppm
+│   │   └── config_parser.cppm
+│   ├── target/
+│   │   ├── arm64.cppm
+│   │   ├── riscv64.cppm
+│   │   └── x86_64.cppm
+│   └── ffi/
+│       ├── c_abi.cppm
+│       └── rust_abi.cppm
+```
+
+Module names should use dotted form:
+
+```cpp
+export module cep.core.types;
+export module cep.hot.decoder;
+export module cep.target.arm64;
+```
+
+Namespace names should mirror module names:
+
+```cpp
+namespace cep::core::types {}
+namespace cep::hot::decoder {}
+namespace cep::target::arm64 {}
+```
+
+---
+
+## 32.4 Source directory rules
+
+Implementation units mirror module units.
+
+Example:
+
+```text
+source/
+├── cep/
+│   ├── core/
+│   │   ├── types.cpp
+│   │   └── result.cpp
+│   ├── hot/
+│   │   ├── decoder.cpp
+│   │   └── checksum.cpp
+│   ├── cold/
+│   │   └── config_parser.cpp
+│   └── target/
+│       └── arm64/
+│           ├── cache.cpp
+│           └── barriers.cpp
+```
+
+Rules:
+
+- One primary component per file.
+- No file may contain both CEP-0 and CEP-1 code unless separated by explicit sections and approved.
+- No target-specific code may live in generic source directories.
+- No generated code may live in handwritten source directories.
+- No third-party code may live in first-party source directories.
+
+---
+
+## 32.5 Target directory rules
+
+Target-specific code must be isolated.
+
+Example:
+
+```text
+target/
+├── arm64/
+│   ├── cache.cppm
+│   ├── barriers.cppm
+│   └── intrinsics.cppm
+├── riscv64/
+│   ├── cache.cppm
+│   └── barriers.cppm
+├── x86_64/
+│   ├── cache.cppm
+│   ├── barriers.cppm
+│   └── inline_asm.cppm
+└── generic/
+    └── fallback.cppm
+```
+
+Allowed inside target directories:
+
+- inline assembly,
+- intrinsics,
+- cache-line constants,
+- memory barriers,
+- MMIO helpers,
+- target-specific alignment rules,
+- target-specific performance counters.
+
+Forbidden outside target directories:
+
+- inline assembly,
+- target intrinsics,
+- target-specific `if` checks,
+- target-specific constants.
+
+Bad:
+
+```cpp
+#if defined(__x86_64__)
+...
+#endif
+```
+
+inside generic hot code.
+
+Good:
+
+```cpp
+#include <cep/target/barriers.hpp>
+```
+
+or:
+
+```cpp
+import cep.target.barriers;
+```
+
+---
+
+## 32.6 FFI directory rules
+
+FFI code must live in dedicated FFI directories.
+
+Example:
+
+```text
+ffi/
+├── cpp/
+│   ├── decoder_api.cppm
+│   └── decoder_api.cpp
+├── c/
+│   ├── cep_decoder.h
+│   └── cep_decoder.c
+├── rust/
+│   ├── decoder_ffi.rs
+│   └── Cargo.toml
+└── zig/
+    └── decoder_ffi.zig
+```
+
+FFI directories must contain:
+
+- ABI definitions,
+- validation code,
+- layout tests,
+- ownership documentation,
+- error-code documentation.
+
+FFI directories must not contain business logic.
+
+FFI should be thin.
+
+Good FFI:
+
+```text
+validate -> convert -> call internal API -> convert result -> return
+```
+
+Bad FFI:
+
+```text
+parse -> allocate -> optimize -> lower -> emit -> log
+```
+
+---
+
+## 32.7 Generated code rules
+
+Generated code must be isolated.
+
+Example:
+
+```text
+generated/
+├── opcode_table.hpp
+├── opcode_table.cpp
+├── error_codes.rs
+├── ir_nodes.zig
+└── diagnostics.c
+```
+
+Every generated file must begin with a generator comment.
+
+Example:
+
+```cpp
+// GENERATED FILE
+// Generator: tools/gen_opcode_table.py
+// Generator CEP:STATUS: complete
+// Generator CEP:EVIDENCE: golden test opcode_table.golden
+// Do not edit manually.
+```
+
+Rules:
+
+- generated files must not be manually edited,
+- generated files must be reproducible,
+- generated files must have golden tests,
+- generated files must include generator identity,
+- generated files must include CEP comments or emit them,
+- generated files must not introduce hard-coded assumptions.
+
+If a generator emits CEP-0 code, the generator itself is performance-critical and security-critical.
+
+---
+
+## 32.8 Test directory rules
+
+Tests must mirror source and modules.
+
+Example:
+
+```text
+tests/
+├── unit/
+│   ├── core/
+│   │   ├── result_test.cpp
+│   │   └── limits_test.cpp
+│   ├── hot/
+│   │   ├── decoder_test.cpp
+│   │   └── checksum_test.cpp
+│   └── ffi/
+│       └── c_abi_test.cpp
+├── property/
+├── contract/
+├── fuzz/
+├── security/
+└── golden/
+```
+
+Rules:
+
+- every CEP-0 function requires tests,
+- every security validation function requires adversarial tests,
+- every FFI boundary requires layout tests,
+- every generated file requires golden tests,
+- every stub requires a test proving it fails loudly in debug,
+- every placeholder requires a test proving it is not used in release.
+
+---
+
+## 32.9 Benchmark directory rules
+
+Benchmarks are evidence, not decoration.
+
+Example:
+
+```text
+benches/
+├── hot/
+│   ├── decoder_bench.cpp
+│   └── checksum_bench.cpp
+├── target/
+│   ├── arm64/
+│   └── x86_64/
+└── artifacts/
+```
+
+Benchmark artifacts must include:
+
+- compiler version,
+- flags,
+- target CPU,
+- input data,
+- date or artifact ID,
+- measured cycles,
+- disassembly hash,
+- regression threshold.
+
+Benchmarks must be deterministic.
+
+---
+
+## 32.10 Tools directory rules
+
+Tooling lives here:
+
+```text
+tools/
+├── gen_opcode_table.py
+├── gen_error_codes.py
+├── lint_comments.py
+├── check_assumptions.py
+├── bench_gate.py
+└── exterminate.py
+```
+
+Python/Lua tools are CEP-2, but their output must be CEP-compliant.
+
+Tools must be deterministic.
+
+---
+
+## 32.11 Config directory rules
+
+Configuration values must live here:
+
+```text
+config/
+├── target_arm64.hpp
+├── target_riscv64.hpp
+├── limits.hpp
+├── feature_gates.hpp
+└── security_policy.hpp
+```
+
+Config files must define named constants.
+
+Bad:
+
+```cpp
+constexpr int cache_line = 64;
+```
+
+Good:
+
+```cpp
+namespace cep::target {
+    inline constexpr std::size_t cache_line_bytes = CEP_TARGET_CACHE_LINE_BYTES;
+}
+```
+
+All config constants must have comments:
+
+```cpp
+// CEP:WHAT: Target cache line size.
+// CEP:WHY: Used for alignment and false-sharing avoidance.
+// CEP:STATUS: complete
+// CEP:FAILURE: static_assert if target config missing.
+// CEP:ASSUMES: provided by target manifest.
+// CEP:COST: compile-time only.
+// CEP:EVIDENCE: target manual / bench config.
+```
+
+---
+
+## 32.12 Security directory rules
+
+Security documentation is normative.
+
+Example:
+
+```text
+security/
+├── threat_model.md
+├── trust_boundaries.md
+├── ffi_security.md
+├── unsafe_audit.md
+├── side_channels.md
+└── supply_chain.md
+```
+
+Security documents must be versioned and reviewed.
+
+---
+
+## 32.13 Quarantine directory
+
+Non-compliant code may be moved to:
+
+```text
+quarantine/
+```
+
+Quarantine code:
+
+- is not compiled by default,
+- is not linked,
+- is not shipped,
+- is not benchmarked,
+- is not treated as compliant,
+- must contain a quarantine manifest.
+
+Quarantine manifest example:
+
+```text
+quarantine/
+└── old_decoder/
+    ├── QUARANTINE.md
+    ├── decoder.cpp
+    └── decoder.cppm
+```
+
+`QUARANTINE.md` must contain:
+
+```text
+Reason: hidden allocation in CEP-0
+Violation: CEP&CC 9.2
+Owner: alice
+Ticket: CEP-901
+Deadline: 2026-10-15
+Disposition: repair or exterminate
+```
+
+Quarantine is temporary.
+
+Quarantine is not storage.
+
+If quarantine code is not repaired by its deadline, it is exterminated.
+
+---
+
+# 33. Naming
+
+Naming is normative.
+
+Bad names hide intent. Hidden intent hides cost. Hidden cost violates CEP&CC.
+
+---
+
+## 33.1 General naming principles
+
+Names must be:
+
+- explicit,
+- searchable,
+- pronounceable,
+- consistent,
+- non-clever,
+- non-ambiguous,
+- stable where ABI-stable,
+- reflective of cost class where useful.
+
+Avoid:
+
+- jokes,
+- puns,
+- obscure abbreviations,
+- temporary names,
+- duplicated names across unrelated concepts,
+- names that lie,
+- names that imply speed without evidence,
+- names that imply safety without proof.
+
+Bad:
+
+```cpp
+fast_thing
+```
+
+Bad:
+
+```cpp
+do_it
+```
+
+Bad:
+
+```cpp
+helper2
+```
+
+Bad:
+
+```cpp
+optimized_parser
+```
+
+Good:
+
+```cpp
+decode_opcode
+```
+
+Good:
+
+```cpp
+validate_packet_bounds
+```
+
+Good:
+
+```cpp
+compute_checksum_u32
+```
+
+---
+
+## 33.2 File names
+
+Use lowercase snake_case.
+
+Examples:
+
+```text
+opcode_decoder.cppm
+opcode_decoder.cpp
+packet_validator.cpp
+arm64_barriers.cppm
+checksum_bench.cpp
+decoder_test.cpp
+```
+
+Rules:
+
+- no spaces,
+- no uppercase,
+- no version numbers in file names unless ABI versioning requires it,
+- no dates in file names,
+- no “final”, “new”, “old”, “fixed”,
+- no duplicated names in different layers unless intentional and documented.
+
+Bad:
+
+```text
+DecoderFinal.cpp
+```
+
+Bad:
+
+```text
+parser_new.cpp
+```
+
+Bad:
+
+```text
+checksum2.cpp
+```
+
+---
+
+## 33.3 Hot file names
+
+CEP-0 files should be obviously hot.
+
+Recommended:
+
+```text
+hot/decoder/opcode_decoder.cppm
+hot/checksum/checksum_u32.cppm
+```
+
+or file-level tag:
+
+```cpp
+// CEP:CLASS: CEP-0
+```
+
+If a file contains hot code, the file header must say so.
+
+Example:
+
+```cpp
+// CEP:FILE: hot/decoder/opcode_decoder.cppm
+// CEP:CLASS: CEP-0
+```
+
+---
+
+## 33.4 Cold file names
+
+Cold files should be obviously cold.
+
+Examples:
+
+```text
+cold/diagnostics/log_sink.cpp
+cold/config/config_parser.cpp
+```
+
+File header:
+
+```cpp
+// CEP:FILE: cold/config/config_parser.cpp
+// CEP:CLASS: CEP-1
+```
+
+---
+
+## 33.5 Target file names
+
+Target files must include target identity.
+
+Examples:
+
+```text
+target/arm64/barriers.cppm
+target/x86_64/cache.cppm
+target/riscv64/mmio.cppm
+```
+
+Bad:
+
+```text
+target/barriers.cppm
+```
+
+unless generic.
+
+Good generic fallback:
+
+```text
+target/generic/fallback_barriers.cppm
+```
+
+---
+
+## 33.6 Test file names
+
+Test files must state what they test.
+
+Pattern:
+
+```text
+<component>_test.cpp
+```
+
+Examples:
+
+```text
+opcode_decoder_test.cpp
+checksum_u32_test.cpp
+ffi_c_abi_test.cpp
+```
+
+For property tests:
+
+```text
+opcode_decoder_property_test.cpp
+```
+
+For fuzz tests:
+
+```text
+packet_validator_fuzz_test.cpp
+```
+
+For security tests:
+
+```text
+packet_validator_security_test.cpp
+```
+
+---
+
+## 33.7 Benchmark file names
+
+Pattern:
+
+```text
+<component>_bench.cpp
+```
+
+Examples:
+
+```text
+opcode_decoder_bench.cpp
+checksum_u32_bench.cpp
+```
+
+For target-specific benches:
+
+```text
+opcode_decoder_arm64_bench.cpp
+```
+
+---
+
+## 33.8 Generated file names
+
+Generated files should state their origin.
+
+Examples:
+
+```text
+generated/opcode_table.hpp
+generated/error_codes.rs
+generated/ir_nodes.zig
+```
+
+Generated file header:
+
+```cpp
+// GENERATED FILE
+// Generator: tools/gen_opcode_table.py
+// Do not edit manually.
+```
+
+---
+
+## 33.9 Namespace names
+
+Namespaces must be lowercase and architectural.
+
+Pattern:
+
+```cpp
+namespace cep::<layer>::<component> {}
+```
+
+Examples:
+
+```cpp
+namespace cep::core {}
+namespace cep::hot::decoder {}
+namespace cep::cold::config {}
+namespace cep::target::arm64 {}
+namespace cep::ffi::c {}
+namespace cep::detail {}
+```
+
+Rules:
+
+- no namespace aliases in public APIs unless stable,
+- no `using namespace` in module interfaces,
+- no namespace pollution,
+- no one-letter namespaces except local lambda/template scope.
+
+---
+
+## 33.10 Module names
+
+Use dotted module names.
+
+Examples:
+
+```cpp
+export module cep.core.types;
+export module cep.hot.decoder;
+export module cep.target.arm64.barriers;
+export module cep.ffi.c.decoder;
+```
+
+Module names must match directory and namespace structure.
+
+---
+
+## 33.11 Type names
+
+Types use `PascalCase`.
+
+Examples:
+
+```cpp
+struct OpcodeInfo {};
+class InstructionDecoder {};
+enum class DecodeError : std::uint8_t {};
+using Checksum = std::uint64_t;
+```
+
+Rules:
+
+- no Hungarian notation,
+- no `C` prefix,
+- no `I` interface prefix unless required by legacy policy,
+- no abbreviations unless project-wide glossary defines them.
+
+Bad:
+
+```cpp
+struct OpInfo {};
+```
+
+unless `Op` is a defined term.
+
+Good:
+
+```cpp
+struct OpcodeInfo {};
+```
+
+---
+
+## 33.12 Enum names
+
+Enums use `enum class` and `PascalCase` names.
+
+Enumerator names use `snake_case` or `PascalCase` depending on project choice, but one style must be chosen.
+
+Recommended:
+
+```cpp
+enum class DecodeError : std::uint8_t {
+    none = 0,
+    bad_opcode = 1,
+    bad_operand = 2,
+    unsupported_extension = 3,
+};
+```
+
+Or:
+
+```cpp
+enum class DecodeError : std::uint8_t {
+    None = 0,
+    BadOpcode = 1,
+    BadOperand = 2,
+    UnsupportedExtension = 3,
+};
+```
+
+Do not mix styles.
+
+Rules:
+
+- enums must have explicit underlying type if ABI-stable,
+- enums must not be implicitly converted to integers,
+- use `std::to_underlying` when conversion is required.
+
+---
+
+## 33.13 Function names
+
+Functions use `snake_case`.
+
+Function names should describe the action.
+
+Examples:
+
+```cpp
+auto decode_opcode(std::uint8_t opcode) noexcept -> DecodeResult;
+auto validate_packet(PacketView packet) noexcept -> std::expected<Packet, PacketError>;
+auto compute_checksum_u32(std::span<const std::uint32_t> data) noexcept -> std::uint64_t;
+```
+
+Use verb-first names:
+
+- `decode_`
+- `validate_`
+- `parse_`
+- `compute_`
+- `lower_`
+- `emit_`
+- `schedule_`
+- `allocate_`
+- `reserve_`
+- `flush_`
+- `finish_`
+
+Predicates use:
+
+- `is_`
+- `has_`
+- `can_`
+- `should_`
+
+Examples:
+
+```cpp
+auto is_aligned(const void* ptr, std::size_t alignment) noexcept -> bool;
+auto has_overflow(std::uint32_t a, std::uint32_t b) noexcept -> bool;
+```
+
+Factories use:
+
+- `make_`
+- `create_`
+
+Examples:
+
+```cpp
+auto make_decoder_config() noexcept -> DecoderConfig;
+```
+
+Conversions use:
+
+- `to_`
+- `as_`
+- `into_`
+
+Examples:
+
+```cpp
+auto to_wire_format(const Packet& packet) noexcept -> WirePacket;
+```
+
+---
+
+## 33.14 Variable names
+
+Variables use `snake_case`.
+
+Examples:
+
+```cpp
+std::uint32_t opcode;
+std::size_t frame_index;
+PacketError parse_error;
+```
+
+Rules:
+
+- no single-letter variables except loops, math, template parameters,
+- no abbreviations without glossary,
+- loop indices may be `i`, `j`, `k` only when conventional,
+- iterator names should describe the element.
+
+Bad:
+
+```cpp
+auto x = decode();
+```
+
+Good:
+
+```cpp
+auto decoded_insn = decode();
+```
+
+---
+
+## 33.15 Constant names
+
+Constants use `kPascalCase`.
+
+Examples:
+
+```cpp
+inline constexpr std::size_t kMaxPacketBytes = CEP_LIMIT_MAX_PACKET_BYTES;
+inline constexpr std::uint32_t kInvalidOpcode = 0xFFFFFFFFu;
+```
+
+Magic constants are banned.
+
+Bad:
+
+```cpp
+constexpr int kMax = 4096;
+```
+
+Good:
+
+```cpp
+inline constexpr std::size_t kMaxPacketBytes = CEP_LIMIT_MAX_PACKET_BYTES;
+```
+
+and the limit itself is documented.
+
+---
+
+## 33.16 Macro names
+
+Macros are discouraged, but if used, they must be prefixed.
+
+Required prefix:
+
+```text
+CEP_
+```
+
+Examples:
+
+```cpp
+#define CEP_TARGET_CACHE_LINE_BYTES 64
+#define CEP_HAS_MDSPAN 1
+```
+
+Banned:
+
+```cpp
+#define MAX 4096
+```
+
+Banned:
+
+```cpp
+#define DO_DECODE() ...
+```
+
+---
+
+## 33.17 Template parameter names
+
+Template parameters use `PascalCase`.
+
+Examples:
+
+```cpp
+template <typename Decoder>
+auto decode_all(Decoder& decoder) -> DecodeStatus;
+
+template <std::size_t Alignment>
+class AlignedBuffer;
+```
+
+Concepts use `PascalCase`.
+
+Examples:
+
+```cpp
+template <typename T>
+concept ContiguousBuffer = requires(T buffer) {
+    { buffer.data() } -> std::same_as<std::uint8_t*>;
+    { buffer.size() } -> std::convertible_to<std::size_t>;
+};
+```
+
+---
+
+## 33.18 Error type names
+
+Error types must be explicit.
+
+Patterns:
+
+```cpp
+enum class <component>_error;
+struct <component>_error;
+using <component>_result = std::expected<T, <component>_error>;
+```
+
+Examples:
+
+```cpp
+enum class DecodeError : std::uint8_t;
+using DecodeResult = std::expected<OpcodeInfo, DecodeError>;
+
+enum class PacketError : std::uint8_t;
+using PacketParseResult = std::expected<Packet, PacketError>;
+```
+
+Do not use generic `Error` unless the scope is tiny.
+
+Bad:
+
+```cpp
+enum class Error {};
+```
+
+Good:
+
+```cpp
+enum class DecoderError {};
+```
+
+---
+
+## 33.19 FFI names
+
+FFI symbols must be stable and explicit.
+
+C ABI example:
+
+```c
+extern "C" int cep_decode_opcode(uint8_t opcode, cep_opcode_info* out);
+```
+
+Rules:
+
+- prefix all public C symbols with project prefix,
+- use lowercase snake_case,
+- use fixed-width types,
+- avoid C++ types in C ABI,
+- avoid exceptions,
+- avoid allocation,
+- document ownership.
+
+Good:
+
+```c
+int32_t cep_decoder_validate(const uint8_t* data, size_t size);
+```
+
+Bad:
+
+```c
+int decode(const char* data, int len);
+```
+
+---
+
+## 33.20 Rust naming
+
+Rust follows standard Rust style, but CEP&CC additions apply.
+
+Use:
+
+```rust
+snake_case
+```
+
+for functions and variables.
+
+Use:
+
+```rust
+PascalCase
+```
+
+for types.
+
+Use:
+
+```rust
+SCREAMING_SNAKE_CASE
+```
+
+for constants and statics.
+
+FFI functions must be explicit:
+
+```rust
+#[no_mangle]
+pub extern "C" fn cep_decode_opcode(opcode: u8) -> DecodeResult
+```
+
+Unsafe modules should be named clearly:
+
+```rust
+mod unsafe_decoder;
+```
+
+or:
+
+```rust
+mod ffi;
+```
+
+Do not hide unsafe in generic utility modules.
+
+---
+
+## 33.21 C naming
+
+C uses lowercase snake_case.
+
+Public symbols must have project prefix.
+
+Example:
+
+```c
+uint32_t cep_mmio_read_u32(volatile uint32_t const* addr);
+```
+
+Internal functions may be `static`.
+
+Bad:
+
+```c
+uint32_t read_reg(volatile uint32_t* p);
+```
+
+Good:
+
+```c
+uint32_t cep_mmio_read_u32(volatile uint32_t const* addr);
+```
+
+---
+
+## 33.22 Zig naming
+
+Zig uses standard Zig style.
+
+Functions:
+
+```zig
+camelCase
+```
+
+Types:
+
+```zig
+PascalCase
+```
+
+Constants:
+
+```zig
+camelCase
+```
+
+or project-chosen stable style.
+
+FFI functions should use C-compatible names:
+
+```zig
+export fn cep_decode_opcode(opcode: u8) callconv(.C) DecodeResult
+```
+
+Do not use ambiguous names.
+
+Bad:
+
+```zig
+pub fn doThing(...)
+```
+
+Good:
+
+```zig
+pub fn decodeOpcode(...)
+```
+
+---
+
+## 33.23 Python/Lua tool naming
+
+Python:
+
+```python
+snake_case
+```
+
+for functions and variables.
+
+```python
+PascalCase
+```
+
+for classes.
+
+```python
+UPPER_SNAKE_CASE
+```
+
+for constants.
+
+Files:
+
+```text
+gen_opcode_table.py
+lint_comments.py
+bench_gate.py
+```
+
+Lua:
+
+```lua
+snake_case
+```
+
+recommended.
+
+Tool names must describe the tool.
+
+Bad:
+
+```text
+gen.py
+```
+
+Good:
+
+```text
+gen_opcode_table.py
+```
+
+---
+
+# 34. Violation handling and extermination
+
+CEP&CC is not advisory.
+
+Violations are defects.
+
+Some defects are style issues.
+
+Some defects are security hazards.
+
+Some defects are performance hazards.
+
+Some defects are all three.
+
+The response is proportional to severity, but the default action for non-compliant code is rejection.
+
+---
+
+## 34.1 Prime extermination rule
+
+> Non-compliant code is not allowed to enter the mainline.  
+> If it is detected before merge, it is blocked.  
+> If it is detected after merge, it is quarantined, reverted, or deleted.  
+> The code is exterminated. The person is not.
+
+This standard is about code hygiene, not punishment.
+
+But code that violates security, cycle-exactness, or assumption rules is not allowed to remain alive in the tree.
+
+---
+
+## 34.2 Violation severity classes
+
+### Severity 0: Exterminate immediately
+
+Severity 0 violations are unacceptable.
+
+Examples:
+
+- undefined behavior,
+- memory safety bug,
+- buffer overflow,
+- use-after-free,
+- uninitialized read,
+- uninitialized write,
+- secret leakage,
+- FFI boundary without validation,
+- exception crossing FFI,
+- panic crossing FFI,
+- hidden allocation in CEP-0,
+- hidden locking in CEP-0,
+- hidden I/O in CEP-0,
+- hot-path virtual dispatch,
+- hot-path `dyn Trait` in Rust,
+- hot-path `std::function`,
+- hot-path `std::any`,
+- hot-path macro-generated control flow,
+- hard-coded target assumption,
+- missing layout on FFI type,
+- generated code without golden test,
+- untrusted input parsed without validation,
+- security check removed without proof,
+- benchmark evidence falsified,
+- stale optimality claim knowingly retained.
+
+Response:
+
+1. Block merge.
+2. If already merged, revert or quarantine immediately.
+3. Add regression test.
+4. Add lint rule if possible.
+5. Perform root-cause analysis.
+
+---
+
+### Severity 1: Exterminate unless emergency waiver
+
+Severity 1 violations are serious but may have rare waivers.
+
+Examples:
+
+- missing CEP comment block on hot function,
+- missing `CEP:COST` on CEP-0 function,
+- missing `CEP:FAILURE` on security-sensitive function,
+- missing `CEP:ASSUMES` where assumption exists,
+- TODO without owner and ticket,
+- stub used in production path without ticket,
+- placeholder callable from release path,
+- benchmark missing artifact,
+- non-deterministic Python/Lua generator output,
+- unsafe block without `CEP:UNSAFE`,
+- target-specific code outside target directory,
+- mixed hot/cold file without waiver.
+
+Response:
+
+1. Block merge.
+2. Require repair or deletion.
+3. If emergency waiver is granted, record it in `.cep/waivers/`.
+
+Waivers must include:
+
+```text
+violation
+reason
+owner
+ticket
+security review
+performance review
+expiration date
+```
+
+Waivers without expiration are banned.
+
+---
+
+### Severity 2: Reject and request repair
+
+Severity 2 violations are clean-code violations.
+
+Examples:
+
+- bad naming,
+- missing file header,
+- missing namespace structure,
+- mixed directory placement,
+- vague comment,
+- stale comment,
+- commented-out code,
+- missing `[[nodiscard]]`,
+- missing explicit constructor,
+- magic number in cold code,
+- missing test for cold utility.
+
+Response:
+
+1. CI may warn or fail depending on project strictness.
+2. Reviewer should reject.
+3. Author repairs.
+
+If repeated, code may be quarantined.
+
+---
+
+### Severity 3: Warn and educate
+
+Severity 3 violations are minor style or documentation issues.
+
+Examples:
+
+- inconsistent formatting where formatter is missing,
+- minor comment wording issue,
+- non-blocking naming preference,
+- documentation typo.
+
+Response:
+
+- warn,
+- request cleanup,
+- do not block unless repeated.
+
+---
+
+## 34.3 Automated extermination pipeline
+
+CI must enforce extermination.
+
+Pipeline stages:
+
+1. **Parse**
+   - Check file structure.
+   - Check file headers.
+   - Check CEP comment tags.
+   - Check status tags.
+   - Check TODO owner/ticket.
+
+2. **Compile**
+   - C++26 mode.
+   - Warnings as errors.
+   - Feature gates.
+   - No banned features in hot code.
+
+3. **Static analysis**
+   - Banned functions.
+   - Banned types.
+   - Banned macros.
+   - Hard-coded constants.
+   - Missing static assertions.
+   - Unsafe block comments.
+
+4. **Sanitizers**
+   - ASan.
+   - UBSan.
+   - TSan.
+   - MSan where relevant.
+
+5. **Security**
+   - Fuzz tests.
+   - FFI validation tests.
+   - Secret scanning.
+   - Dependency pinning.
+   - Supply-chain checks.
+
+6. **Performance**
+   - Benchmark gate.
+   - Disassembly diff.
+   - Allocation check.
+   - Virtual call check.
+   - Indirect call check.
+   - Branch regression check.
+
+7. **Determinism**
+   - Generated code reproducibility.
+   - Python/Lua tool determinism.
+   - Golden file tests.
+
+8. **Verdict**
+   - PASS,
+   - WARN,
+   - FAIL,
+   - EXTERMINATE.
+
+If verdict is `EXTERMINATE`, merge is blocked.
+
+---
+
+## 34.4 Extermination actions
+
+When code is exterminated, one of the following actions occurs.
+
+### 34.4.1 Reject
+
+For unmerged code.
+
+The merge request is closed or marked blocked.
+
+Reason must be recorded:
+
+```text
+EXTERMINATED: hidden allocation in CEP-0
+Rule: CEP&CC 9.2
+Evidence: CI run 2026-09-28-1432
+```
+
+### 34.4.2 Revert
+
+For merged code that violates Severity 0 or Severity 1.
+
+Revert commit message:
+
+```text
+Exterminate commit 8f3a2c1
+
+Reason: hidden allocation in CEP-0 hot decoder.
+Rule: CEP&CC 9.2
+Ticket: CEP-901
+Owner: alice
+```
+
+The revert is not optional.
+
+The revert happens before repair if the violation is severe.
+
+### 34.4.3 Quarantine
+
+For code that may be repairable but must not remain active.
+
+Move code to:
+
+```text
+quarantine/
+```
+
+Add manifest:
+
+```text
+QUARANTINE.md
+```
+
+Quarantined code is excluded from build.
+
+### 34.4.4 Delete
+
+For code that is not worth repairing.
+
+Delete:
+
+- dead code,
+- obsolete stubs,
+- expired quarantine,
+- repeated violations,
+- unowned code,
+- code with no tests,
+- code with no evidence,
+- code with stale security claims.
+
+Deletion is a valid maintenance action.
+
+Dead code is a security liability and a performance lie.
+
+---
+
+## 34.5 Human handling
+
+Do not attack people.
+
+Attack the defect.
+
+Good review comment:
+
+```text
+This violates CEP&CC 9.2: hidden allocation in CEP-0.
+The code must be quarantined or repaired before merge.
+```
+
+Bad review comment:
+
+```text
+You wrote terrible code.
+```
+
+Repeated violations by a contributor should trigger:
+
+- additional review,
+- pairing,
+- training,
+- reduced merge privileges,
+- mandatory CEP&CC checklist sign-off.
+
+But the immediate object of extermination is the code.
+
+---
+
+## 34.6 Violation examples and required responses
+
+### Example 1: Hidden allocation in CEP-0
+
+Violation:
+
+```cpp
+auto decode_packet(PacketView view) -> Packet {
+    std::vector<std::uint8_t> buffer;
+    ...
+}
+```
+
+Response:
+
+```text
+EXTERMINATE
+Reason: std::vector allocation in CEP-0.
+Rule: CEP&CC 9.2.
+Action: revert or replace with caller-provided fixed buffer.
+```
+
+---
+
+### Example 2: Missing CEP comments on hot function
+
+Violation:
+
+```cpp
+auto decode_opcode(std::uint8_t opcode) noexcept -> OpcodeInfo;
+```
+
+No CEP block.
+
+Response:
+
+```text
+FAIL
+Reason: missing CEP comment block.
+Rule: CEP&CC 10.2.
+Action: repair before merge.
+```
+
+If function is already in CEP-0 and comments are missing after review, quarantine.
+
+---
+
+### Example 3: Hard-coded cache line size
+
+Violation:
+
+```cpp
+alignas(64) struct Counter {};
+```
+
+No named constant.
+
+Response:
+
+```text
+FAIL
+Reason: hard-coded cache-line assumption.
+Rule: CEP&CC 11.
+Action: use cep::target::cache_line_bytes.
+```
+
+---
+
+### Example 4: FFI without layout
+
+Rust violation:
+
+```rust
+pub struct DecoderState {
+    ...
+}
+```
+
+exported through FFI without `#[repr(C)]`.
+
+Response:
+
+```text
+EXTERMINATE
+Reason: FFI type lacks explicit layout.
+Rule: CEP&CC 25.8.
+Action: add #[repr(C)] and layout tests.
+```
+
+---
+
+### Example 5: Rust panic in hot path
+
+Violation:
+
+```rust
+let value = table[index].unwrap();
+```
+
+Response:
+
+```text
+EXTERMINATE
+Reason: possible panic in CEP-0.
+Rule: CEP&CC 25.4.
+Action: replace with explicit error handling or proof.
+```
+
+---
+
+### Example 6: Zig default allocator in hot path
+
+Violation:
+
+```zig
+var list = std.ArrayList(u8).init(std.heap.page_allocator);
+```
+
+Response:
+
+```text
+EXTERMINATE
+Reason: heap allocation in CEP-0.
+Rule: CEP&CC 27.4.
+Action: replace with fixed buffer or arena.
+```
+
+---
+
+### Example 7: C macro logic
+
+Violation:
+
+```c
+#define DECODE(x) do { ... } while (0)
+```
+
+Response:
+
+```text
+EXTERMINATE
+Reason: macro-generated control flow.
+Rule: CEP&CC 26.5.
+Action: replace with static inline function.
+```
+
+---
+
+### Example 8: Python generator nondeterminism
+
+Violation:
+
+```python
+for key in table.keys():
+    emit(key)
+```
+
+Output depends on unstable order.
+
+Response:
+
+```text
+FAIL
+Reason: nondeterministic generated output.
+Rule: CEP&CC 28.3.
+Action: sort keys or use stable order.
+```
+
+If generated code already merged, regenerate golden files or revert.
+
+---
+
+## 34.7 Waiver process
+
+Waivers are rare, temporary, and documented.
+
+Waivers are stored in:
+
+```text
+.cep/waivers/
+```
+
+Example waiver file:
+
+```text
+.cep/waivers/CEP-901.yaml
+```
+
+Contents:
+
+```yaml
+id: CEP-901
+rule: CEP&CC 9.2
+component: hot/decoder/opcode_decoder.cpp
+violation: inline assembly required due to target errata
+owner: alice
+security_review: bob
+performance_review: carol
+created: 2026-09-28
+expires: 2026-12-31
+status: active
+```
+
+Waivers must not:
+
+- be verbal,
+- be permanent,
+- cover security vulnerabilities without security review,
+- cover undefined behavior unless hardware errata is documented,
+- apply to generated code without generator fix ticket.
+
+Expired waivers automatically trigger extermination.
+
+---
+
+## 34.8 Extermination report
+
+Every extermination produces a report.
+
+Report location:
+
+```text
+.cep/exterminations/
+```
+
+Example:
+
+```text
+.cep/exterminations/2026-09-28-CEP-901.md
+```
+
+Report contents:
+
+```markdown
+# Extermination Report CEP-901
+
+Date: 2026-09-28
+Component: hot/decoder/opcode_decoder.cpp
+Violation: hidden allocation in CEP-0
+Rule: CEP&CC 9.2
+Severity: 0
+Detected by: CI benchmark gate
+Action: reverted commit 8f3a2c1
+Owner: alice
+Follow-up: CEP-902
+Regression test: tests/unit/hot/decoder_allocation_test.cpp
+```
+
+Extermination reports are not optional.
+
+They are institutional memory.
+
+---
+
+## 34.9 Post-extermination process
+
+After extermination, the team must:
+
+1. Identify the root cause.
+2. Add a regression test.
+3. Add lint or CI rule if possible.
+4. Update documentation.
+5. Repair or delete quarantined code.
+6. Close the ticket.
+
+If the same violation recurs three times in the same component, the component is considered structurally non-compliant.
+
+Structural non-compliance requires redesign or deletion.
+
+---
+
+# 35. File header requirements
+
+Every first-party source file must begin with a file-level CEP block.
+
+C++ example:
+
+```cpp
+// CEP:FILE: hot/decoder/opcode_decoder.cppm
+// CEP:WHAT: Module interface for the hot opcode decoder.
+// CEP:WHY: Provides allocation-free opcode decoding for CEP-0 dispatch.
+// CEP:CLASS: CEP-0
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns DecodeError for invalid opcodes. No allocation. No throw.
+// CEP:ASSUMES: Input opcode is a raw untrusted byte; validated inside.
+// CEP:COST: 3 cycles expected on arm64-a78, bench CEP-0019.
+// CEP:EVIDENCE: bench CEP-0019, asm artifact a41c9e2.
+// CEP:SECURITY: Handles untrusted opcode input.
+```
+
+C example:
+
+```c
+// CEP:FILE: target/arm64/mmio.c
+// CEP:WHAT: MMIO access helpers for arm64 target.
+// CEP:WHY: Hardware registers require volatile accesses with explicit ordering.
+// CEP:CLASS: CEP-0
+// CEP:STATUS: complete
+// CEP:FAILURE: none if caller provides valid aligned target address.
+// CEP:ASSUMES: address is 4-byte aligned and target-mapped.
+// CEP:COST: one volatile load/store per access.
+// CEP:EVIDENCE: target manual section 12.4.
+// CEP:SECURITY: MMIO values are untrusted and must be validated by caller.
+```
+
+Rust example:
+
+```rust
+// CEP:FILE: ffi/decoder_ffi.rs
+// CEP:WHAT: C ABI FFI for opcode decoder.
+// CEP:WHY: Provides stable C interface to Rust decoder.
+// CEP:CLASS: FFI
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns error code; does not panic.
+// CEP:ASSUMES: C caller validates pointer validity where possible.
+// CEP:COST: one table lookup after validation.
+// CEP:EVIDENCE: bench CEP-RS-0019.
+// CEP:SECURITY: FFI boundary; all inputs validated.
+```
+
+Zig example:
+
+```zig
+// CEP:FILE: ffi/decoder_ffi.zig
+// CEP:WHAT: C ABI FFI for opcode decoder.
+// CEP:WHY: Exposes deterministic decoder to C/C++.
+// CEP:CLASS: FFI
+// CEP:STATUS: complete
+// CEP:FAILURE: Returns error enum; no panic.
+// CEP:ASSUMES: caller provides valid slice bounds.
+// CEP:COST: one table lookup after validation.
+// CEP:EVIDENCE: bench CEP-ZIG-0019.
+// CEP:SECURITY: FFI boundary; inputs validated.
+```
+
+Python tool example:
+
+```python
+# CEP:FILE: tools/gen_opcode_table.py
+# CEP:WHAT: Generates opcode table from opcode specification.
+# CEP:WHY: Keeps opcode metadata synchronized and deterministic.
+# CEP:CLASS: CEP-2
+# CEP:STATUS: complete
+# CEP:FAILURE: Exits with error if spec is malformed.
+# CEP:ASSUMES: spec file is UTF-8 and repository-trusted.
+# CEP:COST: offline tool; runtime cost irrelevant.
+# CEP:EVIDENCE: golden test generated/opcode_table.hpp.golden.
+# CEP:SECURITY: no network; no untrusted input.
+```
+
+---
+
+# 36. Updated repository compliance checklist
+
+A repository is compliant only if:
+
+## Structure
+
+- [ ] Hot and cold code are separated.
+- [ ] Target-specific code is isolated.
+- [ ] FFI code is isolated.
+- [ ] Generated code is isolated.
+- [ ] Tests mirror source.
+- [ ] Benchmarks mirror hot code.
+- [ ] Third-party code is vendored and separated.
+- [ ] Quarantine exists and is excluded from builds.
+- [ ] Config constants are centralized.
+
+## Naming
+
+- [ ] Files use lowercase snake_case.
+- [ ] Modules match namespaces and directories.
+- [ ] Types use PascalCase.
+- [ ] Functions use snake_case.
+- [ ] Constants use kPascalCase or equivalent.
+- [ ] Macros use CEP_ prefix.
+- [ ] FFI symbols use stable project prefix.
+- [ ] No clever or misleading names.
+- [ ] No dead names like `old`, `new`, `final`.
+
+## Violation handling
+
+- [ ] CI can block non-compliant merges.
+- [ ] CI can detect banned hot-path constructs.
+- [ ] CI can detect missing CEP comments.
+- [ ] CI can detect missing evidence.
+- [ ] CI can detect nondeterministic generators.
+- [ ] Waivers are written, temporary, and reviewed.
+- [ ] Extermination reports exist.
+- [ ] Quarantine has deadlines.
+- [ ] Expired quarantine is deleted.
+
+---
+
+# 37. Final extermination clause
+
+The final rule is:
+
+> CEP&CC does not negotiate with non-compliant code.
+
+If code cannot prove:
+
+- what it is,
+- why it exists,
+- what it assumes,
+- how it fails,
+- what it costs,
+- whether it is secure,
+- whether it is optimal,
+- whether it is complete,
+
+then it does not belong in the codebase.
+
+It is either fixed, quarantined, or exterminated.
