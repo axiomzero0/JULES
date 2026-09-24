@@ -106,15 +106,19 @@ src/core/son/passes/p42_loop_unrolling.cpp
     src/core/son/passes/pe/pe.cpp
     src/core/son/passes/pe/p90_partial_evaluation.cpp
     src/core/son/passes/pe/p91_partial_deop.cpp
+    src/core/son/passes/p92_superoptimization.cpp
     src/core/son/passes/opt_levels.cpp
     src/core/son/passes/pass_manager.cpp
     src/core/son/verifier.cpp
+    src/superopt/superopt.cpp
     src/core/codegen/ralloc.cpp
     src/core/codegen/ralloc_flow.cpp
     src/core/codegen/target.cpp
     src/driver/main.cpp
     src/targets/x86_64/x64_dp_isel.cpp
+    src/targets/x86_64/x64_ilp_isel.cpp
     src/targets/x86_64/x64_emit.cpp
     src/targets/x86_64/x64_ra.cpp
+    src/targets/x86_64/x64_super_isa.cpp
     src/targets/x86_64/x64_target.cpp
 )

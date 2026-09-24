@@ -1,0 +1,60 @@
+// ILP-tier exercise (pass 84's sniper): the joint decisions the per-root
+// DP cannot make, in a hot region (inner-loop body under the 50-node
+// budget, natural-loop depth >= 1).
+//
+// The DEATH GROUP shape: the SAME scaled index Mul(i,8) feeds TWO array
+// references on DIFFERENT bases (r[i] + s[i]) — two separate address Adds,
+// each claimed as a Lea2 root that extracts the raw index into the SIB
+// scale. The mul's materialization is then dead code, but ONLY if EVERY
+// reader scale-absorbs it — an all-readers covering constraint the
+// per-root DP cannot see (regions=1 death-groups=1 under JULES_ILP_STATS).
+// A same-base RMW (r[i] = r[i] + k) does NOT hit this: GVN shares the one
+// address Add and the DP's own single-use absorb already suppresses the
+// mul — that shape is kept below as the negative control.
+fn sum2(g: *mut i64, w: i64, h: i64) -> i64 {
+    var y: i64 = 0;
+    var acc: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            acc = acc + g[y * w + x];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return acc;
+}
+fn main() -> i64 {
+    let n: i64 = 512;
+    let r: *mut i64 = alloc(i64, n);
+    let s: *mut i64 = alloc(i64, n);
+    var i: i64 = 0;
+    // fill: r[i] = 3i, s[i] = -i (single-use index scales: the DP's own
+    // absorb path; also the -1*idiv-free negation shape)
+    while i < n {
+        r[i] = i * 3;
+        s[i] = 0 - i;
+        i = i + 1;
+    }
+    // DEATH GROUP: one Mul(i,8), two bases — both readers scale-absorb
+    var total: i64 = 0;
+    i = 0;
+    while i < n {
+        total = total + r[i] + s[i];
+        i = i + 1;
+    }
+    // negative control: same-base RMW (shared address Add, single-use
+    // absorb — no death group, must stay correct regardless)
+    i = 0;
+    while i < n {
+        let v: i64 = r[i];
+        r[i] = v + (v >> 1);
+        i = i + 1;
+    }
+    // sum in a 2D view: w = 32 rows (deep SIB chains + disp)
+    let w: i64 = 32;
+    let h: i64 = n / w;
+    total = total + sum2(r, w, h);
+    print(total);
+    return 0;
+}

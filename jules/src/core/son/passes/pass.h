@@ -1,7 +1,7 @@
 // Pass infrastructure: contracts, registry, modes, kill switches, telemetry.
 //
 // Every pass lives in its own translation unit (one file per catalog entry,
-// 89 files under son/passes/ + machine passes under codegen/passes/).
+// 92 files under son/passes/ (incl. the PE family and pass 92) + machine passes under codegen/passes/).
 // Registration happens through JULES_REGISTER_PASS; the scheduler orders by
 // catalog number and honors:
 //   * mode masks (AOT / JIT_BASELINE / JIT_OPTIMIZING)

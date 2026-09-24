@@ -1,0 +1,61 @@
+// Division-family selection: the pass-84 magic-number rules (Div/Mod by a
+// non-pow2 constant via mulhi, both the fitting and the increment form of
+// Granlund-Montgomery), the IR p12 pow2 rules (shift/mask with the signed
+// bias forms), and the inliner interactions they exposed.
+//
+// REGRESSION PROVENANCE (Task 23): calling these helpers from a loop
+// miscompiled TWO pre-existing inliner defects —
+//   (1) straight-line callees cloned their body onto a synthetic Jump the
+//       linearizer dead-placed after the caller's block (use-before-def
+//       across blocks: printf ran before the division);
+//   (2) the `before` closure crossed the loop memory-phi's backedge,
+//       stranding post-call consumers at the call-site block while the
+//       cloned body lived in the callee's block tree.
+// Plus two latent machine-fold holes the magic sequences exposed:
+//   (3) branch-fusion's copy-chain scan checked writes before reads, so
+//       destructive two-operand ops counted as redefinitions;
+//   (4) the RA's GP operand fold killed multi-use scratch movs.
+// All four are fixed at the mechanism; this program locks the semantics.
+fn straight_helper(x: i64, d: i64) -> i64 {
+    // straight-line callee: body pinned to start (the Jump-clone bug)
+    return x / d;
+}
+fn cf_helper(x: i64) -> i64 {
+    // control-flow callee: a Region survives (the phi-backedge bug)
+    var t: i64 = x;
+    if t < 0 {
+        t = 0 - t;
+    }
+    return t / 7;
+}
+fn main() -> i64 {
+    // ---- signed division/modulo, non-pow2 (magic, increment form for 7) --
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        let x: i64 = i * 111111111 - 333333333;
+        acc = acc + straight_helper(x, 7);
+        acc = acc + cf_helper(x);
+        acc = acc + x / 1000000007 + x % 1000000007;
+        acc = acc + x / -7 + x % -7;
+        i = i + 1;
+    }
+    // ---- unsigned, 64-bit edges (magic forms A and B) --------------------
+    let big: u64 = 18446744073709551615;
+    let big2: u64 = 9223372036854775808;
+    acc = acc + ((big / 10) as i64) + ((big % 10) as i64);
+    acc = acc + ((big2 / 3) as i64) + ((big2 % 3) as i64);
+    acc = acc + ((big / 1000000007) as i64) + ((big % 1000000007) as i64);
+    // ---- pow2 (IR p12: shifts/masks + the signed bias forms) -------------
+    acc = acc + ((100 / 8) as i64) + ((-100 / 8) as i64) +
+          ((-100 % 8) as i64) + ((100 % 8) as i64);
+    acc = acc + ((-101 / 32) as i64) + ((-101 % 32) as i64);
+    // ---- i32 shapes ------------------------------------------------------
+    let a: i32 = -2147483647 - 1;
+    acc = acc + ((a / 7) as i64) + ((a % 7) as i64) +
+          ((a / 3) as i64) + ((a % 3) as i64);
+    let b: u32 = 4294967295;
+    acc = acc + ((b / 10) as i64) + ((b % 10) as i64);
+    print(acc);
+    return 0;
+}

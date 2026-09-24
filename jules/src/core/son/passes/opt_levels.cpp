@@ -86,6 +86,7 @@ constexpr Row kRowVec{{X, X, X, Y, A, L, X}};       // vectorizer family
 constexpr Row kRowVecLite{{X, L, L, Y, Y, Y, L}};   // idiom recognition, simd match
 constexpr Row kRowDevirt{{X, L, Y, Y, Y, Y, L}};    // static devirt family
 constexpr Row kRowSpec{{X, X, X, L, Y, L, X}};      // speculative family
+constexpr Row kRowO3{{X, X, X, X, A, X, X}};       // -O3-only peak tier
 constexpr Row kRowInlineC{{X, L, L, Y, A, L, X}};   // cost-based inlining
 constexpr Row kRowInlineLite{{X, L, Y, Y, Y, Y, L}}; // closure/recursive bounding
 constexpr Row kRowMach{{X, L, Y, Y, Y, Y, L}};      // post-RA cleanup
@@ -93,7 +94,7 @@ constexpr Row kRowPeep{{X, L, Y, Y, Y, Y, L}};      // machine peephole
 constexpr Row kRowRequired{{Y, Y, Y, Y, Y, Y, Y}};  // required lowering
 constexpr Row kRowAlways{{L, Y, Y, Y, Y, Y, Y}};    // always-inline (semantic)
 
-// One entry per catalog order 1..91; nullptr => phase default (kRowScalar1
+// One entry per catalog order 1..92; nullptr => phase default (kRowScalar1
 // capped by level: nothing but required lowering runs at -O0).
 const Row* kMatrix[96] = {};
 
@@ -204,6 +205,8 @@ void init_matrix() {
         // Phase 9: partial evaluation & deoptimization (PE family)
         {90, &kRowSpec},      // PartialEvaluation: O2 ~, O3 on
         {91, &kRowSpec},      // PartialDeoptimization: guarded ladder (PGO)
+        // Phase 8 extension: post-spec-catalog machine tier
+        {92, &kRowO3},        // Superoptimization: -O3 peak tier (search)
     };
     static bool done = false;
     if (done) return;

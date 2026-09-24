@@ -670,7 +670,7 @@ struct Allocator {
                         case IOp::SExt32:
                             return dst(q.a);
                         case IOp::Cqo: return c == R::Rdx;
-                        case IOp::IDiv: case IOp::UDiv:
+                        case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
                             return c == R::Rax || c == R::Rdx;
                         case IOp::CallFn: case IOp::CallSym: case IOp::TailCallFn:
                             return true; // clobbers every caller-saved reg
@@ -1157,11 +1157,34 @@ struct Allocator {
         }
 
         // (positional promotion loop ends above)
+        if (std::getenv("JULES_MIR_DUMP")) {
+            std::fprintf(stderr, "== MIR post-promotion ==\n");
+            for (size_t k = 0; k < lf.code.size(); ++k) {
+                const Inst& i = lf.code[k];
+                std::fprintf(stderr,
+                             "%4zu op=%-3d a=(k%d r%d s%d) b=(k%d r%d s%d) "
+                             "bin=%d\n",
+                             k, (int)i.op, (int)i.a.k, (int)i.a.reg, i.a.slot,
+                             (int)i.b.k, (int)i.b.reg, i.b.slot, (int)i.bin);
+            }
+        }
 
         // Next live (non-Nop) index at-or-after `from`: folds must look
         // THROUGH instructions earlier folds killed — adjacency-by-
         // position alone misses the A-side setup mov once the B-side mov
         // became a Nop between it and the consumer.
+        auto mid_dump = [&](const char* tag) {
+            if (!std::getenv("JULES_MIR_DUMP")) return;
+            std::fprintf(stderr, "== MIR %s ==\n", tag);
+            for (size_t k = 0; k < lf.code.size(); ++k) {
+                const Inst& i = lf.code[k];
+                std::fprintf(stderr,
+                             "%4zu op=%-3d a=(k%d r%d s%d) b=(k%d r%d s%d) "
+                             "bin=%d\n",
+                             k, (int)i.op, (int)i.a.k, (int)i.a.reg, i.a.slot,
+                             (int)i.b.k, (int)i.b.reg, i.b.slot, (int)i.bin);
+            }
+        };
         auto next_live = [&](size_t from) -> size_t {
             size_t j = from;
             while (j < lf.code.size() && lf.code[j].op == IOp::Nop) ++j;
@@ -1236,6 +1259,59 @@ struct Allocator {
         // the rcx mov dies; without the re-run the loop guard kept
         // `mov %r10, %rax; cmp %rdx, %rax` — the bound never landed in the
         // compare's operand slot.
+        //
+        // MULTI-USE GUARD: the mov being killed may feed MORE than the one
+        // consumer being folded into. A scratch value held across several
+        // instructions (the pass-84 magic-division sequences: the mulhi
+        // high half rides rax through a sub and an add) must not lose its
+        // defining mov to the FIRST consumer. A fold is only legal when
+        // the mov's destination has no other reader before its next plain
+        // redefinition; control boundaries end the window conservatively.
+        auto gp_other_reader = [&](size_t from, R reg, size_t except) -> bool {
+            for (size_t k = from; k < lf.code.size(); ++k) {
+                if (k == except) continue;
+                const Inst& q = lf.code[k];
+                if (q.op == IOp::Nop) continue;
+                if (q.op == IOp::Label || q.op == IOp::Jcc || q.op == IOp::Jmp ||
+                    q.op == IOp::Ret || q.op == IOp::RetNaked ||
+                    q.op == IOp::CallFn || q.op == IOp::CallSym)
+                    return true; // boundary: assume a reader on some path
+                bool rd = q.b.k == Operand::K::Reg && q.b.reg == reg;
+                if (!rd) {
+                    switch (q.op) {
+                        case IOp::ArithRR: case IOp::CmpRR: case IOp::Cmov:
+                        case IOp::ShiftImm: case IOp::ShiftCl: case IOp::Neg:
+                        case IOp::Not: case IOp::Test: case IOp::MovZX:
+                            rd = q.a.k == Operand::K::Reg && q.a.reg == reg;
+                            break;
+                        case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
+                            rd = reg == R::Rax || reg == R::Rdx ||
+                                 (q.a.k == Operand::K::Reg && q.a.reg == reg);
+                            break;
+                        case IOp::Cqo:
+                        case IOp::SExt32:
+                            rd = reg == R::Rax;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (rd) return true;
+                // a plain (non-destructive) redefinition: later readers see
+                // the new value, the fold is safe for them
+                switch (q.op) {
+                    case IOp::MovRR: case IOp::MovRImm: case IOp::MovSR:
+                    case IOp::MovZX: case IOp::LoadMem: case IOp::LeaSlot:
+                    case IOp::LeaSym: case IOp::LeaRR: case IOp::Lea2:
+                    case IOp::Setcc: case IOp::MovFpFromGpr:
+                        if (q.a.k == Operand::K::Reg && q.a.reg == reg) return false;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return false; // no reader at all: dead value, fold away
+        };
         for (int round = 0; round < 4; ++round) {
         bool folded_this_round = false;
         for (size_t i = 0; i + 1 < lf.code.size(); ++i) {
@@ -1248,6 +1324,7 @@ struct Allocator {
             Inst& use = lf.code[ui];
             // only isel scratch targets: never touch allocator-homed moves
             if (mov.a.reg != R::Rax && mov.a.reg != R::Rcx) continue;
+            if (gp_other_reader(i + 1, mov.a.reg, ui)) continue; // multi-use
             if (use.op == IOp::ArithRR) {
                 if (use.b.k == Operand::K::Reg && use.b.reg == mov.a.reg &&
                     mov.b.reg != use.a.reg) {
@@ -1292,6 +1369,8 @@ struct Allocator {
         }
         if (!folded_this_round) break;
         }
+
+        mid_dump("post-gp-fold");
 
         // ------------------------------------------------------------------
         // Single-use home-store forwarding. A promoted value with exactly
@@ -1474,6 +1553,7 @@ struct Allocator {
             }
             lf.ra_fused += fused;
         }
+        mid_dump("post-fuse");
 
         // Dead-def stores: slots that are defined but never read keep a
         // store whose result nobody consumes. The RA already knows they are

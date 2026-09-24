@@ -168,6 +168,61 @@ assert_pass_disabled t30_storemerge StoreMerging
 assert_pass_disabled t40_static_pe PartialEvaluation
 assert_pass_disabled t40_static_pe PartialDeoptimization
 
+# Superoptimization (pass 92): -O3-only search tier. The activity assert
+# must compile at -O3 (the availability matrix gates it off elsewhere), and
+# the kill switch must hold exactly like every other pass.
+assert_pass_active_l3() {
+    local name=$1
+    local pass_name=$2
+    local stats
+    stats=$(timeout 30 $JULESC -O3 --stats "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
+            awk -v p="$pass_name" '$2 == p {v += $4} END {print v + 0}')
+    if [ -z "$stats" ] || [ "$stats" = "0" ]; then
+        echo "FAIL $name (pass '$pass_name' reported no changes at -O3)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    echo "PASS $name [$pass_name changes=$stats at -O3]"
+    pass=$((pass + 1))
+}
+assert_pass_active_l3 t_superopt Superoptimization
+
+# kill switch at -O3 (the level where the pass actually runs — a default-
+# level assert would be vacuous since the availability matrix gates 92 to
+# O3), plus the pass-internal JULES_SUPEROPT=0 env switch.
+assert_pass_disabled_l3() {
+    local name=$1
+    local pass_name=$2
+    local stats skipped
+    stats=$(timeout 30 $JULESC -O3 --stats --disable "$pass_name" "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
+            awk -v p="$pass_name" '$2 == p {v += $4} END {print v + 0}')
+    skipped=$(timeout 30 $JULESC -O3 --stats --disable "$pass_name" "tests/programs/${name}.jules" -o "$WORK/a.bin" 2>/dev/null |
+              awk -v p="$pass_name" '$2 == p && $3 ~ /^skipped/ {n++} END {print n + 0}')
+    if [ -n "$stats" ] && [ "$stats" != "0" ]; then
+        echo "FAIL $name (pass '$pass_name' reported changes=$stats despite --disable at -O3)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if [ -z "$skipped" ] || [ "$skipped" = "0" ]; then
+        echo "FAIL $name (pass '$pass_name' never showed skipped(disabled) at -O3)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    echo "PASS $name [$pass_name fully disabled at -O3]"
+    pass=$((pass + 1))
+}
+assert_pass_disabled_l3 t_superopt Superoptimization
+
+envstats=$(JULES_SUPEROPT=0 timeout 30 $JULESC -O3 --stats "tests/programs/t_superopt.jules" -o "$WORK/a.bin" 2>/dev/null |
+           awk -v p="Superoptimization" '$2 == p {v += $4} END {print v + 0}')
+if [ -n "$envstats" ] && [ "$envstats" != "0" ]; then
+    echo "FAIL t_superopt (JULES_SUPEROPT=0 reported changes=$envstats)"
+    fail=$((fail + 1))
+else
+    echo "PASS t_superopt [JULES_SUPEROPT=0 fully off]"
+    pass=$((pass + 1))
+fi
+
 # PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
 # Asserts: the instrumented binary's output is UNCHANGED (instrumentation
 # must not alter semantics), the profile exists and is non-trivial, the

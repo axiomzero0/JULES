@@ -6,6 +6,7 @@
 #include "core/son/passes/pass_utils.h"
 #include "core/son/son.h"
 #include "targets/x86_64/x64_dp_isel.h"
+#include "targets/x86_64/x64_ilp_isel.h"
 
 #include <cstdio>
 #include <cstring>
@@ -131,7 +132,7 @@ bool fp_of(TypeId t) { return ty_in_xmm(t); } // scalar FP + packed vectors: XMM
 
 struct Emitter {
     Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms)
-        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms), dp_(lf, fg) {
+        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms), dp_(lf, fg), ilp_(lf, fg) {
         lf_.label_counter = kLocalLabelBase;
     }
 
@@ -409,6 +410,7 @@ struct Emitter {
             cur_block_ = b.index;
             sc_begin_block(b); // fused short-circuit: suppress chain nodes
             dp_.plan_block(b, suppress_); // DP-on-DAG cover (pass-84 selector)
+            ilp_.refine_block(b, suppress_, dp_); // sniper: joint hot-region pass
             for (NodeId n : b.nodes) {
                 const bool* sup = suppress_.find(n);
                 if (sup && *sup) continue;
@@ -1195,10 +1197,161 @@ struct Emitter {
                 }
                 return;
             }
+            case DpIsel::ValCell::Form::Magic: {
+                // Div/Mod by a non-pow2 constant — the mulhi sequences
+                // (identities verified in scripts/verify_magic_math.py).
+                // The dividend is a Leaf; everything works in {dst, other}
+                // plus the rdx:rax mulhi pair (MulHi's fixed-register shape
+                // is what the RA's masks already handle for IDiv).
+                emit_magic(c);
+                return;
+            }
             default:
                 load_value(n, dst, sz_of(g_.node(n).ty));
                 return;
         }
+    }
+
+    // Magic-form emission. Sequences (all sizes computed at 64-bit width;
+    // i32 dividends zero/sign-extend first and the store takes the low 32).
+    // The mulhi high half STAYS in rdx (mul's implicit destination) — values
+    // never ride a scratch register across two consumers, so the RA/peephole
+    // operand folds (which assume per-consumer scratch movs) cannot break
+    // the sequence; the multi-use guard in the GP fold is the belt to this
+    // suspenders.
+    //   unsigned form A:  load x; movabs rdx,M; mul rdx; mov rax,rdx; shr $s
+    //   unsigned form B:  load x; mov rcx,rax; movabs rdx,M'; mul rdx;
+    //                     sub rcx,rdx; shr $1,rcx; add rdx,rcx; shr $(s-1),rdx;
+    //                     mov rax,rdx
+    //   signed: |x| wrapper (mov rcx; sar $63,rcx; xor; sub), the unsigned
+    //     core, then sign restore (xor rcx; sub rcx) — form B reloads x and
+    //     recomputes sar $63 (its rcx carries t). d < 0 appends neg.
+    //   mod tail: mov rcx,rax(q); load x; imul $d,%rcx (or movabs rdx,d;
+    //     imul rdx,rcx); sub rcx,rax   ->  r = x - q*d
+    void emit_magic(const DpIsel::ValCell* c) {
+        const bool sgn = c->signed_div;
+        const bool w32 = c->size == 4;
+        // dividend into rax (movl zero-extends; signed i32 follows with
+        // movslq — SExt32 is rax-fixed, which is why this form is
+        // root-only with dst == rax)
+        load_value(c->a.node, R::Rax, c->size);
+        if (sgn && w32) emit(IOp::SExt32);
+        if (sgn) {
+            // t = |x| ; rcx = sign mask (form A keeps it for the restore)
+            reg2(IOp::MovRR, R::Rcx, R::Rax, 8);
+            Inst& s = emit(IOp::ShiftImm);
+            s.bin = BinOp::Shr;
+            s.sar = true;
+            s.a.k = Operand::K::Reg; s.a.reg = R::Rcx;
+            s.b.k = Operand::K::Imm; s.b.imm = 63;
+            s.size = 8;
+            Inst& x1 = reg2(IOp::ArithRR, R::Rax, R::Rcx, 8);
+            x1.bin = BinOp::Xor;
+            Inst& x2 = reg2(IOp::ArithRR, R::Rax, R::Rcx, 8);
+            x2.bin = BinOp::Sub;
+            if (c->form_b) {
+                // the increment form needs rcx for t: recompute the sign
+                // from x's slot after the core instead of keeping it
+                reg2(IOp::MovRR, R::Rcx, R::Rax, 8); // rcx = t
+                imm_reg(IOp::MovRImm, R::Rdx, static_cast<i64>(c->magic));
+                Inst& m = emit(IOp::MulHi); // rdx:rax = rax * rdx
+                m.a.k = Operand::K::Reg; m.a.reg = R::Rdx;
+                Inst& d1 = reg2(IOp::ArithRR, R::Rcx, R::Rdx, 8);
+                d1.bin = BinOp::Sub;                  // rcx = t - t_hi
+                Inst& sh = emit(IOp::ShiftImm);
+                sh.bin = BinOp::Shr;
+                sh.a.k = Operand::K::Reg; sh.a.reg = R::Rcx;
+                sh.b.k = Operand::K::Imm; sh.b.imm = 1;
+                sh.size = 8;
+                Inst& a1 = reg2(IOp::ArithRR, R::Rdx, R::Rcx, 8);
+                a1.bin = BinOp::Add;                  // rdx = t_hi + ((t-t_hi)>>1)
+                emit_shr_imm(R::Rdx, c->mshift - 1); // rdx = q_u
+                // sign restore via reload (rcx was consumed by the core)
+                load_value(c->a.node, R::Rax, c->size);
+                if (w32) emit(IOp::SExt32);
+                Inst& s2 = emit(IOp::ShiftImm);
+                s2.bin = BinOp::Shr;
+                s2.sar = true;
+                s2.a.k = Operand::K::Reg; s2.a.reg = R::Rax;
+                s2.b.k = Operand::K::Imm; s2.b.imm = 63;
+                s2.size = 8;
+                Inst& x3 = reg2(IOp::ArithRR, R::Rdx, R::Rax, 8);
+                x3.bin = BinOp::Xor;
+                Inst& x4 = reg2(IOp::ArithRR, R::Rdx, R::Rax, 8);
+                x4.bin = BinOp::Sub;                   // rdx = q
+                reg2(IOp::MovRR, R::Rax, R::Rdx, 8);   // result -> rax
+            } else {
+                imm_reg(IOp::MovRImm, R::Rdx, static_cast<i64>(c->magic));
+                Inst& m = emit(IOp::MulHi);
+                m.a.k = Operand::K::Reg; m.a.reg = R::Rdx;
+                reg2(IOp::MovRR, R::Rax, R::Rdx, 8);  // rax = hi(|x| * M)
+                if (c->mshift > 0) emit_shr_imm(R::Rax, c->mshift);
+                // sign restore (s still live in rcx)
+                Inst& x3 = reg2(IOp::ArithRR, R::Rax, R::Rcx, 8);
+                x3.bin = BinOp::Xor;
+                Inst& x4 = reg2(IOp::ArithRR, R::Rax, R::Rcx, 8);
+                x4.bin = BinOp::Sub;                   // rax = q
+            }
+            // d < 0: the wrapper's quotient is trunc(x/|d|) — negate to
+            // the true quotient. Applies to Mod too: the tail recomputes
+            // r = x - q*d with the SIGNED d, so a missing neg here produced
+            // x - q*|d|-shaped garbage (found by t_magic_div's x % -7).
+            if (c->divisor < 0) {
+                Inst& ng = emit(IOp::Neg);
+                ng.a.k = Operand::K::Reg; ng.a.reg = R::Rax;
+            }
+        } else {
+            if (c->form_b) {
+                reg2(IOp::MovRR, R::Rcx, R::Rax, 8); // rcx = x
+                imm_reg(IOp::MovRImm, R::Rdx, static_cast<i64>(c->magic));
+                Inst& m = emit(IOp::MulHi);
+                m.a.k = Operand::K::Reg; m.a.reg = R::Rdx;
+                Inst& d1 = reg2(IOp::ArithRR, R::Rcx, R::Rdx, 8);
+                d1.bin = BinOp::Sub;                  // rcx = x - t_hi
+                Inst& sh = emit(IOp::ShiftImm);
+                sh.bin = BinOp::Shr;
+                sh.a.k = Operand::K::Reg; sh.a.reg = R::Rcx;
+                sh.b.k = Operand::K::Imm; sh.b.imm = 1;
+                sh.size = 8;
+                Inst& a1 = reg2(IOp::ArithRR, R::Rdx, R::Rcx, 8);
+                a1.bin = BinOp::Add;                  // rdx = t_hi + ((x-t_hi)>>1)
+                emit_shr_imm(R::Rdx, c->mshift - 1); // rdx = q_u
+                reg2(IOp::MovRR, R::Rax, R::Rdx, 8);  // result -> rax
+            } else {
+                imm_reg(IOp::MovRImm, R::Rdx, static_cast<i64>(c->magic));
+                Inst& m = emit(IOp::MulHi);
+                m.a.k = Operand::K::Reg; m.a.reg = R::Rdx;
+                reg2(IOp::MovRR, R::Rax, R::Rdx, 8);  // rax = hi(x * M)
+                if (c->mshift > 0) emit_shr_imm(R::Rax, c->mshift);
+            }
+        }
+        if (c->is_mod) {
+            // r = x - q*d (q in rax). imul's immediate form is imm32-only;
+            // big divisors materialize d in rdx first.
+            reg2(IOp::MovRR, R::Rcx, R::Rax, 8); // rcx = q
+            load_value(c->a.node, R::Rax, c->size);
+            if (sgn && w32) emit(IOp::SExt32);
+            if (c->divisor >= -2147483648LL && c->divisor <= 2147483647LL) {
+                Inst& im = imm_reg(IOp::ArithRImm, R::Rcx, c->divisor);
+                im.bin = BinOp::Mul; // imul $d, %rcx, %rcx
+            } else {
+                imm_reg(IOp::MovRImm, R::Rdx, c->divisor);
+                Inst& im = reg2(IOp::ArithRR, R::Rcx, R::Rdx, 8);
+                im.bin = BinOp::Mul; // imul %rdx, %rcx
+            }
+            Inst& sb = reg2(IOp::ArithRR, R::Rax, R::Rcx, 8);
+            sb.bin = BinOp::Sub;                     // rax = x - q*d
+        }
+    }
+
+    // logical shift-right by a constant (the magic sequences' final scale)
+    void emit_shr_imm(R reg, u8 k) {
+        Inst& sh = emit(IOp::ShiftImm);
+        sh.bin = BinOp::Shr;
+        sh.sar = false;
+        sh.a.k = Operand::K::Reg; sh.a.reg = reg;
+        sh.b.k = Operand::K::Imm; sh.b.imm = k;
+        sh.size = 8;
     }
 
     void emit_alloc(NodeId n) {
@@ -1579,7 +1732,8 @@ struct Emitter {
     FunctionGraph& fg_;
     Graph& g_;
     SymbolTable& syms_;
-    DpIsel dp_; // per-block DP cover planner (x64_dp_isel.{h,cpp})
+    DpIsel dp_;   // per-block DP cover planner (x64_dp_isel.{h,cpp})
+    IlpIsel ilp_;  // pass-84 sniper tier: hot-region joint refinement
     // replaced by fp_const_cache_dom_ (dominance-checked)
     int next_const_xmm_ = 15;
 };
@@ -1587,13 +1741,36 @@ struct Emitter {
 } // namespace
 
 // ---- pass 84 ------------------------------------------------------------------
+static void dump_mir_tagged(const char* tag, const LFunction& lf) {
+    if (!std::getenv("JULES_MIR_DUMP")) return;
+    std::fprintf(stderr, "== MIR %s (slot_count=%d) ==\n", tag, lf.slot_count);
+    for (size_t k = 0; k < lf.code.size(); ++k) {
+        const Inst& i = lf.code[k];
+        std::fprintf(stderr,
+                     "%4zu op=%-3d a=(k%d r%d s%d i%lld) b=(k%d r%d s%d i%lld) "
+                     "sz=%d bin=%d\n",
+                     k, static_cast<int>(i.op), static_cast<int>(i.a.k),
+                     static_cast<int>(i.a.reg), i.a.slot,
+                     static_cast<long long>(i.a.imm), static_cast<int>(i.b.k),
+                     static_cast<int>(i.b.reg), i.b.slot,
+                     static_cast<long long>(i.b.imm), static_cast<int>(i.size),
+                     static_cast<int>(i.bin));
+    }
+}
+
 bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms) {
     Emitter e(lf, fg, syms);
     bool ok = e.run();
+    dump_mir_tagged("post-isel", lf);
     if (ok && std::getenv("JULES_DP_STATS"))
         std::fprintf(stderr, "[dp] %.*s: roots=%u folds=%u\n",
                      static_cast<int>(syms.name(fg.name).size()),
                      syms.name(fg.name).data(), e.dp_.roots(), e.dp_.folds());
+    if (ok && std::getenv("JULES_ILP_STATS"))
+        std::fprintf(stderr, "[ilp] %.*s: regions=%u death-groups=%u flips=%u\n",
+                     static_cast<int>(syms.name(fg.name).size()),
+                     syms.name(fg.name).data(), e.ilp_.regions(), e.ilp_.groups(),
+                     e.ilp_.flips());
     return ok;
 }
 
@@ -1644,6 +1821,19 @@ bool x64_post_ra_cleanup(LFunction& lf) {
     bool changed = false;
     std::vector<Inst> out;
     out.reserve(lf.code.size());
+    auto tag_dump = [&](const char* tag) {
+        if (!std::getenv("JULES_MIR_DUMP")) return;
+        std::fprintf(stderr, "== MIR %s ==\n", tag);
+        for (size_t k = 0; k < lf.code.size(); ++k) {
+            const Inst& i = lf.code[k];
+            std::fprintf(stderr,
+                         "%4zu op=%-3d a=(k%d r%d s%d) b=(k%d r%d s%d) "
+                         "bin=%d\n",
+                         k, (int)i.op, (int)i.a.k, (int)i.a.reg, i.a.slot,
+                         (int)i.b.k, (int)i.b.reg, i.b.slot, (int)i.bin);
+        }
+    };
+    tag_dump("p86-entry");
     for (size_t i = 0; i < lf.code.size(); ++i) {
         const Inst& cur = lf.code[i];
         if (cur.op == IOp::MovRS && i + 1 < lf.code.size()) {
@@ -1704,6 +1894,7 @@ bool x64_post_ra_cleanup(LFunction& lf) {
         out.push_back(cur);
     }
     lf.code = std::move(out);
+    tag_dump("p86-exit");
     return changed;
 }
 
@@ -2449,17 +2640,35 @@ bool x64_branch_fusion(LFunction& lf) {
                 default: return false;
             }
         };
+        // Reads FIRST, writes second: destructive two-operand forms read
+        // AND write `a` — checking writes first classified them as
+        // "redefinitions" and let this fold delete a load whose value a
+        // destructive consumer still needed. Found by the magic-division
+        // sequence ([mov rax,x][mov rcx,rax][sar rcx][xor rax,rcx]): the
+        // xor reads rax, the fold killed the load, and the abs-wrapper
+        // computed on garbage. A mov (MovRR/MovRImm/MovFpFp) still counts
+        // as a plain redefinition — phi-copy chains keep folding.
         auto reads_reg = [](const Inst& q, R a) {
             if (q.b.k == Operand::K::Reg && q.b.reg == a) return true;
             switch (q.op) {
-                case IOp::ArithRR: case IOp::CmpRR: case IOp::FpBin:
-                case IOp::FpCmp: case IOp::Cmov:
+                // destructive: a is read AND written
+                case IOp::ArithRR: case IOp::FpBin: case IOp::Cmov:
+                case IOp::ShiftImm: case IOp::ShiftCl: case IOp::Neg:
+                case IOp::Not: case IOp::FpNeg:
+                case IOp::CmpRR: case IOp::FpCmp: case IOp::Test:
+                case IOp::MovZX: // writes AL but that IS part of rax
                     return q.a.k == Operand::K::Reg && q.a.reg == a;
-                case IOp::Test: case IOp::IDiv: case IOp::UDiv:
-                    return q.a.k == Operand::K::Reg && q.a.reg == a;
+                // fixed-register implicit operands
+                case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
+                    return a == R::Rax || a == R::Rdx ||
+                           (q.a.k == Operand::K::Reg && q.a.reg == a);
+                case IOp::Cqo: return a == R::Rax; // reads rax, writes rdx
+                case IOp::SExt32: return a == R::Rax; // movslq reads eax
                 case IOp::MovFpFp: case IOp::MovRR:
-                    return q.a.k == Operand::K::Reg && q.a.reg == a; // dst read for swaps? conservative
-                default: return false;
+                    // a mov DEFINES its dst — the old value is dead
+                    return false;
+                default:
+                    return false;
             }
         };
         for (size_t i = 0; i + 1 < code.size(); ++i) {
@@ -2482,8 +2691,8 @@ bool x64_branch_fusion(LFunction& lf) {
                     q.op == IOp::CallSym || q.op == IOp::TailCallFn ||
                     q.op == IOp::TailCallNaked)
                     { abort = true; break; }
-                if (writes_reg(q, a)) { ok = true; break; }
                 if (reads_reg(q, a)) { abort = true; break; }
+                if (writes_reg(q, a)) { ok = true; break; }
             }
             if (!ok || abort) continue;
             m1.op = IOp::Nop;
@@ -2557,6 +2766,18 @@ bool x64_branch_fusion(LFunction& lf) {
 bool x64_machine_peephole(LFunction& lf) {
     bool changed = false;
     auto& code = lf.code;
+    if (std::getenv("JULES_MIR_DUMP")) {
+        std::fprintf(stderr, "== MIR pre-peephole ==\n");
+        for (size_t k = 0; k < code.size(); ++k) {
+            const Inst& i = code[k];
+            std::fprintf(stderr,
+                         "%4zu op=%-3d a=(k%d r%d s%d) b=(k%d r%d s%d) sz=%d "
+                         "bin=%d\n",
+                         k, (int)i.op, (int)i.a.k, (int)i.a.reg, i.a.slot,
+                         (int)i.b.k, (int)i.b.reg, i.b.slot, (int)i.size,
+                         (int)i.bin);
+        }
+    }
 
     // Register-reference predicates for the scan-based patterns below.
     auto reads_reg = [](const Inst& q, R x) {
@@ -2564,7 +2785,7 @@ bool x64_machine_peephole(LFunction& lf) {
         switch (q.op) {
             case IOp::ArithRR: case IOp::CmpRR: case IOp::FpBin:
             case IOp::FpCmp: case IOp::Cmov: case IOp::Test:
-            case IOp::IDiv: case IOp::UDiv:
+            case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
                 return q.a.k == Operand::K::Reg && q.a.reg == x;
             default: return false;
         }
@@ -2652,11 +2873,13 @@ bool x64_machine_peephole(LFunction& lf) {
             if (q.a.k == Operand::K::Reg && !a_is_write_only(q.op)) mask |= bit(q.a.reg);
             if (q.op == IOp::IDiv || q.op == IOp::UDiv || q.op == IOp::Cqo)
                 mask |= bit(R::Rax) | bit(R::Rdx);
+            if (q.op == IOp::MulHi)
+                mask |= bit(R::Rax); // implicit rax input (a.reg via the generic path)
             if (q.op == IOp::ShiftCl) mask |= bit(R::Rcx);
         };
         auto inst_writes = [&](const Inst& q, u32& mask) {
             if (q.a.k == Operand::K::Reg && w_writes(q.op)) mask |= bit(q.a.reg);
-            if (q.op == IOp::IDiv || q.op == IOp::UDiv)
+            if (q.op == IOp::IDiv || q.op == IOp::UDiv || q.op == IOp::MulHi)
                 mask |= bit(R::Rax) | bit(R::Rdx);
             if (q.op == IOp::Cqo) mask |= bit(R::Rdx);
         };
@@ -3176,6 +3399,7 @@ void serialize_inst(std::ostringstream& os, const Inst& i, const LFunction& lf, 
         case IOp::Cqo: os << "\tcqo\n"; break;
         case IOp::IDiv: os << "\tidivq " << r(i.a.reg) << "\n"; break;
         case IOp::UDiv: os << "\tdivq " << r(i.a.reg) << "\n"; break;
+        case IOp::MulHi: os << "\tmulq " << r(i.a.reg) << "\n"; break;
         case IOp::CmpRR: os << "\tcmp" << ssz(i.size) << " " << rs(i.b.reg, i.size) << ", " << rs(i.a.reg, i.size) << "\n"; break;
         case IOp::CmpRImm:
             if (i.a.k == Operand::K::Slot) // fold-3 form: cmp $imm, off(%rbp)

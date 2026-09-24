@@ -16,13 +16,16 @@
 namespace jules {
 namespace {
 
-// Latency-class cost units (deltas are what drive decisions: a materialized
-// intermediate costs store+load = 4; imul -> lea/shl saves 2).
-constexpr i32 C_LD = 3;  // mov reg, [slot] (frame round trip)
-constexpr i32 C_ST = 1;  // mov [slot], reg
-constexpr i32 C_IMM = 1; // mov reg, imm (incl. movabs)
-constexpr i32 C_OP = 1;  // arith / lea / shift-imm
-constexpr i32 C_IMUL = 3;
+// Latency-class cost units — aliases of the DpIsel public constants so the
+// rule code below reads like the header's cost table (deltas drive decisions:
+// a materialized intermediate costs store+load = 4; imul -> lea/shl saves 2;
+// idiv -> magic saves ~20+).
+constexpr i32 C_LD = DpIsel::kCLd;   // mov reg, [slot] (frame round trip)
+constexpr i32 C_ST = DpIsel::kCSt;   // mov [slot], reg
+constexpr i32 C_IMM = DpIsel::kCImm; // mov reg, imm (incl. movabs)
+constexpr i32 C_OP = DpIsel::kCOp;   // arith / lea / shift-imm / mov rr
+constexpr i32 C_IMUL = DpIsel::kCMul; // imul / mulhi
+constexpr i32 C_DIV = DpIsel::kCDiv; // idiv
 
 constexpr i32 kInf = std::numeric_limits<i32>::max() / 4;
 
@@ -57,7 +60,12 @@ bool pow2_shift(i64 v, u8& k) {
 // Does `v` encode as a sign-extended imm32 (arith immediate form)?
 bool fits32(i64 v) { return v >= -2147483648LL && v <= 2147483647LL; }
 
-i32 op_cost(BinOp op) { return op == BinOp::Mul ? C_IMUL : C_OP; }
+i32 op_cost(BinOp op) {
+    return op == BinOp::Mul ? C_IMUL : (op == BinOp::Div || op == BinOp::Mod)
+                                                 ? C_DIV : C_OP;
+}
+
+bool is_pow2_u64(u64 v) { return v && !(v & (v - 1)); }
 
 // An index term for a SIB lea: Mul(i, 2^k) or Shl(i, k<=3).
 bool index_term(const Graph& g, NodeId t, NodeId& i, u8& scale) {
@@ -87,6 +95,36 @@ bool index_term(const Graph& g, NodeId t, NodeId& i, u8& scale) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// magic derivation (Granlund-Montgomery; verified in scripts/verify_magic_math.py)
+// ---------------------------------------------------------------------------
+
+bool DpIsel::derive_magic(u64 d, Magic& out) {
+    // pow2 / tiny divisors are not ours (IR p12 shift/mask rules); giants
+    // that would need shift == 64 keep the idiv fallback.
+    if (d < 3 || is_pow2_u64(d)) return false;
+    using U128 = unsigned __int128;
+    const U128 two64 = (U128)1 << 64;
+    for (int s = 0; s < 64; ++s) {
+        const U128 pw = (U128)1 << (64 + s);
+        const U128 num = (pw + d - 1) / d;   // M = ceil(2^(64+s) / d)
+        const U128 e = num * d - pw;         // 0 <= e < d by construction
+        if (num < two64) {
+            if (e <= ((U128)1 << s)) {       // fitting form
+                out = {(u64)num, (u8)s, false};
+                return true;
+            }
+        } else {
+            // M >= 2^64  <=>  2^s >= d: increment form with M' = M - 2^64.
+            // Computes floor(x*M / 2^(64+s)) exactly in u64 arithmetic
+            // (0 <= t <= x-1 since M' < 2^64 — no wrap anywhere).
+            out = {(u64)(num - two64), (u8)s, true};
+            return true;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // public interface
@@ -160,6 +198,8 @@ void DpIsel::plan_block(const LBlock& b, const FlatMap<NodeId, bool>& suppressed
 
     // Pass B: Bin roots the rule set covers strictly cheaper than the hand
     // emitter (no ties — quality never regresses to a different encoding).
+    // Div/Mod with a nonzero constant divisor joins here for the magic rules
+    // (pow2 divisors are IR p12's shifts/masks; |d| == 1 folds there too).
     for (NodeId n : b.nodes) {
         if (act(n) != Act::None) continue;
         if (suppressed.find(n)) continue;
@@ -167,7 +207,13 @@ void DpIsel::plan_block(const LBlock& b, const FlatMap<NodeId, bool>& suppressed
         if (nd.op != Op::Bin || !int_scalar(nd.ty)) continue;
         BinOp sub = static_cast<BinOp>(nd.sub);
         bool shl_const = sub == BinOp::Shl && g_.node(nd.in[2]).op == Op::Const;
-        if (!chain_sub(sub) && !shl_const) continue;
+        bool div_const = false;
+        if (sub == BinOp::Div || sub == BinOp::Mod) {
+            ConstVal cd{};
+            div_const = g_.node(nd.in[2]).op == Op::Const &&
+                        const_of(g_, nd.in[2], cd) && cd.iv != 0;
+        }
+        if (!chain_sub(sub) && !shl_const && !div_const) continue;
         if (!try_commit(n)) continue;
         const ValCell* c = cells_.find(n);
         if (c->cost + C_ST < fallback_mat(n)) {
@@ -430,8 +476,58 @@ bool DpIsel::try_commit(NodeId n) {
         }
     }
 
+    // ---- rule: Magic — Div/Mod by a non-pow2 constant ----------------------
+    // Root-only standalone form (dividend is a Leaf: the sequence uses the
+    // rax:rdx pair on top of {dst, other}). Verified identities above.
+    if (op == BinOp::Div || op == BinOp::Mod) {
+        ConstVal cd{};
+        if (const_of(g_, nd.in[2], cd) && cd.iv != 0) {
+            const bool sgn = ty_is_signed(nd.ty);
+            const i64 d = cd.iv;
+            // |d| as u64 (INT64_MIN-safe); unsigned divisors use their bits.
+            const u64 ad = !sgn ? (u64)d
+                               : d < 0 ? (u64)(-(d + 1)) + 1 : (u64)d;
+            Magic mg;
+            if ((sgn ? (d > 1 || d < -1) : true) && derive_magic(ad, mg)) {
+                ValCell c;
+                c.form = ValCell::Form::Magic;
+                c.a = OpRef{OpRef::K::Leaf, nd.in[1], 0};
+                c.size = size;
+                c.divisor = d;
+                c.magic = mg.m;
+                c.mshift = mg.s;
+                c.form_b = mg.form_b;
+                c.signed_div = sgn;
+                c.is_mod = (op == BinOp::Mod);
+                i32 cost = leaf_cost(nd.in[1]);       // load x
+                int instrs = 1;                       // ...the load
+                if (size == 4 && sgn) { cost += C_OP; ++instrs; } // SExt32
+                if (sgn) { cost += 6 * C_OP; instrs += 6; }     // abs wrapper
+                cost += C_IMM; ++instrs;                            // movabs M'
+                cost += C_IMUL; ++instrs;                          // mul
+                cost += C_OP; ++instrs;                             // mov hi
+                if (mg.form_b) {
+                    cost += 3 * C_OP; instrs += 3; // sub+shr1+add (x in other)
+                } else if (mg.s > 0) {
+                    cost += C_OP; ++instrs;         // shr s
+                }
+                if (sgn) { cost += 2 * C_OP; instrs += 2; } // xor+sub sign
+                if (sgn && d < 0) { cost += C_OP; ++instrs; } // neg
+                if (c.is_mod) {
+                    // r = x - q*d: movabs d, imul, reload x, sub, mov
+                    cost += C_IMM + C_IMUL + C_LD + 2 * C_OP;
+                    instrs += 5;
+                }
+                consider(c, cost, instrs, 4);
+            }
+        }
+    }
+
     // ---- rule: generic Arith (b-side may be an inline chain) ----------------
-    if (op != BinOp::Shl) {
+    // Div/Mod never take this form: the serializer's ArithRR has no idiv
+    // encoding (the hand emitter uses the Cqo+IDiv pair), and the magic rule
+    // above is strictly better anyway.
+    if (op != BinOp::Shl && op != BinOp::Div && op != BinOp::Mod) {
         ValCell c;
         c.form = ValCell::Form::Arith;
         c.bin = op;
@@ -476,6 +572,12 @@ i32 DpIsel::fallback_mat(NodeId n) const {
     BinOp op = static_cast<BinOp>(nd.sub);
     NodeId a = nd.in[1], b = nd.in[2];
     auto opnd = [&](NodeId x) { return g_.node(x).op == Op::Const ? C_IMM : C_LD; };
+    if (op == BinOp::Div || op == BinOp::Mod) {
+        // Cqo (signed) / xor edx (unsigned) + idiv; the remainder arrives in
+        // rdx for Mod (+1 mov). Const divisor materializes via movabs.
+        return opnd(a) + C_IMM + C_OP + C_DIV + (op == BinOp::Mod ? C_OP : 0) +
+               C_ST;
+    }
     if (op == BinOp::Shl || op == BinOp::Shr) {
         if (g_.node(b).op == Op::Const) return opnd(a) + C_OP + C_ST;
         return opnd(a) + C_LD + C_OP + C_ST; // ShiftCl

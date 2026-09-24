@@ -89,11 +89,16 @@ enum class IOp : u16 {
     Cqo,            // sign-extend rax into rdx:rax (size)
     IDiv,           // signed divide rdx:rax by reg
     UDiv,           // unsigned divide rax by reg
+    MulHi,          // unsigned multiply-high: rdx:rax = rax * a.reg; the
+                    // high half stays in rdx (mov it out). Fixed register
+                    // pair exactly like IDiv/UDiv — the RA/peephole treat
+                    // them uniformly. Emitted by the pass-84 magic-division
+                    // rules (x64_dp_isel).
     CmpRR,          // cmp a, b
     CmpRImm,        // cmp a, imm
     Test,           // test a, a
     Setcc,          // al = cond (after cmp)
-    Cmov,           // dst = cond ? dst : src
+    Cmov,           // dst = cond ? src : dst (cmovcc src, dst)
     Jcc,            // cond jump to label
     Jmp,            // jump to label
     CallSym,        // call external symbol (malloc/printf/free)
@@ -243,7 +248,7 @@ bool x64_allocate_registers(LFunction& lf, const Graph* g, bool use_registers,
                             bool aggressive, bool size_biased);
 bool x64_post_ra_cleanup(LFunction& lf);
 bool x64_machine_peephole(LFunction& lf);
-// Pass 87 helper: fused compare-and-branch + accumulator folds.
+// Pass 88 helper: fused compare-and-branch + accumulator folds.
 bool x64_branch_fusion(LFunction& lf);
 // Pass 88 (MachineLICM): machine loop transforms —
 //   * loop rotation: while-loop [head: cond; jcc body][exit][body; jmp head]
@@ -258,5 +263,12 @@ bool x64_hoist_loop_constants(LFunction& lf);
 // cluster to immediately after the entry code so the entry edge and the
 // leaf-exit edge become fallthrough instead of taken jumps.
 bool x64_loop_entry_fallthrough(LFunction& lf);
+
+// Pass 92 (Superoptimization): bounded search over post-88 MIR windows via
+// the target-agnostic engine in src/superopt/ and the x86-64 ISA descriptor
+// table in src/targets/x86_64/x64_super_isa.cpp (semantics as data — the
+// only place the superoptimizer learns instructions). Returns true when
+// any window was replaced.
+bool x64_superopt_module(LinearModule& lin);
 
 } // namespace jules

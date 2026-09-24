@@ -1,0 +1,36 @@
+// Superoptimization (pass 92): the bounded machine-code search over post-88
+// MIR windows. The search's job here: strength reductions the pattern-based
+// tiers cannot express — the multi-use multiply (the DP selector only
+// chains SINGLE-use terms, so a product with two readers keeps the hand
+// emitter's imul) and add-pair fusions. Both functions are #[no_inline] so
+// the shapes survive into the machine code at -O3 (the only level the
+// search runs at).
+//
+// The test asserts BEHAVIOR ONLY (byte-diff against the gcc oracle); the
+// runner additionally asserts the pass reports changes at -O3 and honors
+// its kill switch.
+#[no_inline]
+fn m5(x: u64) -> u64 {
+    // two readers of t: the product cannot be DP-chained
+    var t: u64 = x * 5;
+    return t + t;
+}
+#[no_inline]
+fn mixed(a: u64, b: u64) -> u64 {
+    // a mix of shapes: add-pairs, shifts by non-pow2, masks
+    var s: u64 = a + a;          // +pair -> lea scale 2
+    var m: u64 = b * 3;          // *3  -> lea a+a*2
+    var k: u64 = (a << 3) + b;   // shl + add (single-use chains: DP covers)
+    var w: u64 = m & 255;        // mask
+    return s + m + k + w;
+}
+fn main() -> i32 {
+    print(m5(7));
+    print(m5(0));
+    print(m5(1000000007));
+    print(mixed(3, 11));
+    print(mixed(0, 0));
+    print(mixed(123456789, 987654321));
+    print(m5(18446744073709551615));   // wraps: 10*(2^64-1) mod 2^64
+    return 0;
+}

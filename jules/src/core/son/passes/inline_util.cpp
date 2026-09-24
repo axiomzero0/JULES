@@ -28,7 +28,30 @@ public:
         NodeId B = c_.g.node(call).in[0];       // call site block
         call_mem_ = c_.g.node(call).in[1];      // caller memory at the call
 
-        j_entry_ = c_.g.make(Op::Jump, ty_ctrl(), {B});
+        // Straight-line callee: every value node (and the Return's control)
+        // is pinned directly to the callee's start — there is no callee
+        // control flow to splice. Cloning onto a synthetic Jump here used to
+        // re-pin the body to a block the linearizer must place AFTER the
+        // caller's block, while users of the call could stay AT the caller's
+        // block (the `before` closure's phi-backedge hole below) — a
+        // use-before-def across blocks: the consumer ran before the
+        // producer and read garbage (found by the division-family tests:
+        // inlined `return x / d` helpers). The correct placement is no new
+        // control at all: pin the clone to the call site's own region.
+        bool straight = g_.node(ret).in[0] == g_.start();
+        if (straight) {
+            for (NodeId id = 0; id < g_.size(); ++id) {
+                const Node& n = g_.node(id);
+                if (n.op == Op::Dead || n.op == Op::Param || n.op == Op::Const ||
+                    n.op == Op::Start || n.op == Op::Stop || n.op == Op::Return)
+                    continue;
+                if (n.n_in > 0 && n.in[0] != kNoNode && n.in[0] != g_.start()) {
+                    straight = false;
+                    break;
+                }
+            }
+        }
+        j_entry_ = straight ? B : c_.g.make(Op::Jump, ty_ctrl(), {B});
 
         // params -> arguments
         for (NodeId id = 0; id < g_.size(); ++id) {
@@ -89,6 +112,15 @@ public:
         //    users was misclassified as "after the call" and stranded its
         //    consumers — a use-before-def miscompile at low levels where
         //    no post-inline folding repairs the graph (-O0/-Og).
+        //    EXCEPTION (phi edges): Phi value inputs are NOT followed in
+        //    this closure. Phis are block-owned (never repinned), their
+        //    entry-edge suppliers live above the loop, and their BACKEDGE
+        //    suppliers are same-block nodes that come AFTER the call in
+        //    program order — following that edge classified post-call
+        //    consumers as "before", stranding them at B while the cloned
+        //    body lived in the callee's block tree: use-before-def across
+        //    blocks (found by the division-family tests: an inlined
+        //    `return x / d` helper feeding printf inside a loop).
         //
         //    Control nodes (Jump/If) keep the original always-move rule:
         //    they are ordered by control flow, not data dependencies, and
@@ -105,6 +137,11 @@ public:
                 if (n == kNoNode || before.contains(n)) continue;
                 before.insert(n, true);
                 const Node& nd = c_.g.node(n);
+                if (nd.op == Op::Phi) continue; // block-owned; its value
+                                                // inputs merge OTHER points
+                                                // in the CFG (the phi edge
+                                                // is not a same-iteration
+                                                // dependency)
                 for (u8 i = 0; i < nd.n_in; ++i)
                     if (nd.in[i] != kNoNode) stack.push_back(nd.in[i]);
             }

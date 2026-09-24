@@ -799,7 +799,13 @@ private:
         g.append_input(vmphi, cur_mem);
         g.append_input(kphi, knew);
         if (reduction_phi_ != kNoNode) {
-            g.append_input(vaccA, two_acc ? updA : updB);
+            // 1-acc chains: the backedge value is the LAST pack's update
+            // (acc_next tracks it through the pack loop). updB alone was
+            // wrong at packs==1 (size-biased levels keep one pack): it is
+            // never set there, the phi's backedge got kNoNode, and the
+            // graph was corrupt from then on (assert downstream; found by
+            // t_ilp_isel @ -Os: fill + reduce + a nested-loop callee).
+            g.append_input(vaccA, two_acc ? updA : acc_next);
             if (two_acc) g.append_input(vaccB, updB);
         }
 

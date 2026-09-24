@@ -17,15 +17,29 @@
 // base + index*scale + disp in one instruction (the full SIB form — the one
 // MIR opcode the DP adds; everything else emits through existing IOps).
 //
+// Division family: Div/Mod by a non-pow2 CONSTANT is claimed as a
+// magic-number sequence (Granlund-Montgomery, Hacker's Delight 10-9; both
+// the fitting form and the increment form, verified in
+// jules/scripts/verify_magic_math.py). Signed dividends go through an abs-wrapper
+// so a single u64 mulhi path serves everything; the high half comes from
+// the MulHi MIR opcode (rax:rdx fixed pair — same register shape as IDiv).
+// Magic cells are root-only standalone forms: the dividend is always a
+// Leaf (never an inline Chain), because the sequence uses the rax:rdx pair
+// on top of {dst, other}.
+//
 // Cost model: latency-class units (slot load 3 / store 1, lea/arith/shl 1,
-// imul 3). Ties prefer fewer instructions, then lower rule id — LLVM
-// AddedComplexity-style deterministic priorities.
+// imul 3, idiv 30 — the div latency class dwarfs everything, which is what
+// makes magic claims decisive). Ties prefer fewer instructions, then lower
+// rule id — LLVM AddedComplexity-style deterministic priorities.
 //
 // Scratch discipline (soundness of nested chains): every form computes its
 // value into the requested register using only {dst, other} where
 // other = (dst == rax ? rcx : rax), and every chain operand completes before
 // any leaf operand of the same form loads. A chain's internal writes are
 // therefore finished before the caller relies on its own registers.
+// (Exception: the Magic form additionally uses the rdx:rax pair for the
+// mulhi — legal because its dividend is a Leaf and the pair is dead before
+// and after the sequence; the RA's fixed-register masks cover it.)
 #pragma once
 
 #include "core/codegen/linear.h"
@@ -53,6 +67,7 @@ public:
             LeaRR,  // dst = index*scale + disp         (baseless)
             ShlImm, // dst = x << k   (Mul by 2^k, or Shl)
             Arith,  // generic two-operand form (b-side may be a chain)
+            Magic,  // dst = x /<const> or x %<const> via multiply-high
         };
         Form form = Form::Leaf;
         // Lea2 / LeaRR payload (8-byte chains only)
@@ -69,10 +84,28 @@ public:
         BinOp bin = BinOp::Add;
         u8 shift = 0; // ShlImm
         u8 size = 8;
+        // Magic payload (Form::Magic) — see the file header.
+        i64 divisor = 0;   // original signed constant divisor (nonzero)
+        u64 magic = 0;      // form A: M; form B: M_true - 2^64 (the bits used)
+        u8  mshift = 0;     // s (form B shifts by s-1 after the increment)
+        bool form_b = false; // increment form (M_true >= 2^64)
+        bool signed_div = false; // |x| wrapper + sign restore (+ neg for d<0)
+        bool is_mod = false;    // r = x - q*d recombination
         i32 cost = 0; // committed cost of this cell (excludes materializing store)
     };
 
     DpIsel(LFunction& lf, FunctionGraph& fg);
+
+    // Granlund-Montgomery unsigned magic for a u64 divisor (>= 3, not a
+    // power of two — IR p12 owns those). Returns false for divisors that
+    // would need shift == 64 (giants within 2 of 2^64): the caller keeps
+    // the idiv fallback there. Deterministic: smallest accepted s.
+    struct Magic {
+        u64 m = 0;      // form A: M itself; form B: M_true - 2^64
+        u8 s = 0;       // the shift
+        bool form_b = false; // increment form (t + ((x - t) >> 1)) >> (s - 1)
+    };
+    static bool derive_magic(u64 d, Magic& out);
 
     // Plan one block. Call after the short-circuit suppression set is built
     // for it — sc-consumed nodes are left alone. Planning and emission are
@@ -86,7 +119,22 @@ public:
     u32 roots() const { return roots_; } // claimed roots (DP-emitted nodes)
     u32 folds() const { return folds_; } // chain nodes consumed inline
 
+    // What the hand emitter pays to materialize a node (its mirror cost,
+    // including the store). Public: the ILP tier seeds its objective from
+    // the same numbers the DP compares against.
+    i32 fallback_mat(NodeId n) const;
+
+    // Latency-class cost units (shared with the ILP tier's objective).
+    static constexpr i32 kCLd = 3;   // mov reg, [slot]
+    static constexpr i32 kCSt = 1;   // mov [slot], reg
+    static constexpr i32 kCImm = 1; // mov reg, imm (incl. movabs)
+    static constexpr i32 kCOp = 1;   // arith / lea / shift-imm / mov rr
+    static constexpr i32 kCMul = 3;  // imul / mulhi latency class
+    static constexpr i32 kCDiv = 30; // idiv latency class
+
 private:
+    friend class IlpIsel; // the pass-84 sniper tier (x64_ilp_isel.{h,cpp})
+
     LFunction& lf_;
     Graph& g_;
     FlatMap<NodeId, u8> act_;
@@ -104,7 +152,6 @@ private:
     OpRef consume(NodeId x, NodeId parent); // Chain if legal, else Leaf
     i32 opref_cost(const OpRef& r);
     bool try_commit(NodeId n);               // compute + commit best cell
-    i32 fallback_mat(NodeId n) const;        // what the hand emitter pays
     void mark_consumed(NodeId n);            // Suppressed mark + walk
     void mark_children_consumed(NodeId n);   // walk only (Root keeps its own)
     void claim_root(NodeId n);

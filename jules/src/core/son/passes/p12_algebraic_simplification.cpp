@@ -140,6 +140,72 @@ private:
                 }
             }
         }
+
+        // ---- division/modulo by a power-of-two constant (int scalar) ------
+        // Identities verified exhaustively (edges + randomized) in
+        // scripts/verify_magic_math.py:
+        //   unsigned:  x / 2^k -> x >> k          (logical shift)
+        //              x % 2^k -> x & (2^k - 1)
+        //   signed:    x / 2^k -> (x + ((x >>a bits-1) & (2^k - 1))) >>a k
+        //              x % 2^k -> x - ((x / 2^k) << k)
+        // The signed forms preserve trunc-toward-zero exactly. Positivity is
+        // checked on the SIGNED value: a negative divisor whose bit pattern
+        // matches 2^k (INT64_MIN) must not fire. Non-pow2 constant divisors
+        // are the isel tier's magic-number rules (x64_dp_isel), not IR.
+        if (!fp && !ty_is_vector(n.ty) &&
+            (op == BinOp::Div || op == BinOp::Mod) &&
+            bn.op == Op::Const && const_of(g_, b, cb) && cb.iv > 0) {
+            const u64 bits = ty_bits(n.ty);
+            const bool sgn = ty_is_signed(n.ty);
+            const u64 kmax = sgn ? bits - 2 : bits - 1;
+            for (u64 k = 1; k <= kmax; ++k) {
+                if (static_cast<u64>(cb.iv) != (1ull << k)) continue;
+                NodeId pin = n.in[0];
+                auto mkc = [&](i64 v) {
+                    ConstVal c;
+                    c.ty = n.ty;
+                    c.is_fp = false;
+                    c.iv = v;
+                    return make_const_node(g_, pin, c);
+                };
+                auto mkb = [&](BinOp o, NodeId x, NodeId y) {
+                    return g_.make(Op::Bin, n.ty, {pin, x, y},
+                                   static_cast<u8>(o));
+                };
+                if (!sgn) {
+                    if (op == BinOp::Div) {
+                        // q = x >> k (unsigned: logical)
+                        g_.set_input(id, 2, mkc(static_cast<i64>(k)));
+                        n.sub = static_cast<u8>(BinOp::Shr);
+                        return true;
+                    }
+                    // r = x & (2^k - 1)
+                    g_.set_input(id, 2,
+                                 mkc(static_cast<i64>((1ull << k) - 1)));
+                    n.sub = static_cast<u8>(BinOp::And);
+                    return true;
+                }
+                // signed: mask = (x >>a bits-1) & (2^k - 1)
+                NodeId sx = a;
+                NodeId sign = mkb(BinOp::Shr, sx,
+                                  mkc(static_cast<i64>(bits - 1)));
+                NodeId msk = mkb(BinOp::And, sign,
+                                 mkc(static_cast<i64>((1ull << k) - 1)));
+                NodeId biased = mkb(BinOp::Add, sx, msk);
+                if (op == BinOp::Div) {
+                    // q = (x + mask) >>a k
+                    g_.set_input(id, 1, biased);
+                    g_.set_input(id, 2, mkc(static_cast<i64>(k)));
+                    n.sub = static_cast<u8>(BinOp::Shr);
+                    return true;
+                }
+                // r = x - ((q) << k), composed from the verified q identity
+                NodeId q = mkb(BinOp::Shr, biased, mkc(static_cast<i64>(k)));
+                NodeId qk = mkb(BinOp::Shl, q, mkc(static_cast<i64>(k)));
+                NodeId r = mkb(BinOp::Sub, sx, qk);
+                return replace(id, r);
+            }
+        }
         return false;
     }
 
