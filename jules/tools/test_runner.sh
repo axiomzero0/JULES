@@ -196,6 +196,39 @@ assert_pass_active t39_widenbase TailRecursionElimination
 # c==2 / (x,y) bindings create their own variants.
 assert_pass_active t40_static_pe PartialEvaluation
 
+# ---- pass-scaffold completion round (2026-09-25): the activity asserts ----
+# p15 (NarrowingTransform): extend-feed-trunc cancellation fires
+assert_pass_active t43_narrow NarrowingTransform
+# p27 (BitfieldLowering): nested segment-write canonicalization fires
+assert_pass_active t44_bfmerge BitfieldLowering
+# p33 (PartialEscapeAnalysis): allocation sinking into the single using arm
+assert_pass_active t46_pea PartialEscapeAnalysis
+# p57 (OuterLoopVectorizer): short-inner flattening (the SLP re-run packs)
+assert_pass_active t47_outervec OuterLoopVectorizer
+# p34/p72/p73 fire in their PGO flows (run_pgo_test asserts the use-build
+# changes; the instrument-build assert for p34 is custom below)
+assert_pass_disabled t43_narrow NarrowingTransform
+assert_pass_disabled t46_pea PartialEscapeAnalysis
+
+# ---- review-fix round (2026-09-25): the soundness regression locks ----
+# p28: the folded direct-slot compare read must keep the coloring sound
+# while the recolor still fires on the spill-heavy shape.
+assert_pass_active t51_p28cmp StackSlotColoring
+assert_pass_disabled t51_p28cmp StackSlotColoring
+# p33 hazard site (store through the pointer outside the arm) must be
+# REFUSED while the clean site still sinks: activity = the clean site.
+assert_pass_active t52_pea_store PartialEscapeAnalysis
+assert_pass_disabled t52_pea_store PartialEscapeAnalysis
+# p15 mixed 32-bit domains: the transform must decline (exact-type
+# identity), so the graph verifier stays clean on this shape.
+if ! timeout 30 $JULESC --verify tests/programs/t54_mixednarrow.jules -o "$WORK/t54v.bin" > "$WORK/t54v.log" 2>&1; then
+    echo "FAIL t54_mixednarrow (--verify compile)"
+    fail=$((fail + 1))
+else
+    echo "PASS t54_mixednarrow [--verify clean on mixed 32-bit domains]"
+    pass=$((pass + 1))
+fi
+
 # Kill-switch hold across the post-inline cleanup re-run (audit fix):
 # cleanup-set passes must stay dead when disabled.
 assert_pass_disabled t04_sroa ScalarReplacementOfAggregates
@@ -359,6 +392,15 @@ run_pgo_test() {
 run_pgo_test t36_pgo
 run_pgo_test t41_partial_deop PartialDeoptimization
 run_pgo_test t42_range_deop PartialDeoptimization
+# t46 closes the PEA feedback loop end-to-end: the instrument build writes
+# the alloc-site blocks (pass 34), the use build reads them (pass 33) and
+# the sinking still fires — output must survive both builds.
+run_pgo_test t46_pea PartialEscapeAnalysis
+# t48/t49 generate the profiles the guard-family detection asserts below
+# consume; the ladder creation (PartialDeoptimization) is the activity
+# each flow is asserted on.
+run_pgo_test t48_guardhoist PartialDeoptimization
+run_pgo_test t49_guardweaken PartialDeoptimization
 
 # t42 RANGE deopt (pass 91): the standard flow above proves the ladder
 # fires on profile-derived hulls and the output survives; the adversarial
@@ -399,6 +441,122 @@ t42_range_deop_adversarial() {
 # (it consumes t42's profile); guarded so one failure doesn't cascade.
 if [ -d "$WORK/t42_range_deop_pgo" ]; then
     t42_range_deop_adversarial
+fi
+
+
+# p34 (AllocationSiteProfiling): fires only in instrument mode — assert
+# the instrument-build's stats directly (run_pgo_test asserts use builds).
+p34stats=$(timeout 30 $JULESC --pgo=instrument --stats tests/programs/t46_pea.jules -o "$WORK/p34.bin" 2>/dev/null |
+           awk -v p="AllocationSiteProfiling" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$p34stats" ] || [ "$p34stats" = "0" ]; then
+    echo "FAIL t46_pea (pass 'AllocationSiteProfiling' reported no changes in instrument build)"
+    fail=$((fail + 1))
+else
+    echo "PASS t46_pea [AllocationSiteProfiling instrument changes=$p34stats]"
+    pass=$((pass + 1))
+fi
+
+# p63 (AutoSOATransform): opt-in --soa; the default build must NOT fire.
+soastats=$(timeout 30 $JULESC --soa --stats tests/programs/t50_soa.jules -o "$WORK/soa.bin" 2>/dev/null |
+           awk -v p="AutoSOATransform" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$soastats" ] || [ "$soastats" = "0" ]; then
+    echo "FAIL t50_soa (pass 'AutoSOATransform' reported no changes under --soa)"
+    fail=$((fail + 1))
+else
+    echo "PASS t50_soa [AutoSOATransform --soa changes=$soastats]"
+    pass=$((pass + 1))
+fi
+soaoff=$(timeout 30 $JULESC --stats tests/programs/t50_soa.jules -o "$WORK/soaoff.bin" 2>/dev/null |
+         awk -v p="AutoSOATransform" '$2 == p {v += $4} END {print v + 0}')
+if [ -n "$soaoff" ] && [ "$soaoff" != "0" ]; then
+    echo "FAIL t50_soa (AutoSOATransform fired WITHOUT --soa)"
+    fail=$((fail + 1))
+else
+    echo "PASS t50_soa [AutoSOATransform opt-in honored]"
+    pass=$((pass + 1))
+fi
+timeout 30 "$WORK/soa.bin" > "$WORK/soa.out" 2>&1
+if ! diff -q tests/expected/t50_soa.txt "$WORK/soa.out" > /dev/null 2>&1; then
+    echo "FAIL t50_soa (--soa build output)"
+    fail=$((fail + 1))
+else
+    echo "PASS t50_soa [--soa build output]"
+    pass=$((pass + 1))
+fi
+
+# t53 (review-fix round): the hazard allocation (pointer passed as the
+# first effect's argument) must be REFUSED while the clean array still
+# transforms — activity under --soa = the clean array, output must be
+# byte-identical with and without the flag.
+t53stats=$(timeout 30 $JULESC --soa --stats tests/programs/t53_soa_call.jules -o "$WORK/t53soa.bin" 2>/dev/null |
+           awk -v p="AutoSOATransform" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$t53stats" ] || [ "$t53stats" = "0" ]; then
+    echo "FAIL t53_soa_call (pass 'AutoSOATransform' reported no changes under --soa)"
+    fail=$((fail + 1))
+else
+    echo "PASS t53_soa_call [AutoSOATransform --soa changes=$t53stats]"
+    pass=$((pass + 1))
+fi
+timeout 30 "$WORK/t53soa.bin" > "$WORK/t53soa.out" 2>&1
+if ! diff -q tests/expected/t53_soa_call.txt "$WORK/t53soa.out" > /dev/null 2>&1; then
+    echo "FAIL t53_soa_call (--soa build output)"
+    fail=$((fail + 1))
+else
+    echo "PASS t53_soa_call [--soa hazard refused, clean array transformed]"
+    pass=$((pass + 1))
+fi
+if ! timeout 30 $JULESC tests/programs/t53_soa_call.jules -o "$WORK/t53off.bin" > /dev/null 2>&1; then
+    echo "FAIL t53_soa_call (default compile)"
+    fail=$((fail + 1))
+else
+    timeout 30 "$WORK/t53off.bin" > "$WORK/t53off.out" 2>&1
+    if ! diff -q tests/expected/t53_soa_call.txt "$WORK/t53off.out" > /dev/null 2>&1; then
+        echo "FAIL t53_soa_call (default build output)"
+        fail=$((fail + 1))
+    else
+        echo "PASS t53_soa_call [default build output]"
+        pass=$((pass + 1))
+    fi
+fi
+
+# p72/p73 (detection mode): the use builds of their PGO flows must report
+# the detected hoistable/weakenable guard sites.
+p72stats=$(timeout 30 $JULESC --pgo=use="$WORK/t48_guardhoist_pgo/jules.prof" --stats tests/programs/t48_guardhoist.jules -o "$WORK/p72.bin" 2>/dev/null |
+           awk -v p="GuardHoisting" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$p72stats" ] || [ "$p72stats" = "0" ]; then
+    echo "FAIL t48_guardhoist (GuardHoisting detected nothing)"
+    fail=$((fail + 1))
+else
+    echo "PASS t48_guardhoist [GuardHoisting detected=$p72stats]"
+    pass=$((pass + 1))
+fi
+p73stats=$(timeout 30 $JULESC --pgo=use="$WORK/t49_guardweaken_pgo/jules.prof" --stats tests/programs/t49_guardweaken.jules -o "$WORK/p73.bin" 2>/dev/null |
+           awk -v p="GuardWeakening" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$p73stats" ] || [ "$p73stats" = "0" ]; then
+    echo "FAIL t49_guardweaken (GuardWeakening detected nothing)"
+    fail=$((fail + 1))
+else
+    echo "PASS t49_guardweaken [GuardWeakening detected=$p73stats]"
+    pass=$((pass + 1))
+fi
+
+# p35 (MaterializationPointInsertion): the JIT-mode deopt manifest carries
+# the sunk allocation's materialization recipe.
+if [ -d "$WORK/p35run" ]; then rm -rf "$WORK/p35run"; fi
+mkdir -p "$WORK/p35run"
+p35src="$(pwd)/tests/programs/t46_pea.jules"
+p35c="$(cd "$(dirname "$JULESC")" && pwd)/$(basename "$JULESC")"
+if (cd "$WORK/p35run" && timeout 30 "$p35c" --mode jit-optimizing "$p35src" -o jit.bin) > /dev/null 2>&1; then
+    if grep -q '^materialize ' "$WORK/p35run/jules_deopt_manifest.txt" 2>/dev/null; then
+        echo "PASS t46_pea [materialization recipe in the deopt manifest]"
+        pass=$((pass + 1))
+    else
+        echo "FAIL t46_pea (no materialization recipe in the manifest)"
+        fail=$((fail + 1))
+    fi
+else
+    echo "FAIL t46_pea (jit-optimizing compile)"
+    fail=$((fail + 1))
 fi
 
 echo

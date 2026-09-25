@@ -1,0 +1,26 @@
+// Pass 28 (StackSlotColoring): the accumulator t is live through the first
+// loop and the print, redefined to zero, then live through the second loop
+// — its activity has a HOLE where only u lives, and u's activity has a
+// hole where t lives. The hull coloring of pass 85 cannot share them (the
+// hulls overlap through the middle); the gen-precise refinement can. The
+// many cross-call values force memory-resident slots.
+fn main() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 50 {
+        t = t + i;
+        i = i + 1;
+    }
+    print(t); // 1225
+    var u: i64 = 0;
+    u = u + 5;
+    print(u); // 5
+    t = 0;
+    i = 0;
+    while i < 50 {
+        t = t + i * 2;
+        i = i + 1;
+    }
+    print(t); // 2450
+    return 0;
+}

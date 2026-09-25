@@ -1,0 +1,24 @@
+// Pass 63 (AutoSOATransform, --soa): the struct array's only uses are the
+// two field accesses (offsets 0 and 8); the untouched layout stride is
+// the evidence. Under --soa the array becomes two parallel i64 arrays and
+// every access sheds its stride.
+struct P { x: i64, y: i64 }
+
+fn main() -> i64 {
+    let arr = alloc(P, 16);
+    var i: i64 = 0;
+    while i < 16 {
+        arr[i].x = i;
+        arr[i].y = i * 2;
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    i = 0;
+    while i < 16 {
+        s = s + arr[i].x + arr[i].y;
+        i = i + 1;
+    }
+    print(s); // 360
+    free(arr);
+    return 0;
+}

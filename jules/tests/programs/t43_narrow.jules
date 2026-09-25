@@ -1,0 +1,29 @@
+// Pass 15 (NarrowingTransform): extend-feed-trunc cancellation. The i64
+// adds/ors below are fed exclusively by 32-bit sources extended to i64 and
+// consumed exclusively by truncation back to 32 bits — the whole chain
+// narrows to 32-bit ops with no extends left on the hot path.
+fn main() -> i64 {
+    var acc: i32 = 0;
+    var i: i32 = 0;
+    while i < 100 {
+        // (i as i64) + ((i * 2) as i64), consumed as i32: Bin64(SExt,SExt)
+        // feeding Trunc(i32) — the cancellation shape.
+        let s = ((i as i64) + ((i * 2) as i64)) as i32;
+        acc = acc + s;
+        i = i + 1;
+    }
+    print(acc); // 14850
+
+    // u64/u32 domain with the or-chain (ZExt inputs)
+    var u: u32 = 0;
+    var k: u32 = 0;
+    while k < 50 {
+        let x = k * 7;
+        let y = k * 3;
+        let v = ((x as u64) | (y as u64)) as u32;
+        u = u + v;
+        k = k + 1;
+    }
+    print(u); // 10863
+    return 0;
+}

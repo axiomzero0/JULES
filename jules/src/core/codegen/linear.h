@@ -206,6 +206,8 @@ struct LFunction {
     u32 ra_spilled = 0;                 // pass 85 telemetry: memory slots
     u32 ra_colored = 0;                 // pass 28/85 telemetry: offsets shared
                                         // by disjoint-range spill slots
+    i32 ra_callee_area = 0;              // pass 85 finalize: bytes of callee
+                                        // saves (pass 28 re-layouts above it)
     u32 ra_fused = 0;                   // pass 85 telemetry: fused accumulator chains
     u32 ra_coalesced = 0;               // pass 85 telemetry: hint-unified register pairs
     int fp_const_min_xmm = 14;          // isel FP const pool: lowest xmm index
@@ -236,6 +238,14 @@ struct LinearModule {
         const char* kind;
     };
     std::vector<GuardSite> guard_sites;
+    // Materialization recipes (pass 35, from pass 33's sunk allocations)
+    struct Materialization {
+        FnId fn;
+        int block;
+        i64 size;        // -1 = dynamic-size allocation
+        const char* how; // "sunk" = allocation sinking materialization
+    };
+    std::vector<Materialization> materializations;
 };
 
 // Serialization: MIR -> AT&T assembly text (whole module).
@@ -250,6 +260,10 @@ bool x64_allocate_frame(LFunction& lf);
 //   level >= O1 -> linear scan with callee-saved/caller-saved/XMM pools
 bool x64_allocate_registers(LFunction& lf, const Graph* g, bool use_registers,
                             bool aggressive, bool size_biased);
+// Pass 28 (StackSlotColoring) at machine level: gen-precise offset sharing
+// over the final stream (post-88, pre-89). Unifies aliased slot ids and
+// re-lays out the frame above the callee-save area. Returns saved slots.
+u32 x64_slot_recolor(LFunction& lf);
 bool x64_post_ra_cleanup(LFunction& lf);
 bool x64_machine_peephole(LFunction& lf);
 // Pass 88 helper: fused compare-and-branch + accumulator folds.

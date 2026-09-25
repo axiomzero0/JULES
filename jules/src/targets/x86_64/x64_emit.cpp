@@ -1991,6 +1991,11 @@ SlotCounts count_slot_refs(const std::vector<Inst>& code) {
             c.uses.insert(i.b.slot, c.uses.contains(i.b.slot) ? *c.uses.find(i.b.slot) + 1 : 1);
         else if (i.op == IOp::LeaSlot && i.b.k == Operand::K::Slot)
             c.uses.insert(i.b.slot, c.uses.contains(i.b.slot) ? *c.uses.find(i.b.slot) + 1 : 1);
+        else if (i.op == IOp::CmpRImm && i.a.k == Operand::K::Slot)
+            // folded direct-slot compare (pass 87 fold 3 output) reads the
+            // slot — a dead-store elimination running after the fold must
+            // not kill the store feeding it
+            c.uses.insert(i.a.slot, c.uses.contains(i.a.slot) ? *c.uses.find(i.a.slot) + 1 : 1);
     }
     return c;
 }

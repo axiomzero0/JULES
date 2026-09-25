@@ -1,5 +1,7 @@
 jules lto summary v1
-functions: 2
-fn 0 nodes 22 params 2 hint never
-fn 1 nodes 43 params 0 hint cost
-  edge -> 0 sites 6 const yes
+functions: 3
+fn 0 nodes 8 params 1 hint never
+fn 1 nodes 18 params 2 hint cost
+fn 2 nodes 37 params 0 hint cost
+  edge -> 0 sites 2 const yes
+  edge -> 1 sites 1 const no

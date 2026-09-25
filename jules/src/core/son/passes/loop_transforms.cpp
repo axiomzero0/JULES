@@ -399,9 +399,19 @@ std::vector<NodeId> body_order(Graph& g, const CountedLoop& cl) {
                 }
             } else if (bn.op == Op::IfTrue || bn.op == Op::IfFalse) {
                 // the projection's input is an internal If; the If is
-                // PINNED at a block — that block must be placed first
+                // PINNED at a block — that block must be placed first.
+                // No body_proj special case here (the Jump one below is
+                // safe because clone_head DEFERS unremapped inputs; the
+                // projection head-clone has no deferral, so a projection
+                // swept before its pin's contents clones against the
+                // ORIGINAL If — observed on the empty false arm of an
+                // in-body diamond: three IfFalse copies all pointing at
+                // the original If, the joins fed by the wrong path, and
+                // the loop miscompiled under -O2).
                 NodeId if_pin = g.node(bn.in[0]).in[0];
-                if (if_pin != cl.body_proj && !placed.contains(if_pin)) ready = false;
+                if (if_pin != kNoNode && in_blocks(if_pin) &&
+                    !placed.contains(if_pin))
+                    ready = false;
             } else {
                 NodeId ctrl = bn.in[0];
                 if (ctrl != kNoNode && ctrl != cl.body_proj && in_blocks(ctrl) &&

@@ -1,0 +1,28 @@
+// Pass 72 (GuardHoisting): hot() is called in a loop with a loop-INVARIANT
+// first argument (the #[no_inline] call result pinned before the loop), so
+// the pass-91 ladder's equality guard re-checks the same condition every
+// iteration. Pass 72 versions the loop: the hoisted preheader guard picks
+// the specialized body once; both exits merge back.
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    return v * 1;
+}
+
+fn hot(x: i64, c: i64) -> i64 {
+    if x < 3 {
+        return x * c + 1;
+    }
+    return x - c;
+}
+
+fn main() -> i64 {
+    let x = opaque(3); // runtime value, pinned outside the loop
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 200 {
+        s = s + hot(x, i);
+        i = i + 1;
+    }
+    print(s); // -19300
+    return 0;
+}

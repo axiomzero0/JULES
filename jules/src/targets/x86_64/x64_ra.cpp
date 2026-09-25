@@ -116,6 +116,18 @@ bool slot_use_inst(const Inst& i, i32& slot, bool& fp, bool& addr) {
         addr = true;
         return true;
     }
+    // Folded direct-slot compare (pass 87 fold 3 rewrites
+    // [mov rax,[s]][test rax] into [cmp $imm,[s]]). Any post-87 slot
+    // analysis MUST see this read: missing it collapses the slot's live
+    // interval to its def and lets the recolor alias another slot onto
+    // the same offset (a folded branch then reads the other value —
+    // regression-locked by t51_p28cmp).
+    if (i.op == IOp::CmpRImm && i.a.k == Operand::K::Slot) {
+        slot = i.a.slot;
+        fp = false;
+        addr = false;
+        return true;
+    }
     return false;
 }
 
@@ -256,9 +268,13 @@ struct Allocator {
         // the slot, so X simply stays live across the branches.
         auto gap_ok = [](const Inst& c, i32 s, R x) {
             switch (c.op) {
+                case IOp::CmpRImm:
+                    // flags-only UNLESS it is the folded direct-slot form
+                    // (pass 87 fold 3): [cmp $imm,[s]] reads slot s, so a
+                    // same-slot round trip cannot fold across it.
+                    return c.a.k != Operand::K::Slot || c.a.slot != s;
                 case IOp::Nop:
                 case IOp::CmpRR:
-                case IOp::CmpRImm:
                 case IOp::Test:
                 case IOp::FpCmp:
                 case IOp::Jcc:
@@ -1694,6 +1710,10 @@ struct Allocator {
         i32 frame = (total + 15) & ~15;          // keep rsp 16-byte aligned
         i32 frame_sub = frame - callee_area;     // pushes already moved rsp
 
+        // pass 28 re-layout anchor: the fixed callee-save area the scalar
+        // and wide slot areas are stacked above.
+        lf.ra_callee_area = callee_area;
+
         // ---- frame elision (omit frame pointer) ---------------------------
         // No unpromoted slots => no rbp-relative addressing survives, so the
         // rbp chain and the frame subtraction are pure overhead. The
@@ -1828,6 +1848,425 @@ struct Allocator {
 };
 
 } // namespace
+
+// ---- pass 28 support: CFG from the FINAL code stream -----------------------
+//
+// Pass 88's loop rotation reorders the machine stream (labels and branch
+// targets rewritten in place) without re-deriving LBlock::succs, so any
+// post-88 analysis must take its CFG from the stream itself — the same
+// discipline the superoptimizer's region builder follows. This is the
+// slot-liveness core analyze() runs pre-88 (per-region use/def, backward
+// fixpoint, per-instruction walk, generation sub-intervals), rebuilt over
+// label-delimited regions so the coloring never trusts stale block edges.
+namespace {
+
+struct StreamSlotInfo {
+    bool defined = false;
+    bool addr_taken = false;
+    size_t first_live = SIZE_MAX;
+    size_t last_live = 0;
+    std::vector<std::pair<size_t, size_t>> gens;
+};
+
+bool stream_slot_liveness(const LFunction& lf, std::vector<StreamSlotInfo>& out) {
+    out.clear();
+    out.resize(static_cast<size_t>(lf.slot_count > 0 ? lf.slot_count : 0));
+    const std::vector<Inst>& code = lf.code;
+    if (lf.slot_count <= 0 || code.empty()) return false;
+
+    // 1) regions: label-delimited; instructions before the first label
+    //    belong to the prologue pseudo-region (index = region count).
+    std::vector<u32> region_of(code.size(), 0);
+    std::vector<size_t> rbegin, rend;
+    FlatMap<int, u32> label_region;
+    u32 r = 0;
+    size_t start = 0;
+    if (code[0].op == IOp::Label) {
+        label_region.insert(code[0].a.label, 0);
+        start = 1;
+    }
+    rbegin.push_back(start);
+    for (size_t i = start; i < code.size(); ++i) {
+        if (code[i].op == IOp::Label) {
+            rend.push_back(i);
+            rbegin.push_back(i + 1);
+            label_region.insert(code[i].a.label, ++r);
+        }
+        region_of[i] = r;
+    }
+    rend.push_back(code.size());
+    const u32 nregions = static_cast<u32>(rbegin.size());
+    const u32 entry = nregions; // prologue pseudo-region index
+    const size_t nb = nregions + 1;
+
+    // 2) successors from the stream (Jmp / Jcc targets; terminators cut
+    //    the fallthrough; everything else falls through). A region may
+    //    carry MULTIPLE Jcc's (the fused short-circuit guard chains
+    //    linearize as [cmp][jcc exit][cmp][jcc body] in one block) — every
+    //    target counts as an edge, plus the fallthrough when no
+    //    unconditional terminator ends the region.
+    std::vector<std::vector<u32>> succs(nb);
+    for (u32 k = 0; k < nregions; ++k) {
+        bool fell_through = true;
+        for (size_t i = rbegin[k]; i < rend[k]; ++i) {
+            const Inst& in = code[i];
+            if (in.op == IOp::Jmp) {
+                const u32* t = label_region.find(in.a.label);
+                if (t) {
+                    succs[k].push_back(*t);
+                } else {
+                    // unresolved target: bail like the Jcc path below —
+                    // silently dropping the edge would under-approximate
+                    // liveness at the fixpoint (two sharable-looking
+                    // slots that a real edge keeps apart)
+                    return false;
+                }
+                fell_through = false;
+                break;
+            }
+            if (in.op == IOp::Jcc) {
+                if (in.a.k == Operand::K::Label) {
+                    const u32* t = label_region.find(in.a.label);
+                    if (t) succs[k].push_back(*t);
+                    else return false; // unresolved branch target: bail out
+                } else {
+                    return false; // malformed conditional: no target to model
+                }
+                continue; // conditional: more targets may follow
+            }
+            if (in.op == IOp::Ret || in.op == IOp::RetNaked ||
+                in.op == IOp::TailCallFn || in.op == IOp::TailCallNaked) {
+                fell_through = false;
+                break;
+            }
+        }
+        if (fell_through && k + 1 < nregions) succs[k].push_back(k + 1);
+    }
+    // prologue falls into the region holding the first instruction.
+    if (nregions > 0) {
+        u32 first = 0;
+        for (size_t i = 0; i < code.size(); ++i)
+            if (code[i].op != IOp::Label) {
+                first = region_of[i];
+                break;
+            }
+        succs[entry].push_back(first);
+    }
+
+    // 3) per-region use/def (a use after a def in the same region is not
+    //    a region-level use — the def dominates it locally). Instructions
+    //    before the first label belong to the prologue pseudo-region.
+    std::vector<SlotSet> buse(nb), bdef(nb);
+    for (size_t i = 0; i < code.size(); ++i) {
+        size_t bi = i < start ? static_cast<size_t>(entry)
+                              : static_cast<size_t>(region_of[i]);
+        i32 s = 0;
+        bool f = false, ad = false;
+        if (slot_def_inst(code[i], s, f)) {
+            out[static_cast<size_t>(s)].defined = true;
+            bdef[bi].add(s);
+        } else if (slot_use_inst(code[i], s, f, ad)) {
+            if (ad) out[static_cast<size_t>(s)].addr_taken = true;
+            if (!bdef[bi].has(s)) buse[bi].add(s);
+        }
+    }
+
+    // 4) backward liveness fixpoint.
+    std::vector<SlotSet> live_in(nb), live_out(nb);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t bi = nb; bi-- > 0;) {
+            SlotSet lo;
+            for (u32 t : succs[bi]) lo.add_all(live_in[t]);
+            if (lo.slots.size() != live_out[bi].slots.size()) changed = true;
+            live_out[bi] = std::move(lo);
+            SlotSet li = buse[bi];
+            for (i32 s : live_out[bi].slots)
+                if (!bdef[bi].has(s)) li.add(s);
+            if (li.slots.size() != live_in[bi].slots.size()) changed = true;
+            live_in[bi] = std::move(li);
+        }
+    }
+
+    // 5) per-instruction backward walk: first/last activity + the EXACT
+    //    active-position record. A position is active for a slot when the
+    //    slot is live across it (fixpoint live set on SOME path — a
+    //    may-analysis, hence conservative), or the position itself
+    //    defines/uses it. Runs of consecutive active positions become the
+    //    shareable sub-intervals; this replaces position-split
+    //    redefinition analysis, which carves FALSE HOLES when a def is
+    //    conditional (the value from an earlier def flows through the
+    //    not-taken arm's positions without any def/use marking them).
+    const size_t nslots = out.size();
+    const size_t npos = code.size();
+    const size_t total_bits = nslots * npos;
+    std::vector<u64> active_bits;
+    const bool record = total_bits <= (8u << 20); // 1 MiB bitmap budget
+    if (record) active_bits.assign((total_bits + 63) / 64, 0);
+    auto mark_active = [&](i32 s, size_t i) {
+        if (!record) return;
+        size_t b = static_cast<size_t>(s) * npos + i;
+        active_bits[b >> 6] |= 1ull << (b & 63);
+    };
+    for (size_t bi = nb; bi-- > 0;) {
+        SlotSet live = live_out[bi];
+        const size_t from = bi == entry ? 0 : rbegin[bi];
+        const size_t to = bi == entry ? start : rend[bi];
+        for (size_t i = to; i-- > from;) {
+            const Inst& inst = code[i];
+            // `live` here = live AFTER instruction i (before it is processed)
+            for (i32 s : live.slots) {
+                StreamSlotInfo& r2 = out[static_cast<size_t>(s)];
+                if (r2.last_live < i) r2.last_live = i;
+                mark_active(s, i);
+            }
+            i32 s = 0;
+            bool f = false, ad = false;
+            if (slot_def_inst(inst, s, f)) {
+                StreamSlotInfo& r2 = out[static_cast<size_t>(s)];
+                if (r2.last_live < i) r2.last_live = i;
+                if (r2.first_live > i) r2.first_live = i;
+                mark_active(s, i);
+                live.remove(s);
+            } else if (slot_use_inst(inst, s, f, ad)) {
+                StreamSlotInfo& r2 = out[static_cast<size_t>(s)];
+                if (r2.last_live < i) r2.last_live = i;
+                mark_active(s, i);
+                live.add(s);
+            }
+            for (i32 s2 : live.slots) {
+                StreamSlotInfo& r2 = out[static_cast<size_t>(s2)];
+                if (r2.first_live > i) r2.first_live = i;
+                mark_active(s2, i);
+            }
+        }
+    }
+    // degenerate: defined but never otherwise live
+    for (StreamSlotInfo& r2 : out)
+        if (r2.first_live == SIZE_MAX) r2.first_live = r2.last_live;
+
+    // 6) coalesce the active positions into sub-intervals. Slots whose
+    //    bitmap was over budget (or with no interior activity) fall back
+    //    to the conservative hull — identical to pass 85's own coloring,
+    //    so sharing simply degrades to what finalize() already did.
+    if (record) {
+        for (size_t s = 0; s < nslots; ++s) {
+            StreamSlotInfo& r2 = out[s];
+            size_t i = 0;
+            while (i < npos) {
+                size_t b = s * npos + i;
+                if (((active_bits[b >> 6] >> (b & 63)) & 1ull) == 0) {
+                    ++i;
+                    continue;
+                }
+                size_t lo = i;
+                while (i < npos) {
+                    size_t b2 = s * npos + i;
+                    if (((active_bits[b2 >> 6] >> (b2 & 63)) & 1ull) == 0) break;
+                    ++i;
+                }
+                r2.gens.push_back({lo, i - 1});
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+// Pass 28 (StackSlotColoring): gen-precise offset sharing over the FINAL
+// machine stream. Pass 85's finalize() colors memory slots by their live
+// HULL; this refinement unifies slots whose exact generation sub-intervals
+// (the same gens the register assignment's coalescing used) are provably
+// disjoint — a loop phi slot and an inner temporary can share one rbp
+// offset even though their hulls overlap through the backedge.
+//
+// Unification rewrites the slot IDS (aliased slots become the color
+// representative), so downstream consumers — pass 89's frame telemetry,
+// pass 92's window liveness — model ONE slot id per physical offset and
+// the aliasing never leaks into a semantic model.
+//
+// Soundness notes:
+//   * addr-taken slots never share (distinct allocations keep distinct
+//     addresses; LeaSlot identity).
+//   * wide (128-bit vector) slots keep their own 16-byte area.
+//   * promoted slots have no slot operands left — excluded naturally.
+//   * intervals include their endpoints; sharing requires strict
+//     disjointness (a read of one on the same position as a def of the
+//     other is a conflict).
+// Returns the number of saved frame slots (0 = nothing to share).
+u32 x64_slot_recolor(LFunction& lf) {
+    if (lf.slot_count <= 0) return 0;
+    if (lf.slot_offset.size() != static_cast<size_t>(lf.slot_count)) return 0;
+
+    // CFG + liveness derived from the STREAM (label-delimited regions):
+    // pass 88's loop rotation rewrote branch targets in place, so
+    // LBlock::succs may be stale at this point in the pipeline.
+    std::vector<StreamSlotInfo> info;
+    if (!stream_slot_liveness(lf, info)) return 0;
+
+    auto is_wide = [&](i32 s) {
+        const bool* w = lf.slot_wide.find(s);
+        return w && *w;
+    };
+
+    // Which slots still carry memory operands, and their first activity
+    // for deterministic (activity, id) ordering.
+    std::vector<bool> mem(static_cast<size_t>(lf.slot_count), false);
+    for (const Inst& i : lf.code) {
+        i32 s = 0;
+        bool f = false, ad = false;
+        if (slot_def_inst(i, s, f) || slot_use_inst(i, s, f, ad))
+            mem[static_cast<size_t>(s)] = true;
+    }
+    std::vector<i32> cands;
+    for (i32 s = 0; s < lf.slot_count; ++s) {
+        if (is_wide(s)) continue;
+        if (lf.slot_reg.contains(s)) continue; // promoted: no operands left
+        if (!mem[static_cast<size_t>(s)]) continue;
+        if (info[static_cast<size_t>(s)].addr_taken) continue;
+        cands.push_back(s);
+    }
+    if (cands.empty()) return 0;
+    std::sort(cands.begin(), cands.end(), [&](i32 x, i32 y) {
+        size_t fx = info[static_cast<size_t>(x)].first_live;
+        size_t fy = info[static_cast<size_t>(y)].first_live;
+        if (fx != fy) return fx < fy;
+        return x < y;
+    });
+
+    // Exact sub-intervals per candidate: gens when multi-def (the head
+    // window before the first def is restored by the analysis), else hull.
+    auto intervals = [&](i32 s) -> std::vector<std::pair<size_t, size_t>> {
+        const StreamSlotInfo& r = info[static_cast<size_t>(s)];
+        if (!r.gens.empty()) return r.gens;
+        if (r.first_live == SIZE_MAX) return {{r.last_live, r.last_live}};
+        return {{r.first_live, r.last_live}};
+    };
+
+    // Greedy color assignment: a color is reusable when every one of its
+    // intervals is strictly disjoint from the candidate's.
+    struct ColorGroup {
+        std::vector<std::pair<size_t, size_t>> live; // all member intervals
+        std::vector<i32> slots;
+    };
+    std::vector<ColorGroup> groups;
+    for (i32 s : cands) {
+        const auto ivs = intervals(s);
+        bool placed = false;
+#ifdef JULES_DEBUG_SC
+        std::fprintf(stderr, "[sc] cand slot %d ivs:", s);
+        for (const auto& iv : ivs)
+            std::fprintf(stderr, " [%zu,%zu]", iv.first, iv.second);
+        std::fprintf(stderr, " (groups so far: %zu)\n", groups.size());
+#endif
+        for (ColorGroup& g : groups) {
+            bool ok = true;
+            for (const auto& g1 : g.live) {
+                for (const auto& iv : ivs) {
+                    // overlap iff each starts before the other ends
+                    if (iv.first <= g1.second && g1.first <= iv.second) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) break;
+            }
+            if (ok) {
+                g.live.insert(g.live.end(), ivs.begin(), ivs.end());
+                g.slots.push_back(s);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            groups.push_back(ColorGroup{{}, {s}});
+            groups.back().live.assign(ivs.begin(), ivs.end());
+        }
+    }
+
+    // Unify ids: every member of a multi-slot group aliases the smallest id.
+    FlatMap<i32, i32> rep; // member -> representative
+    u32 saved = 0;
+    for (const ColorGroup& g : groups) {
+        if (g.slots.size() < 2) continue;
+        saved += static_cast<u32>(g.slots.size()) - 1;
+        i32 r = g.slots[0];
+        for (i32 s : g.slots) r = std::min(r, s);
+        for (i32 s : g.slots)
+            if (s != r) rep.insert(s, r);
+#ifdef JULES_DEBUG_SC
+        std::fprintf(stderr, "[sc] fn %u share rep=%d <- ", lf.fid, r);
+        for (i32 s : g.slots)
+            if (s != r) std::fprintf(stderr, "%d ", s);
+        std::fprintf(stderr, "\n");
+        for (i32 s : g.slots) {
+            const StreamSlotInfo& r2 = info[static_cast<size_t>(s)];
+            std::fprintf(stderr, "[sc]   slot %d first=%zu last=%zu gens:",
+                         s, r2.first_live, r2.last_live);
+            for (const auto& iv : r2.gens)
+                std::fprintf(stderr, " [%zu,%zu]", iv.first, iv.second);
+            std::fprintf(stderr, "\n");
+        }
+#endif
+    }
+    if (saved == 0) return 0; // hull coloring was already exact
+
+    auto remap = [&](i32& s) {
+        const i32* m = rep.find(s);
+        if (m) s = *m;
+    };
+    for (Inst& i : lf.code) {
+        if (i.a.k == Operand::K::Slot) remap(i.a.slot);
+        if (i.b.k == Operand::K::Slot) remap(i.b.slot);
+    }
+    {
+        std::vector<NodeId> keys;
+        keys.reserve(lf.slot_of.entries().size());
+        for (const auto& kv : lf.slot_of.entries()) keys.push_back(kv.first);
+        for (NodeId k : keys) {
+            if (i32* v = lf.slot_of.find(k)) remap(*v);
+        }
+    }
+
+    // ---- re-layout of the scalar + wide areas above the callee saves ----
+    i32 callee = lf.ra_callee_area;
+    i32 distinct = 0;
+    for (i32 s = 0; s < lf.slot_count; ++s) {
+        if (is_wide(s)) continue;
+        if (lf.slot_reg.contains(s)) continue;
+        if (!mem[static_cast<size_t>(s)]) continue;
+        const i32* m = rep.find(s);
+        i32 r = m ? *m : s;
+        bool repr = true; // first (smallest-id) member owns the offset
+        for (i32 t = 0; t < s && repr; ++t) {
+            const i32* m2 = rep.find(t);
+            if (m2 && *m2 == r) repr = false;
+        }
+        if (!repr) continue;
+        lf.slot_offset[static_cast<size_t>(s)] = -(callee + 8 * (distinct + 1));
+        ++distinct;
+    }
+    i32 wide_base = (callee + 8 * distinct + 15) & ~15;
+    i32 wide_count = 0;
+    for (i32 s = 0; s < lf.slot_count; ++s) {
+        if (!is_wide(s)) continue;
+        if (lf.slot_reg.contains(s)) continue;
+        if (!mem[static_cast<size_t>(s)]) continue;
+        lf.slot_offset[static_cast<size_t>(s)] = -(wide_base + 16 * (wide_count + 1));
+        ++wide_count;
+    }
+    i32 frame = (wide_base + 16 * wide_count + 15) & ~15;
+    for (Inst& i : lf.code)
+        if (i.op == IOp::FrameSub) {
+            i.b.k = Operand::K::Imm;
+            i.b.imm = frame - callee;
+        }
+    lf.frame_size = frame;
+    lf.ra_colored = saved;
+    return saved;
+}
 
 bool x64_allocate_registers(LFunction& lf, const Graph* /*g*/, bool use_registers,
                              bool aggressive, bool size_biased) {

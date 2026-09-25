@@ -1,0 +1,29 @@
+// Pass 57 (OuterLoopVectorizer): the inner loop's trip is the constant 4
+// (below pass 42's threshold, above the vectorizer's lane floor); the
+// outer trip is the dynamic iteration variable. The nest is IMPERFECT
+// (the outer body's `t` binding is not part of the inner loop), which is
+// what keeps pass 45's interchange from reshaping it first. Flattening
+// the inner loop gives the outer body four adjacent isomorphic stores
+// for the SLP re-run to pack.
+fn main() -> i64 {
+    let g = alloc(i64, 24);
+    var i: i64 = 0;
+    while i < 6 {
+        var t = i * 10;      // outer-only statement: imperfect nest
+        var j: i64 = 0;
+        while j < 4 {
+            g[i * 4 + j] = t + j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    i = 0;
+    while i < 24 {
+        s = s + g[i];
+        i = i + 1;
+    }
+    print(s); // 636
+    free(g);
+    return 0;
+}

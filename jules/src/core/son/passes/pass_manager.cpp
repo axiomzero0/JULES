@@ -111,27 +111,39 @@ bool PassManager::run_one(Pass& p, PassStats& st) {
 bool PassManager::run() {
     std::vector<Pass*> all = PassRegistry::instance().create_all();
 
+    // Execution slot within a stage. The catalog number (order()) is the
+    // spec's namespace and stays untouched; these keys are execution order
+    // only, for passes whose Phase slot predates the machinery they need:
+    //   71 GuardInsertion   -> 835: Linear stage, needs linearized blocks;
+    //                           sequences between the linearizer (83) and
+    //                           the machine tier (84+), before the manifest
+    //                           emission (89) that serializes its table.
+    //   28 StackSlotColoring-> 885: Linear stage, colors over the FINAL
+    //                           post-88 machine stream, before the manifest
+    //                           reads frame sizes (89).
+    //   72 GuardHoisting    -> 915: SoN stage, after the ladder creator (91)
+    //                           whose guards it hoists.
+    //   73 GuardWeakening   -> 916: SoN stage, same dependency as 72.
+    auto exec_key = [](const Pass* p) -> int {
+        switch (p->order()) {
+            case 71: return 835;
+            case 35: return 836; // materialization recipes: after the
+                                // linearizer, next to 71's guard table
+            case 28: return 885;
+            case 72: return 915;
+            case 73: return 916;
+            default: return p->order() * 10;
+        }
+    };
+
     // Stage partition: SoN passes run before Linear passes regardless of
     // catalog number (stable within each stage by order). The catalog
     // extended past the lowering family (89) with SoN-stage entries (90:
     // PartialEvaluation, 91: PartialDeoptimization); without the partition
     // they would run after the module was already linearized.
-    std::stable_sort(all.begin(), all.end(), [](const Pass* a, const Pass* b) {
+    std::stable_sort(all.begin(), all.end(), [exec_key](const Pass* a, const Pass* b) {
         if (a->stage() != b->stage()) return a->stage() == Stage::Son;
-        // Within the Linear stage, passes with pre-lowering catalog numbers
-        // (71: GuardInsertion — a Phase-6 slot that became Linear when the
-        // guard-site table moved to the linear module) still need LINEARIZED
-        // blocks, so they sequence after the linearizer (83) despite their
-        // lower catalog identity. The catalog number (order()) is the spec's
-        // namespace and stays untouched; this is execution order only.
-        // GuardInsertion (71) is a Linear-stage pass that needs LINEARIZED
-        // blocks: it sequences between the linearizer (83) and the machine
-        // tier (84+) and BEFORE the manifest emission (89) so its guard-site
-        // table is what pass 89 serializes. Keys are scaled x10 to place 71
-        // at 835 — between 83 (830) and 84 (840).
-        int ka = a->order() == 71 ? 835 : a->order() * 10;
-        int kb = b->order() == 71 ? 835 : b->order() * 10;
-        return ka < kb;
+        return exec_key(a) < exec_key(b);
     });
     size_t son_end = 0; // one-past-the-end of the SoN group
     for (size_t i = 0; i < all.size(); ++i)
@@ -174,7 +186,11 @@ bool PassManager::run() {
         // local allocations (NoAlias) — the inlined copies pack there.
         // Production pipelines re-run vectorization after inline the
         // same way.
-        static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58};
+        // 74 runs post-inline per its own file contract: pass 91 creates
+        // the guard sites in the LAST SoN slot, and the cleanup sweep at
+        // the SoN/Linear boundary is where the merger's detection sees
+        // them (its rewrite remains deferred — see the pass file).
+        static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58, 74};
         for (u32 r = 0; r < rounds; ++r) {
             std::vector<Pass*> again = PassRegistry::instance().create_all();
             FlatMap<int, Pass*> by_order;

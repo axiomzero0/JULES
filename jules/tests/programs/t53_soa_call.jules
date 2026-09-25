@@ -1,0 +1,62 @@
+// Pass 63 (AutoSOATransform, opt-in --soa): TWO arrays with different
+// fates. (1) A HAZARD allocation: its pointer is PASSED to a no-inline
+// callee as the FIRST effect after the allocation — the call chains
+// directly on the alloc's memory version AND takes the pointer as an
+// argument. The transform must refuse the whole allocation: killing the
+// base would dangle the call's argument (this shape SIGSEGV'd under
+// --soa when the call was classified as a pure memory-chain user). The
+// callee does not dereference (n = 0) so the output stays deterministic
+// either way. (2) A CLEAN array — field-only accesses through the cast
+// bases plus a free: it must transform under --soa.
+struct P { x: i64, y: i64 }
+
+#[no_inline]
+fn probe(p: *mut P, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + p[i].x;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // hazard array: probe never dereferences (n=0) but the pointer is
+    // an argument of the first effect chained on the allocation
+    let arr = alloc(P, 16);
+    let pre: i64 = probe(arr, 0);
+    var i: i64 = 0;
+    while i < 16 {
+        arr[i].x = i;
+        arr[i].y = i * 2;
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    i = 0;
+    while i < 16 {
+        s = s + arr[i].x + arr[i].y;
+        i = i + 1;
+    }
+    print(pre); // 0
+    print(s);   // 360
+    free(arr);
+
+    // clean array: field-only accesses + free -> transforms under --soa
+    let arr2 = alloc(P, 8);
+    i = 0;
+    while i < 8 {
+        arr2[i].x = i;
+        arr2[i].y = i + 1;
+        i = i + 1;
+    }
+    var s2: i64 = 0;
+    i = 0;
+    while i < 8 {
+        s2 = s2 + arr2[i].x + arr2[i].y;
+        i = i + 1;
+    }
+    print(s2); // 64
+    free(arr2);
+    return 0;
+}

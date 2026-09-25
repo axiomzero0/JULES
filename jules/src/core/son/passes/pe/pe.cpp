@@ -745,6 +745,15 @@ const std::vector<PeAssumption>* pe_variant_assumptions(FnId fid) {
     return nullptr;
 }
 
+// The origin function a PE variant was cloned from (kNoFn = not a
+// variant). Guard-family passes need the origin to re-derive the PGO
+// sketch keys — profiles enumerate ORIGINAL functions only.
+FnId pe_variant_origin(FnId fid) {
+    for (const VariantEntry& e : variant_table())
+        if (e.fid == fid) return e.origin;
+    return kNoFn;
+}
+
 namespace {
 
 // Deep-clone `src` into a fresh graph. Const-bound parameters become

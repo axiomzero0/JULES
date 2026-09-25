@@ -95,6 +95,11 @@ FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
 // Re-derive the variant's assumptions (empty = not a PE variant).
 const std::vector<PeAssumption>* pe_variant_assumptions(FnId fid);
 
+// The origin function a PE variant was cloned from (kNoFn = not a
+// variant). Guard-family passes need the origin to re-derive PGO sketch
+// keys — profiles enumerate ORIGINAL functions only.
+FnId pe_variant_origin(FnId fid);
+
 // ---- PGO argument sketches (pass 91) ---------------------------------------
 //
 // Instrument mode pins one sticky-value sketch per (function, integer

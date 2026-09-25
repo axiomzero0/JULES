@@ -1,0 +1,19 @@
+// Pass 15 (NarrowingTransform): MIXED 32-bit domains — the wide add's
+// operand extends from i32 while its only consumer truncates to u32. The
+// transform must require exact source-type identity against the narrow
+// domain: a bits-only match emitted Bin u32 over i32-typed operands —
+// verifier-invalid IR ("graph verification failed after pass
+// 'NarrowingTransform'") on this exact shape. With the identity check the
+// transform declines, the wide op stays, and the low-32 result (2i, well
+// inside both domains) is identical either way.
+fn main() -> i64 {
+    var i: i32 = 0;
+    var s: u64 = 0;
+    while i < 40 {
+        let w = ((i as u64) + (i as u64)) as u32; // mixed: i32 feeds, u32 reads
+        s = s + (w as u64);
+        i = i + 1;
+    }
+    print(s); // 2 * (0+..+39) = 1560
+    return 0;
+}

@@ -81,6 +81,8 @@ enum : u8 {
     kFlagProfile       = 1u << 3, // Store/Call: profile counter op (PGO);
                                    // immune to DSE/mem-chain pruning
     kFlagVecEpilogue   = 1u << 4, // Store: vectorizer remainder-loop store
+    kFlagMaterialized  = 1u << 5, // Alloc: sunk into its single using arm
+                                    // (pass 33); pass 35 emits the recipe
 };
 
 constexpr u8 kMaxInputs = 16; // node input arity (MVP limit, diagnosed upstream)

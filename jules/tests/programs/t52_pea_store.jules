@@ -1,0 +1,37 @@
+// Pass 33 (PartialEscapeAnalysis): TWO allocation sites with different
+// fates. (1) A HAZARD site: the first effect after the allocation is a
+// store THROUGH the pointer itself — the store chains directly on the
+// alloc's memory version AND consumes the pointer as its address, while
+// the only value user (the no-inline call) sits in one arm of the
+// branch. The transform must REFUSE this site: re-threading the version
+// slot while the address still names the sunk alloc leaves a
+// non-dominating pointer (a wild store — this shape SIGSEGV'd at -O2
+// when the store was classified as a pure memory-chain user).
+// (2) A CLEAN site: every use inside one arm; it must sink (the not-taken
+// path never allocates).
+#[no_inline]
+fn take(p: *mut i64, v: i64) -> i64 {
+    *p = v;
+    return *p + 1;
+}
+
+fn main() -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        let p = alloc(i64);
+        *p = 5;                    // hazard: mem version AND address name p
+        if i == 1 {
+            s = s + take(p, i);   // the only value user: inside the arm
+        }
+        i = i + 1;
+    }
+    let q = alloc(i64);            // clean: every use inside the arm
+    if s == 2 {
+        *q = 7;
+        s = s + *q;
+        free(q);
+    }
+    print(s); // 9
+    return 0;
+}

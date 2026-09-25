@@ -1,0 +1,41 @@
+// Pass 28 (StackSlotColoring): the branch condition is a memory-resident
+// bool whose ONLY slot read is the FOLDED DIRECT-SLOT COMPARE pass 87's
+// mov+test fold creates ([mov rax,[s]][test rax] -> [cmp $0,[s]]). The
+// coloring runs at exec slot 885 — AFTER that fold — so its liveness walk
+// must recognize the CmpRImm slot operand as a use. Missing it collapsed
+// the flag's live interval to its def position, another slot (the spilled
+// loop temp) shared its rbp offset, and the folded branch read the TEMP's
+// value: this exact shape printed 111 instead of 222 at default -O2 when
+// the read was invisible. The 15 opaque locals force the spill pressure;
+// the loop provides the aliased temp.
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    var z: i64 = v;
+    z = z + v * 2;
+    z = z - v;
+    z = z + 11;
+    return z;
+}
+
+fn main() -> i64 {
+    var n: i64 = opaque(1);       // 13
+    var flag: bool = n < 3;        // false: the folded compare reads its slot
+    var t: i64 = 0;
+    var i: i64 = 0;
+    var p1: i64 = opaque(1); var p2: i64 = opaque(2); var p3: i64 = opaque(3);
+    var p4: i64 = opaque(4); var p5: i64 = opaque(5); var p6: i64 = opaque(6);
+    var p7: i64 = opaque(7); var p8: i64 = opaque(8); var p9: i64 = opaque(9);
+    var pa: i64 = opaque(10); var pb: i64 = opaque(11); var pc: i64 = opaque(12);
+    var pd: i64 = opaque(13); var pe: i64 = opaque(14); var pf: i64 = opaque(15);
+    while i < 40 {
+        t = t + i;
+        i = i + 1;
+    }
+    print(p1+p2+p3+p4+p5+p6+p7+p8+p9+pa+pb+pc+pd+pe+pf); // 405
+    print(t);                        // 780
+    if flag { print(111); } else { print(222); }
+    print(p1); print(p2); print(p3); print(p4); print(p5); print(p6);
+    print(p7); print(p8); print(p9); print(pa); print(pb); print(pc);
+    print(pd); print(pe); print(pf);
+    return 0;
+}

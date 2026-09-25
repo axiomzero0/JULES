@@ -35,8 +35,14 @@ public:
         std::fprintf(manifest, "guard_sites: %zu\n", ctx.lin->guard_sites.size());
         for (const LinearModule::GuardSite& g : ctx.lin->guard_sites)
             std::fprintf(manifest, "guard fn=%u block=%d kind=%s\n", g.fn, g.block, g.kind);
+        std::fprintf(manifest, "materializations: %zu\n",
+                     ctx.lin->materializations.size());
+        for (const LinearModule::Materialization& m : ctx.lin->materializations)
+            std::fprintf(manifest, "materialize fn=%u block=%d size=%lld how=%s\n",
+                         m.fn, m.block, static_cast<long long>(m.size), m.how);
         std::fclose(manifest);
-        return !ctx.lin->guard_sites.empty();
+        return !ctx.lin->guard_sites.empty() ||
+               !ctx.lin->materializations.empty();
     }
 };
 

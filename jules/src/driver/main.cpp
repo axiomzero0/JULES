@@ -158,6 +158,7 @@ int run(int argc, char** argv) {
             else { std::fprintf(stderr, "unknown --jit-budget '%s' (fast|balanced|peak)\n", v.c_str()); return 2; }
         }
         else if (a == "--emit-ir") opts.emit_ir = true;
+        else if (a == "--soa") opts.soa = true; // opt-in AoS->SoA (pass 63)
         else if (a == "--emit-dot") emit_dot = true;
         else if (a == "--stats") stats = true;
         else if (a == "--verify") opts.verify_each = true;

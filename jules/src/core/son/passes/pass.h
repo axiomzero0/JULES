@@ -40,6 +40,7 @@ struct PassOptions {
     bool verify_each = false;   // run the graph verifier after every pass
     bool emit_ir = false;       // dump IR after every pass
     bool post_inline_cleanup = true;
+    bool soa = false;           // --soa: opt-in AoS->SoA restructuring (p63)
     FlatMap<std::string, bool> disabled; // kill switches (name -> true)
     std::vector<std::string> only;       // if non-empty: run only these
     // PGO profile data (--pgo=use=<f>): raw counters from jules.prof, pairs

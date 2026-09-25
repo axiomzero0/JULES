@@ -1,0 +1,31 @@
+// Pass 73 (GuardWeakening): hot()'s first argument is the sticky value 3 on
+// 191 of 200 invocations (95.5% >= 95%) with the misses at 4 — a hull of
+// [3,4] around the sticky value. Pass 91 emits the equality rung; pass 73
+// weakens it to the range [3,4] (whose variant folds the same branch) and
+// the 4-invocations stop falling to the generic rung.
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    return v * 1;
+}
+
+fn warm(x: i64, c: i64) -> i64 {
+    if x < 3 {
+        return x * c + 2;
+    }
+    return x + c;
+}
+
+fn main() -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 200 {
+        var x = opaque(3);
+        if i >= 191 {
+            x = opaque(4);
+        }
+        s = s + warm(x, i);
+        i = i + 1;
+    }
+    print(s); // 20509
+    return 0;
+}

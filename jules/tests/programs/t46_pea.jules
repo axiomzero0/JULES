@@ -1,0 +1,25 @@
+// Passes 33/34/35 (PEA family): the allocation sits in the loop body but
+// every use — the call argument and the free — is inside ONE arm of the
+// branch; pass 33 sinks the allocation into that arm (iterations 0 and 2
+// never allocate). take() is #[no_inline] so the call is a real user at
+// pass 33's slot (inlining runs later, at 76+).
+#[no_inline]
+fn take(p: *mut i64, v: i64) -> i64 {
+    *p = v + 10;
+    return *p + 1;
+}
+
+fn main() -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        let p = alloc(i64);
+        if i == 1 {
+            s = s + take(p, i);
+            free(p);
+        }
+        i = i + 1;
+    }
+    print(s); // 12
+    return 0;
+}

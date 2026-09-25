@@ -449,9 +449,24 @@ private:
                 nd.in[0] == B) {
                 moved.push_back(n);
             }
+            // Do NOT walk THROUGH phis: the ladder's mem result feeds the
+            // loop header's memory phi, whose users are the NEXT
+            // iteration's effects and values — following them reaches
+            // nodes that read only loop-carried state (observed: the
+            // guard's own Eq Cmp moved below the branch it feeds, reading
+            // a stale register — one wrong rung per entry). The two RESULT
+            // phis seed this walk and DO traverse; every other phi stops
+            // it, keeping exactly the same-iteration dependents.
+            if (nd.op == Op::Phi && n != top.val && n != top.mem) continue;
             for (NodeId u : g.uses_of(n)) stack.push_back(u);
         }
-        for (NodeId n : moved) g.set_input(n, 0, top.exit);
+        for (NodeId n : moved) {
+#ifdef JULES_DEBUG_PD
+            std::fprintf(stderr, "[pd] repin n%u (op=%d) -> n%u\n", n,
+                         (int)g.node(n).op, top.exit);
+#endif
+            g.set_input(n, 0, top.exit);
+        }
 
         const SmallVec<NodeId, 4> users = g.uses_of(B);
         for (NodeId u : users) {

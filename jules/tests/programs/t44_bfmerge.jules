@@ -1,0 +1,21 @@
+// Pass 27 (BitfieldLowering): consecutive segment writes on one backing
+// slot nest after store-to-load forwarding; the canonicalizer flattens the
+// Or/And chain into the single-RMW form. Values are loop-carried so the
+// masks survive constant folding.
+bitfield F(u64) { a: 3, b: 5, c: 8 }
+
+fn main() -> i64 {
+    var acc: u64 = 0;
+    var raw: u64 = 0;
+    var i: i64 = 0;
+    while i < 8 {
+        var f = raw as F;
+        f.a = i as u64;         // RMW 1: clear [0..3), insert i
+        f.b = (i * 3) as u64;   // RMW 2: clear [3..8), insert 3i — nested
+        acc = acc + (f as u64);
+        raw = raw + 1;
+        i = i + 1;
+    }
+    print(acc); // 700
+    return 0;
+}
