@@ -82,6 +82,24 @@ inline constexpr FnId kFnPgoSketch = 0xFFFFFF04u; // PGO sticky-value argument
 inline constexpr FnId kNoFn    = 0xFFFFFFFFu;
 inline constexpr FnId kMaxUserFn = 0xFFFFFF00u;
 
+// extern "C" pseudo-FnIds: calls to declared-but-external functions. The
+// names live in SemaModule::externs (filled at declaration) and reach the
+// emitter through LinearModule::externs; externs never get a FunctionGraph
+// (nothing to optimize). Every Call.aux consumer treats the whole range
+// >= kExternFnBase as external (print/free/pgo builtins included).
+inline constexpr u32 kExternFnBase = 0xFFFF0000u;
+inline constexpr u32 kExternFnMax = 32; // MVP: plenty for libc surface
+inline constexpr FnId extern_fn_id(u32 index) {
+    return static_cast<FnId>(kExternFnBase + index);
+}
+inline constexpr bool is_extern_fn_id(FnId f) {
+    return f >= kExternFnBase && f < kExternFnBase + kExternFnMax;
+}
+// Any call target that is not a user fn graph (externs + builtins + none).
+inline constexpr bool is_external_call(FnId f) {
+    return f >= static_cast<FnId>(kExternFnBase);
+}
+
 struct FunctionGraph {
     FnId fid = kNoFn;
     SymbolId name = kNoSymbol;

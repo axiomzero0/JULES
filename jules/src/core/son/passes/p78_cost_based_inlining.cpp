@@ -31,7 +31,7 @@ public:
                 for (NodeId id = 0; id < caller.g.size(); ++id) {
                     if (budget == 0) break;
                     const Node& n = caller.g.node(id);
-                    if (n.op != Op::Call || n.aux == kFnPrint || n.aux == kFnFree) continue;
+                    if (n.op != Op::Call || is_external_call(n.aux)) continue; // externs incl.
                     const FunctionGraph* callee = ctx.mod.find_fn(n.aux);
                     if (!callee || callee->no_inline) continue;
                     if (callee->node_estimate > threshold) continue;

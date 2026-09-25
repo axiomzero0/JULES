@@ -19,7 +19,7 @@ struct SiteScore {
 
 u32 score_site(FunctionGraph& caller, NodeId call, Module& mod) {
     const Node& c = caller.g.node(call);
-    if (c.aux == kFnPrint || c.aux == kFnFree) return 0;
+    if (is_external_call(c.aux)) return 0; // print/free/extern
     const FunctionGraph* callee = mod.find_fn(c.aux);
     if (!callee) return 0;
 

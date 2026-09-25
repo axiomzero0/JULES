@@ -131,8 +131,10 @@ u8 sz_of(TypeId t) {
 bool fp_of(TypeId t) { return ty_in_xmm(t); } // scalar FP + packed vectors: XMM class
 
 struct Emitter {
-    Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms)
-        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms), dp_(lf, fg), ilp_(lf, fg) {
+    Emitter(LFunction& lf, FunctionGraph& fg, SymbolTable& syms,
+            const std::vector<SymbolId>& externs)
+        : lf_(lf), fg_(fg), g_(fg.g), syms_(syms), dp_(lf, fg), ilp_(lf, fg),
+          externs_(externs) {
         lf_.label_counter = kLocalLabelBase;
     }
 
@@ -1429,13 +1431,23 @@ struct Emitter {
                 load_value(a, kArgGpRegs[gp++], sz_of(g_.node(a).ty));
             }
         }
-        if (nd.flags & kFlagTailCall) {
+        if (is_extern_fn_id(nd.aux)) {
+            // extern "C" call: SysV registers already loaded above; the
+            // symbol resolves through the system linker (cc links libc).
+            Inst& c = emit(IOp::CallSym);
+            c.a.k = Operand::K::Sym;
+            u32 xi = nd.aux - kExternFnBase;
+            if (xi < externs_.size())
+                c.a.sym = syms_.name(externs_[xi]).data(); // arena-stable
+            else c.a.sym = "jules_bad_extern";
+        } else if (nd.flags & kFlagTailCall) {
             Inst& tc = emit(IOp::TailCallFn);
             tc.a.k = Operand::K::Label; tc.a.label = static_cast<int>(nd.aux);
             return;
+        } else {
+            Inst& c = emit(IOp::CallFn);
+            c.a.k = Operand::K::Label; c.a.label = static_cast<int>(nd.aux);
         }
-        Inst& c = emit(IOp::CallFn);
-        c.a.k = Operand::K::Label; c.a.label = static_cast<int>(nd.aux);
         if (nd.ty != ty_void()) {
             if (fp_of(nd.ty)) {
                 Inst& st = emit(IOp::MovFpS);
@@ -1734,6 +1746,8 @@ struct Emitter {
     SymbolTable& syms_;
     DpIsel dp_;   // per-block DP cover planner (x64_dp_isel.{h,cpp})
     IlpIsel ilp_;  // pass-84 sniper tier: hot-region joint refinement
+    // extern "C" names indexed by (Call.aux - kExternFnBase)
+    const std::vector<SymbolId>& externs_;
     // replaced by fp_const_cache_dom_ (dominance-checked)
     int next_const_xmm_ = 15;
 };
@@ -1758,8 +1772,9 @@ static void dump_mir_tagged(const char* tag, const LFunction& lf) {
     }
 }
 
-bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms) {
-    Emitter e(lf, fg, syms);
+bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms,
+                            const std::vector<SymbolId>& externs) {
+    Emitter e(lf, fg, syms, externs);
     bool ok = e.run();
     dump_mir_tagged("post-isel", lf);
     if (ok && std::getenv("JULES_DP_STATS"))

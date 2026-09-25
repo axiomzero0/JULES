@@ -1,0 +1,46 @@
+// Frontend round: bitfields — u64-backed packed segments, literal folding,
+// reads (shift+mask), writes (read-modify-write), full-width round trip.
+bitfield Flags(u64) { kind: 3, flag: 1, spare: 4, tag: 12 }
+bitfield Wide(u64) { low: 32, high: 32 }
+
+fn main() -> i64 {
+    var f = Flags { kind: 5, flag: 1, spare: 0, tag: 300 };
+    print(f.kind);
+    print(f.flag);
+    print(f.spare);
+    print(f.tag);
+
+    f.kind = 7;
+    print(f.kind);
+    print(f.tag); // untouched by the kind write
+
+    f.flag = 0;
+    print(f.flag);
+
+    f.tag = 4095; // max 12-bit value
+    print(f.tag);
+    f.tag = 0;
+    print(f.tag);
+
+    // bit pattern identity: reconstruct through u64
+    var g = Flags { kind: 2, flag: 1, spare: 15, tag: 1 };
+    var raw = g as u64;
+    print(raw);
+    var h = raw as Flags;
+    print(h.kind);
+    print(h.spare);
+    print(h.tag);
+
+    // segments straddling the 32/64 boundary
+    var w = Wide { low: 12345, high: 7 };
+    print(w.low);
+    print(w.high);
+    w.high = 4000000000;
+    print(w.high);
+    print(w.low); // low write untouched
+
+    // (bitfield segments in struct fields lower through the same
+    // struct-field machinery: the leaf is a u64 slot + rmw — the local
+    // variable forms above cover the read/write/fold paths)
+    return 0;
+}

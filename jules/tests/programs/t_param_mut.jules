@@ -1,0 +1,27 @@
+// Frontend round: regression for the latent param-assignment hole — assigning
+// to a parameter now materializes a slot instead of crashing the builder.
+fn f(x: i64) -> i64 {
+    x = x + 1; // param mutation: SSA value copied into a slot on first store
+    x = x * 2;
+    return x;
+}
+
+fn g(y: f64) -> f64 {
+    y = y * 3.0;
+    return y;
+}
+
+fn h(z: i64, w: i64) -> i64 {
+    z = z + w;
+    return z;
+}
+
+fn main() -> i64 {
+    print(f(10));
+    print(g(1.5));
+    print(h(3, 4));
+    var t: i64 = 5;
+    print(f(t));
+    print(t); // caller value is untouched (by-value)
+    return 0;
+}

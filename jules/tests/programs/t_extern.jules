@@ -1,0 +1,22 @@
+// Frontend round: extern "C" declarations — libc through the system linker,
+// scalar-only ABI, extern values in comptime-free expressions.
+extern fn sqrt(x: f64) -> f64;
+extern fn fabs(x: f64) -> f64;
+extern fn fmax(a: f64, b: f64) -> f64;
+extern fn labs(x: i64) -> i64;
+extern fn abs(x: i32) -> i32;
+
+fn main() -> i64 {
+    print(sqrt(16.0));
+    print(sqrt(2.0) * sqrt(2.0)); // ~2.0
+    print(fabs(0.0 - 3.5));
+    print(fmax(1.25, 2.75));
+    print(fmax(10.0, 0.5 - 1.0));
+    print(labs(0 - 1234567890123));
+    print(abs(0 - 42));
+
+    var x: f64 = 9.0;
+    print(sqrt(x));
+    print(sqrt(x + 7.0));
+    return 0;
+}

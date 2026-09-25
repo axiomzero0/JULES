@@ -20,6 +20,16 @@ public:
             if (n.op != Op::Alloc) continue;
             if (n.flags & kFlagStackPromoted) continue;
             if (!non_escaping(id)) continue;
+            // Frame slots are FIXED 8-byte (scalar) cells (x64_allocate_frame):
+            // only a single-element scalar-sized allocation fits one. Arrays
+            // and struct buffers (alloc(T, n), structs) keep their heap malloc
+            // — promoting them would write past the 8-byte slot.
+            {
+                const Node& size = g_.node(n.in[2]);
+                if (size.op != Op::Const) continue; // dynamic size: heap
+                u32 pointee_bytes = ty_store_bytes(ty_pointee(n.ty));
+                if (static_cast<u64>(size.ival) != pointee_bytes) continue;
+            }
 
             // free(alloc) sites become removable no-ops
             const SmallVec<NodeId, 4> users = g_.uses_of(id);

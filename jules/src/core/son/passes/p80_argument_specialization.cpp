@@ -28,7 +28,7 @@ public:
             for (FunctionGraph& caller : ctx.mod.fns) {
                 for (NodeId id = 0; id < caller.g.size(); ++id) {
                     const Node& n = caller.g.node(id);
-                    if (n.op != Op::Call || n.aux == kFnPrint || n.aux == kFnFree) continue;
+                    if (n.op != Op::Call || is_external_call(n.aux)) continue; // externs incl.
                     if (n.n_in <= 2) continue;
                     const FunctionGraph* callee = ctx.mod.find_fn(n.aux);
                     if (!callee || callee->no_inline) continue;

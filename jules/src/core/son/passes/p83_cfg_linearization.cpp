@@ -266,7 +266,7 @@ public:
                 for (NodeId n = 0; n < (*fgp)->g.size(); ++n) {
                     const Node& nd = (*fgp)->g.node(n);
                     if (nd.op != Op::Call) continue; // killed nodes are Dead
-                    if (nd.aux == kFnPrint || nd.aux == kFnFree) continue; // external
+                    if (is_external_call(nd.aux)) continue; // external: print/free/extern
                     const bool* seen = reachable.find(static_cast<FnId>(nd.aux));
                     if (!seen) {
                         reachable.insert(static_cast<FnId>(nd.aux), true);

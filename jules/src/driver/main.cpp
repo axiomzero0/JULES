@@ -275,6 +275,9 @@ int run(int argc, char** argv) {
     AnalysisManager am(mod);
     PassContext ctx(mod, syms, diag, am, opts);
     LinearModule lin;
+    // extern "C" names must be in place BEFORE the pipeline: pass 84 (isel)
+    // resolves extern Call.aux through this table when emitting CallSym.
+    for (const SemaExtern& ex : sema.externs) lin.externs.push_back(ex.name);
     ctx.lin = &lin;
 
     PassManager pm(ctx);
@@ -325,7 +328,7 @@ int run(int argc, char** argv) {
         return 0;
     }
 
-    std::string cmd = "cc -no-pie " + asm_path + " -o " + output;
+    std::string cmd = "cc -no-pie " + asm_path + " -o " + output + " -lm"; // libm for extern fns
     int rc = std::system(cmd.c_str());
     if (rc != 0) {
         std::fprintf(stderr, "error: link step failed (%d)\n", rc);

@@ -32,6 +32,8 @@ std::string node_detail(const Graph& g, SymbolTable& syms, NodeId id,
             else if (n.aux == kFnPgoBump) os << "pgobump#" << n.ival;
             else if (fn_syms && n.aux < fn_syms->size() && (*fn_syms)[n.aux] != kNoSymbol)
                 os << syms.name((*fn_syms)[n.aux]);
+            else if (is_extern_fn_id(n.aux))
+                os << "extern#" << (n.aux - kExternFnBase);
             else if (n.aux != kNoFn) os << "fn" << n.aux;
             break;
         }

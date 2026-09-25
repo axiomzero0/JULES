@@ -1,0 +1,56 @@
+// Frontend round: enums — qualified constants, explicit discriminants,
+// backing integers and casts, comparisons, comptime folding through consts,
+// enum-typed struct fields.
+enum Color { Red, Green = 5, Blue }
+
+const G: i64 = 1 + 2;
+enum Big : i64 { A = 1, B = 10000000000, C }
+enum U : u32 { X = 4000000000, Y }
+
+struct Pixel { c: Color, heat: i64 }
+
+fn classify(c: Color) -> i64 {
+    if c == Color.Red { return 1; }
+    if c == Color.Green { return 2; }
+    if c == Color.Blue { return 3; }
+    return 0;
+}
+
+const BASE: i64 = 10;
+
+fn main() -> i64 {
+    var c: Color = Color.Red;
+    print(c as i64);
+    c = Color.Green;
+    print(c as i64);
+    c = Color.Blue;
+    print(c as i64);
+
+    print(c == Color.Blue);
+    print(c == Color.Green);
+
+    print(classify(Color.Red));
+    print(classify(Color.Green));
+    print(classify(Color.Blue));
+
+    var b: Big = Big.B;
+    print(b as i64);
+    b = Big.C;
+    print(b as i64);
+
+    var u: U = U.X;
+    print(u as u64);
+
+    // enum in a struct field, stored in its backing representation
+    var px = Pixel { c: Color.Green, heat: 3 };
+    print(px.heat);
+    print(px.c as i64);
+
+    // comptime: enum constants flow into const arithmetic
+    print(G);
+
+    // int -> enum via explicit cast (unchecked, documented)
+    var d: Color = 5 as Color;
+    print(d == Color.Green);
+    return 0;
+}

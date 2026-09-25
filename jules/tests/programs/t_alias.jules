@@ -1,0 +1,37 @@
+// Frontend round: alias — transparent type names for scalars, structs and
+// pointers; aliases fold for type identity; declare-before-use.
+alias Scalar = f64;  // Scalar precedes Point: struct FIELD types resolve
+alias Count = i64;   // at registration (declare-before-use)
+struct Point { x: Scalar, y: Scalar }
+alias Pair = Point;       // aliases to a registered struct bind fine
+alias PairPtr = *mut Point;
+
+fn norm(p: *const Pair) -> Scalar { return p.x * p.x + p.y * p.y; }
+
+const K: Count = 3;
+
+fn main() -> i64 {
+    var p: Pair = Point { x: 3.0, y: 4.0 };
+    print(p.x);
+
+    // alias and struct names are the SAME type
+    var q: Point = p;
+    q.x = 10.0;
+    print(q.x);
+    print(p.x);
+
+    let r: Scalar = 2.5;
+    print(r);
+
+    // pointer alias
+    let pp: PairPtr = &p;
+    print(pp.x);
+    print(norm(pp));
+
+    let n: Count = 7;
+    print(n);
+
+    // alias in a comptime const chain
+    print(K);
+    return 0;
+}

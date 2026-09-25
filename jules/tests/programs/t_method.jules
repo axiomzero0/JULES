@@ -1,0 +1,80 @@
+// Frontend round: methods and traits — static dispatch through impl blocks,
+// &self / &mut self receivers, pointer-receiver auto-deref, methods on
+// rvalue receivers, trait impls checked against trait declarations.
+struct Vec2 { x: f64, y: f64 }
+struct Counter { n: i64 }
+
+trait Norm { fn norm2(&self) -> f64; }
+
+impl Vec2 {
+    fn dot(&self, o: *const Vec2) -> f64 {
+        return self.x * o.x + self.y * o.y;
+    }
+    fn scaled(&self, k: f64) -> Vec2 {
+        return Vec2 { x: self.x * k, y: self.y * k };
+    }
+    fn grow(&mut self, by: f64) {
+        self.x = self.x + by;
+        self.y = self.y + by;
+    }
+}
+
+impl Norm for Vec2 {
+    fn norm2(&self) -> f64 { return self.x * self.x + self.y * self.y; }
+}
+
+impl Counter {
+    fn inc(&mut self) { self.n = self.n + 1; }
+    fn get(&self) -> i64 { return self.n; }
+}
+
+fn main() -> i64 {
+    var a = Vec2 { x: 3.0, y: 4.0 };
+    var b = Vec2 { x: 1.0, y: 2.0 };
+
+    // &self with a pointer argument (mixed receivers)
+    print(a.dot(&b));
+
+    // trait method through the impl table
+    print(a.norm2());
+
+    // &mut self mutation
+    a.grow(1.0);
+    print(a.x);
+    print(a.norm2());
+
+    // struct-returning method (sret path)
+    var c = a.scaled(10.0);
+    print(c.x);
+    print(c.y);
+
+    // chained: rvalue receiver materializes a temp
+    print(a.scaled(2.0).norm2());
+
+    // methods on pointer receivers auto-deref
+    let pa = alloc(Vec2);
+    pa.x = 5.0;
+    pa.y = 12.0;
+    print(pa.norm2());
+    pa.grow(0.0);
+    print(pa.x);
+
+    // a counter through a pointer, mutated by method
+    let k = alloc(Counter);
+    k.n = 0;
+    k.inc();
+    k.inc();
+    k.inc();
+    print(k.get());
+
+    // method on an array element (address taken through the array index)
+    let arr = alloc(Vec2, 2);
+    arr[0].x = 1.0;
+    arr[0].y = 1.0;
+    arr[1].x = 6.0;
+    arr[1].y = 8.0;
+    print(arr[1].norm2());
+    arr[0].grow(3.0);
+    print(arr[0].x);
+    return 0;
+}

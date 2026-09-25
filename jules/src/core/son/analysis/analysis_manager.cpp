@@ -15,7 +15,7 @@ std::unique_ptr<CallGraphInfo> CallGraphInfo::compute(Module& m) {
             if (n.op != Op::Call) continue;
             // data slots start at 2
             sites.push_back(CallGraphInfo::Site{id, n.aux});
-            if (n.aux != kFnPrint && n.aux != kFnFree) calls_out = true;
+            if (!is_external_call(n.aux)) calls_out = true; // externs included
         }
         cg->calls_out_.insert(fg.fid, calls_out);
     }

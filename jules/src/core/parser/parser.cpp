@@ -26,6 +26,7 @@ public:
 
     ModuleAst parse_module() {
         ModuleAst mod;
+        mod_ = &mod;
         maybe_module_decl(mod);
         while (!check(Tok::Eof)) {
             if (!parse_top_level(mod)) break;
@@ -145,18 +146,34 @@ private:
         if (check(Tok::KwConst)) return parse_const(mod);
         bool is_comptime = accept(Tok::KwComptime);
         if (check(Tok::KwFn)) return parse_fn(mod, is_comptime, attrs);
-        for (Tok reserved : {Tok::KwStruct, Tok::KwClass, Tok::KwEnum, Tok::KwBitfield,
-                             Tok::KwBitmask, Tok::KwAlias, Tok::KwTrait, Tok::KwImpl}) {
-            if (check(reserved)) {
-                diag_.error(cur().pos, std::string(tok_name(reserved)) +
-                            " declarations are planned for the next milestone (not in MVP subset)");
-                errored_ = true;
-                while (!check(Tok::RBrace) && !check(Tok::Eof)) advance();
-                accept(Tok::RBrace);
-                return !check(Tok::Eof);
-            }
+        if (check(Tok::KwExtern)) return parse_extern_fn(mod);
+        if (check(Tok::KwStruct)) return parse_struct(mod);
+        if (check(Tok::KwEnum)) return parse_enum(mod);
+        if (check(Tok::KwBitmask)) return parse_bitmask(mod);
+        if (check(Tok::KwBitfield)) return parse_bitfield(mod);
+        if (check(Tok::KwAlias)) return parse_alias(mod);
+        if (check(Tok::KwTrait)) return parse_trait(mod);
+        if (check(Tok::KwImpl)) return parse_impl(mod);
+        if (check(Tok::KwClass)) {
+            diag_.error(cur().pos, "'class' is not part of the JULES surface: the language is a "
+                        "static systems language with value structs and explicit memory "
+                        "(see docs/language_surface.md — 'struct' covers aggregate types, "
+                        "allocation is alloc())");
+            errored_ = true;
+            while (!check(Tok::RBrace) && !check(Tok::Eof)) advance();
+            accept(Tok::RBrace);
+            return !check(Tok::Eof);
         }
-        diag_.error(cur().pos, "expected 'fn', 'const' or attribute at top level");
+        if (check(Tok::KwDyn)) {
+            diag_.error(cur().pos, "'dyn' trait objects are not in the frontend yet: they require "
+                        "vtable emission + indirect calls in the IR/backend (a backend "
+                        "milestone); use static 'impl Trait for Type' dispatch");
+            errored_ = true;
+            advance();
+            return !check(Tok::Eof);
+        }
+        diag_.error(cur().pos, "expected a declaration ('fn', 'const', 'struct', 'enum', 'bitmask', "
+                    "'bitfield', 'alias', 'trait', 'impl', 'extern') at top level");
         errored_ = true;
         advance();
         return !check(Tok::Eof);
@@ -187,16 +204,289 @@ private:
         fn.is_comptime = is_comptime;
         fn.always_inline = attrs.always_inline;
         fn.no_inline = attrs.no_inline;
+        if (!parse_fn_header(fn, "function name")) return true;
+        parse_block(fn.body);
+        mod.fns.push_back(std::move(fn));
+        return true;
+    }
+
+    // ---- new declaration forms ------------------------------------------------
+    bool expect_ident(const char* what, SymbolId& out) {
+        if (!check(Tok::Ident)) {
+            diag_.error(cur().pos, std::string("expected ") + what);
+            errored_ = true;
+            return false;
+        }
+        out = intern_name(cur().text);
+        advance();
+        return true;
+    }
+
+    bool parse_struct(ModuleAst& mod) {
+        StructDecl sd;
+        sd.pos = cur().pos;
+        advance(); // struct
+        if (!expect_ident("struct name", sd.name)) return true;
+        if (!expect(Tok::LBrace, "'{' after struct name")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            SymbolId fname;
+            if (!expect_ident("field name", fname)) break;
+            expect(Tok::Colon, "':' after field name");
+            TypeId ft = parse_type();
+            sd.fields.emplace_back(fname, ft);
+            if (!accept(Tok::Comma)) break;
+        }
+        expect(Tok::RBrace, "'}' after struct fields");
+        accept(Tok::Semi); // optional
+        mod.structs.push_back(std::move(sd));
+        return true;
+    }
+
+    bool parse_enum(ModuleAst& mod) {
+        EnumDecl ed;
+        ed.pos = cur().pos;
+        advance(); // enum
+        if (!expect_ident("enum name", ed.name)) return true;
+        if (accept(Tok::Colon)) {
+            // backing integer: i32 (default) | i64 | u32 | u64
+            if (!check(Tok::Ident)) {
+                diag_.error(cur().pos, "expected backing integer type after 'enum Name:'");
+                errored_ = true;
+            } else {
+                std::string b = cur().text; advance();
+                if (b == "i32") ed.backing = ty_i32();
+                else if (b == "i64") ed.backing = ty_i64();
+                else if (b == "u32") ed.backing = ty_u32();
+                else if (b == "u64") ed.backing = ty_u64();
+                else {
+                    diag_.error(ed.pos, "enum backing must be one of i32/i64/u32/u64 (got '" + b + "')");
+                    errored_ = true;
+                }
+            }
+        }
+        if (!expect(Tok::LBrace, "'{' after enum name")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            SymbolId vname;
+            if (!expect_ident("variant name", vname)) break;
+            ExprP value;
+            if (accept(Tok::Assign)) value = parse_expr();
+            ed.variants.emplace_back(vname, std::move(value));
+            if (!accept(Tok::Comma)) break;
+        }
+        expect(Tok::RBrace, "'}' after enum variants");
+        accept(Tok::Semi);
+        mod.enums.push_back(std::move(ed));
+        return true;
+    }
+
+    bool parse_bitmask(ModuleAst& mod) {
+        BitmaskDecl bd;
+        bd.pos = cur().pos;
+        advance(); // bitmask
+        if (!expect_ident("bitmask name", bd.name)) return true;
+        if (!expect(Tok::LBrace, "'{' after bitmask name")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            SymbolId vname;
+            if (!expect_ident("flag name", vname)) break;
+            ExprP value;
+            if (accept(Tok::Assign)) value = parse_expr();
+            bd.variants.emplace_back(vname, std::move(value));
+            if (!accept(Tok::Comma)) break;
+        }
+        expect(Tok::RBrace, "'}' after bitmask flags");
+        accept(Tok::Semi);
+        mod.bitmasks.push_back(std::move(bd));
+        return true;
+    }
+
+    bool parse_bitfield(ModuleAst& mod) {
+        BitfieldDecl bd;
+        bd.pos = cur().pos;
+        advance(); // bitfield
+        if (!expect_ident("bitfield name", bd.name)) return true;
+        if (!expect(Tok::LParen, "'(' after bitfield name")) return true;
+        if (!check(Tok::Ident) || cur().text != "u64") {
+            diag_.error(cur().pos, "bitfield backing type must be u64 in the MVP");
+            errored_ = true;
+        } else {
+            advance();
+        }
+        expect(Tok::RParen, "')' after bitfield backing");
+        if (!expect(Tok::LBrace, "'{' after bitfield header")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            SymbolId fname;
+            if (!expect_ident("segment name", fname)) break;
+            expect(Tok::Colon, "':' after segment name");
+            if (!check(Tok::IntLit)) {
+                diag_.error(cur().pos, "expected a bit-width integer literal after ':'");
+                errored_ = true;
+                break;
+            }
+            u32 width = static_cast<u32>(cur().int_value);
+            if (width == 0 || width > 64) {
+                diag_.error(cur().pos, "bitfield segment width must be in 1..64");
+                errored_ = true;
+            }
+            advance();
+            bd.segs.emplace_back(fname, width);
+            if (!accept(Tok::Comma)) break;
+        }
+        expect(Tok::RBrace, "'}' after bitfield segments");
+        accept(Tok::Semi);
+        mod.bitfields.push_back(std::move(bd));
+        return true;
+    }
+
+    bool parse_alias(ModuleAst& mod) {
+        AliasDecl ad;
+        ad.pos = cur().pos;
+        advance(); // alias
+        if (!expect_ident("alias name", ad.name)) return true;
+        expect(Tok::Assign, "'=' in alias declaration");
+        ad.target = parse_type();
+        expect(Tok::Semi, "';' after alias declaration");
+        mod.aliases.push_back(std::move(ad));
+        return true;
+    }
+
+    // fn header + body parsing shared by plain fns, impl methods, trait sigs.
+    // header: name (self-able) params ret. Returns false on hard error.
+    bool parse_fn_header(FnDecl& fn, const char* what) {
         advance(); // fn
         if (!check(Tok::Ident)) {
-            diag_.error(cur().pos, "expected function name");
+            diag_.error(cur().pos, std::string("expected ") + what);
+            errored_ = true;
+            return false;
+        }
+        fn.name = intern_name(cur().text);
+        fn.pos = cur().pos;
+        advance();
+        expect(Tok::LParen, "'(' after function name");
+        bool first = true;
+        while (!check(Tok::RParen)) {
+            if (!first) {
+                if (!expect(Tok::Comma, "',' between parameters")) break;
+                if (check(Tok::RParen)) break; // trailing comma
+            }
+            first = false;
+            // self receiver: `&self` | `&mut self` | `self`
+            if (check(Tok::Amp) || check_ident("self")) {
+                u8 self_kind = kSelfNone;
+                if (accept(Tok::Amp)) {
+                    if (check_ident("mut")) { advance(); self_kind = kSelfMut; }
+                    else self_kind = kSelfRef;
+                } else {
+                    self_kind = kSelfNone; // by value (sema rejects on structs)
+                }
+                if (!check_ident("self")) {
+                    diag_.error(cur().pos, "expected 'self' after '" +
+                                std::string(self_kind == kSelfMut ? "&mut" : "&") + "'");
+                    errored_ = true;
+                    break;
+                }
+                advance();
+                fn.self_kind = self_kind == kSelfNone ? 3 : self_kind; // 3 = by-value self
+                fn.params.emplace_back("self", ty_none()); // type filled by sema
+                continue;
+            }
+            if (!check(Tok::Ident)) {
+                diag_.error(cur().pos, "expected parameter name");
+                errored_ = true;
+                break;
+            }
+            std::string pname = cur().text;
+            advance();
+            expect(Tok::Colon, "':' after parameter name");
+            TypeId pt = parse_type();
+            fn.params.emplace_back(std::move(pname), pt);
+        }
+        expect(Tok::RParen, "')' after parameters");
+        if (accept(Tok::Arrow)) fn.ret = parse_type();
+        if (fn.params.size() > kMaxParams) {
+            diag_.error(fn.pos, "too many parameters (MVP node input arity limit)");
+            errored_ = true;
+        }
+        return true;
+    }
+
+    bool parse_trait(ModuleAst& mod) {
+        TraitDecl td;
+        td.pos = cur().pos;
+        advance(); // trait
+        if (!expect_ident("trait name", td.name)) return true;
+        if (!expect(Tok::LBrace, "'{' after trait name")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            if (check(Tok::KwFn)) {
+                TraitMethod tm;
+                tm.pos = cur().pos;
+                FnDecl header;
+                if (!parse_fn_header(header, "method name")) break;
+                tm.name = header.name;
+                tm.params = std::move(header.params);
+                tm.ret = header.ret;
+                tm.self_kind = header.self_kind;
+                td.methods.push_back(std::move(tm));
+                expect(Tok::Semi, "';' after trait method signature");
+            } else {
+                diag_.error(cur().pos, "expected 'fn' inside trait declaration");
+                errored_ = true;
+                advance();
+            }
+        }
+        expect(Tok::RBrace, "'}' after trait methods");
+        accept(Tok::Semi);
+        mod.traits.push_back(std::move(td));
+        return true;
+    }
+
+    bool parse_impl(ModuleAst& mod) {
+        ImplDecl id;
+        id.pos = cur().pos;
+        advance(); // impl
+        SymbolId first;
+        if (!expect_ident("type or trait name after 'impl'", first)) return true;
+        if (check(Tok::KwFor)) { // 'for' is a keyword, not an identifier
+            advance();
+            id.trait_name = first;
+            if (!expect_ident("type name after 'for'", id.type_name)) return true;
+        } else {
+            id.type_name = first; // inherent impl
+        }
+        if (!expect(Tok::LBrace, "'{' after impl header")) return true;
+        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+            if (check(Tok::KwFn)) {
+                FnDecl m;
+                m.self_kind = kSelfNone;
+                if (!parse_fn_header(m, "method name")) break;
+                parse_block(m.body);
+                id.methods.push_back(std::move(m));
+            } else {
+                diag_.error(cur().pos, "expected 'fn' inside impl block");
+                errored_ = true;
+                advance();
+            }
+        }
+        expect(Tok::RBrace, "'}' after impl methods");
+        accept(Tok::Semi);
+        mod.impls.push_back(std::move(id));
+        return true;
+    }
+
+    bool parse_extern_fn(ModuleAst& mod) {
+        FnDecl fn;
+        fn.is_extern = true;
+        fn.pos = cur().pos;
+        advance(); // extern
+        if (!expect(Tok::KwFn, "'fn' after 'extern'")) return true;
+        if (!check(Tok::Ident)) {
+            diag_.error(cur().pos, "expected extern function name");
             errored_ = true;
             return true;
         }
         fn.name = intern_name(cur().text);
         fn.pos = cur().pos;
         advance();
-        expect(Tok::LParen, "'(' after function name");
+        expect(Tok::LParen, "'(' after extern function name");
         while (!check(Tok::RParen)) {
             if (!check(Tok::Ident)) {
                 diag_.error(cur().pos, "expected parameter name");
@@ -212,36 +502,53 @@ private:
         }
         expect(Tok::RParen, "')' after parameters");
         if (accept(Tok::Arrow)) fn.ret = parse_type();
-        if (fn.params.size() > kMaxParams) {
-            diag_.error(fn.pos, "too many parameters (MVP node input arity limit)");
+        expect(Tok::Semi, "';' after extern declaration (no body)");
+        if (fn.params.size() > 6) {
+            diag_.error(fn.pos, "extern functions are limited to 6 parameters in the MVP "
+                        "(SysV GP register count; no stack-passing support yet)");
             errored_ = true;
         }
-        parse_block(fn.body);
         mod.fns.push_back(std::move(fn));
         return true;
     }
-
-    // ---- types ---------------------------------------------------------
     TypeId parse_type() {
         TypeId t = parse_type_base();
-        // pointer suffixes / prefixes handled in base
         return t;
     }
     TypeId parse_type_base() {
-        // '*' 'const' type | '*' 'mut' type | scalar ident
+        // '*' 'const' type | '*' 'mut' type | scalar ident | user type name (pending)
         if (accept(Tok::Star)) {
             bool is_const = true;
-            if (check_ident("const")) { advance(); is_const = true; }
+            if (check(Tok::KwConst)) { advance(); is_const = true; } // 'const' is a KEYWORD
             else if (check_ident("mut")) { advance(); is_const = false; }
             else {
                 diag_.error(cur().pos, "expected 'const' or 'mut' after '*' in pointer type");
                 errored_ = true;
             }
             (void)is_const; // mutability is a frontend check only (no alias model yet)
+            SourcePos ppos = cur().pos;
+            // Reject pointer-to-pointer outright (not in the MVP lattice,
+            // and no user type is ever a pointer).
+            if (check(Tok::Star)) {
+                diag_.error(ppos, "pointer to pointer is not in the MVP subset");
+                errored_ = true;
+                return ty_none();
+            }
             TypeId pointee = parse_type_base();
-            TypeId p = ty_ptr(pointee);
+            if (pointee == ty_none()) return ty_none();
+            if (!ModuleAst::is_pending(pointee)) {
+                TypeId p = ty_ptr(pointee);
+                if (p == ty_none()) {
+                    diag_.error(cur().pos, "pointer to non-scalar type is not in the MVP type lattice");
+                    errored_ = true;
+                }
+                return p;
+            }
+            // Pointer to a (possibly user) type: record a pending pointer slot.
+            const TypeSlot& slot = mod_->type_slots[pointee & ~kPendingTyFlag];
+            TypeId p = mod_->pending_type(slot.name, true, ppos);
             if (p == ty_none()) {
-                diag_.error(cur().pos, "pointer to non-scalar type is not in the MVP type lattice");
+                diag_.error(ppos, "too many distinct types (parser slot limit)");
                 errored_ = true;
             }
             return p;
@@ -261,9 +568,14 @@ private:
         if (name == "f32") return ty_f32();
         if (name == "f64") return ty_f64();
         if (name == "bool") return ty_i1();
-        diag_.error(pos, "unknown type '" + name + "' in MVP subset (i32,i64,u32,u64,f32,f64,bool,usize, *const T, *mut T)");
-        errored_ = true;
-        return ty_i32();
+        // User type name: resolve scalar lattice candidates via ty_ptr check is
+        // not needed — sema resolves; record a pending slot.
+        TypeId p = mod_->pending_type(name, false, pos);
+        if (p == ty_none()) {
+            diag_.error(pos, "too many distinct types (parser slot limit)");
+            errored_ = true;
+        }
+        return p;
     }
 
     // ---- statements ----------------------------------------------------
@@ -301,12 +613,33 @@ private:
                 expect(Tok::Semi, "';' after 'continue'");
                 break;
             }
-            case Tok::KwDefer:
-            case Tok::KwExtern:
-                diag_.error(cur().pos, std::string(tok_name(cur().kind)) + " is not part of the MVP subset");
-                errored_ = true;
+            case Tok::LBrace: {
+                // bare block statement: its own scope
+                s = make_stmt(StmtKind::Block);
+                parse_block(s->body);
+                break;
+            }
+            case Tok::KwDefer: {
+                // defer <single stmt> | defer { ... }  (no semicolon required
+                // after the block form; the single-statement form consumes
+                // its own terminator)
+                s = make_stmt(StmtKind::Defer);
                 advance();
-                return true;
+                if (check(Tok::LBrace)) {
+                    parse_block(s->body);
+                } else {
+                    std::vector<StmtP> one;
+                    parse_stmt(one);
+                    if (one.size() == 1) {
+                        s->body.push_back(std::move(one[0]));
+                    } else if (!errored_) {
+                        diag_.error(s->pos, "expected a statement after 'defer'");
+                        errored_ = true;
+                        s.reset();
+                    }
+                }
+                break;
+            }
             default: s = parse_expr_or_assign(); break;
         }
         if (s) out.push_back(std::move(s));
@@ -428,6 +761,16 @@ private:
         StmtP s = make_stmt(StmtKind::ExprStmt);
         s->value = parse_expr();
         if (accept(Tok::Assign)) {
+            // Field store: base.name = value (parsed as a Field expression)
+            if (s->value && s->value->kind == ExprKind::Field) {
+                StmtP a = make_stmt(StmtKind::AssignField);
+                a->pos = s->value->pos;
+                a->target = std::move(s->value->lhs); // struct base
+                a->name = s->value->name;             // field name
+                a->value = parse_expr();
+                expect(Tok::Semi, "';' after assignment");
+                return a;
+            }
             // Indexed store: base[idx] = value (parsed as an Index expression).
             if (s->value && s->value->kind == ExprKind::Index) {
                 StmtP a = make_stmt(StmtKind::AssignIndex);
@@ -535,10 +878,19 @@ private:
             e->comptime_call = true;
             return e;
         }
-        if (check(Tok::Minus)) uop = UnKind::Neg;
+            if (check(Tok::Minus)) uop = UnKind::Neg;
         else if (check(Tok::Not)) uop = UnKind::Not;
         else if (check(Tok::Tilde)) uop = UnKind::BNot;
         else if (check(Tok::Star)) return parse_postfix(); // deref handled in postfix
+        else if (check(Tok::Amp)) {
+            // address-of: &expr (unary position; binary & never starts an expr)
+            ExprP e = std::make_unique<Expr>();
+            e->pos = cur().pos;
+            e->kind = ExprKind::AddrOf;
+            advance();
+            e->lhs = parse_unary();
+            return e;
+        }
         else return parse_postfix();
         ExprP e = std::make_unique<Expr>();
         e->pos = cur().pos;
@@ -585,6 +937,44 @@ private:
                 c->rhs = parse_expr();
                 expect(Tok::RBracket, "']' after index");
                 e = std::move(c);
+                continue;
+            }
+            if (check(Tok::Dot)) {
+                // field access / qualified constant / method call
+                SourcePos pos = cur().pos;
+                advance();
+                if (!check(Tok::Ident)) {
+                    diag_.error(pos, "expected a field or method name after '.'");
+                    errored_ = true;
+                    break;
+                }
+                std::string member = cur().text;
+                advance();
+                if (check(Tok::LParen)) {
+                    ExprP c = std::make_unique<Expr>();
+                    c->pos = pos;
+                    c->kind = ExprKind::MethodCall;
+                    c->name = member;
+                    advance(); // '('
+                    while (!check(Tok::RParen) && !check(Tok::Eof)) {
+                        c->args.push_back(parse_expr());
+                        if (!accept(Tok::Comma)) break;
+                    }
+                    expect(Tok::RParen, "')' after method arguments");
+                    if (c->args.size() > kMaxCallArgs) {
+                        diag_.error(pos, "too many method arguments (MVP node input arity limit)");
+                        errored_ = true;
+                    }
+                    c->lhs = std::move(e); // receiver
+                    e = std::move(c);
+                } else {
+                    ExprP c = std::make_unique<Expr>();
+                    c->pos = pos;
+                    c->kind = ExprKind::Field;
+                    c->name = member;
+                    c->lhs = std::move(e); // base
+                    e = std::move(c);
+                }
                 continue;
             }
             if (check(Tok::LParen)) {
@@ -653,6 +1043,34 @@ private:
                 e->name = cur().text;
                 e->sym = intern_name(cur().text);
                 advance();
+                // Struct literal lookahead: Ident '{' (Ident ':' | '}') — the
+                // Rust rule. Disambiguates `if x { y }` (block) from
+                // `Point { x: 1.0 }` (literal). Named fields only.
+                if (check(Tok::LBrace)) {
+                    // named-field literal only: Ident '{' Ident ':' — never
+                    // '}' (an empty block after a condition is a block, and
+                    // empty struct literals are not expressible anyway)
+                    size_t la = i_ + 1;
+                    bool is_lit = toks_[la].kind == Tok::Ident &&
+                                  toks_[la + 1].kind == Tok::Colon;
+                    if (is_lit) {
+                        e->kind = ExprKind::StructLit;
+                        advance(); // '{'
+                        while (!check(Tok::RBrace) && !check(Tok::Eof)) {
+                            if (!check(Tok::Ident)) {
+                                diag_.error(cur().pos, "expected a field name in struct literal");
+                                errored_ = true;
+                                break;
+                            }
+                            e->field_names.push_back(cur().text);
+                            advance();
+                            expect(Tok::Colon, "':' after field name in struct literal");
+                            e->args.push_back(parse_expr());
+                            if (!accept(Tok::Comma)) break;
+                        }
+                        expect(Tok::RBrace, "'}' after struct literal fields");
+                    }
+                }
                 return e;
             }
             case Tok::LParen: {
@@ -678,6 +1096,7 @@ private:
     Diagnostics& diag_;
     bool errored_ = false;
     SymbolTable* sym_;
+    ModuleAst* mod_ = nullptr; // pending-type slot registry (set by parse_module)
 };
 
 } // namespace

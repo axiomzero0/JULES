@@ -1,0 +1,50 @@
+// Frontend round: bitmasks — auto pow2 flags, explicit values, set algebra
+// (| & ^ ~), equality, has() sugar, u64 round-trip.
+bitmask Perm { Read, Write, Exec }
+bitmask Io { In = 1, Out = 2, Err = 4, Hup = 64 }
+
+fn open_mode(m: Perm) -> i64 {
+    var n: i64 = 0;
+    if m.has(Perm.Read) { n = n + 1; }
+    if m.has(Perm.Write) { n = n + 10; }
+    if m.has(Perm.Exec) { n = n + 100; }
+    return n;
+}
+
+fn main() -> i64 {
+    var m = Perm.Read | Perm.Write;
+    print(m.has(Perm.Read));
+    print(m.has(Perm.Write));
+    print(m.has(Perm.Exec));
+
+    print(open_mode(m));
+    print(open_mode(Perm.Read | Perm.Exec));
+    print(open_mode(Perm.Exec));
+
+    var full = Perm.Read | Perm.Write | Perm.Exec;
+    var not_r = full & ~Perm.Read;
+    print(not_r.has(Perm.Read));
+    print(not_r.has(Perm.Write));
+
+    var x = full ^ Perm.Write;
+    print(x.has(Perm.Write));
+    x = x ^ Perm.Write;
+    print(x.has(Perm.Write));
+
+    print(m == Perm.Read | Perm.Write);
+    print(m == Perm.Read);
+
+    // u64 round trip
+    var raw = m as u64;
+    raw = raw | 64;
+    var back = raw as Perm;
+    print(back.has(Perm.Read));
+    print(raw);
+
+    // explicit-value bitmask
+    var io = Io.In | Io.Hup;
+    print(io.has(Io.In));
+    print(io.has(Io.Out));
+    print(io.has(Io.Hup));
+    return 0;
+}

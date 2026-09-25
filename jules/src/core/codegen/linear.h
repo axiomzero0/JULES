@@ -226,6 +226,9 @@ struct LFunction {
 struct LinearModule {
     std::vector<LFunction> fns;
     std::vector<StringConst> module_strings; // .rodata entries
+    // extern "C" declarations: name symbols indexed by
+    // (Call.aux - kExternFnBase); the emitter resolves them to CallSym.
+    std::vector<SymbolId> externs;
     // Deopt manifest entries (pass 89)
     struct GuardSite {
         FnId fn;
@@ -239,7 +242,8 @@ struct LinearModule {
 std::string serialize_module_asm(const LinearModule& lin, SymbolTable& syms);
 
 // Machine pass entry points (invoked by pass files 84-87).
-bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms);
+bool x64_select_instructions(LFunction& lf, FunctionGraph& fg, SymbolTable& syms,
+                            const std::vector<SymbolId>& externs);
 bool x64_allocate_frame(LFunction& lf);
 // Pass 85 allocator: linear scan over slot live ranges (see x64_ra.cpp).
 //   level < O1  -> spill-everywhere (correctness-first, spec "simple")

@@ -47,7 +47,7 @@ const char* tok_name(Tok t) {
         case Tok::Comma: return "','"; case Tok::Semi: return "';'";
         case Tok::Colon: return "':'"; case Tok::Arrow: return "'->'";
         case Tok::DotDot: return "'..'"; case Tok::Attr: return "'#['";
-        case Tok::Pound: return "'#'";
+        case Tok::Pound: return "'#'"; case Tok::Dot: return "'.'";
         case Tok::Plus: return "'+'"; case Tok::Minus: return "'-'";
         case Tok::Star: return "'*'"; case Tok::Slash: return "'/'";
         case Tok::Percent: return "'%'";
@@ -229,8 +229,7 @@ private:
             case '~': return emit(Tok::Tilde, {});
             case '.': {
                 if (peek() == '.') { advance(); return emit(Tok::DotDot, {}); }
-                diag_.error(pos_, "unexpected '.' (field access is not part of the MVP subset)");
-                return false;
+                return emit(Tok::Dot, {}); // field access / qualified enum constant
             }
             case '#': {
                 if (peek() == '[') { advance(); return emit(Tok::Attr, {}); }

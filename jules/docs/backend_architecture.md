@@ -372,3 +372,15 @@ counts, same results): pops 0.23M -> 1.09M/sec, constructions 0.64M ->
 SIMD lane simulation (12 lanes fit 2 zmm vectors per location),
 lane-count-adaptive verification for the JIT path, and window-level
 parallelism for AOT.
+
+## Frontend lowering contract (see docs/language_surface.md)
+
+Structs lower without new IR nodes: decomposed locals become per-leaf-field
+slots (SROA-by-construction); address-taken locals (sema escape analysis)
+become one contiguous allocation with offset addressing. Struct params pass
+as a pointer + callee-side entry copy; struct returns use a hidden sret
+pointer as the last parameter. Enums/bitmasks/bitfields are their backing
+integers (bitfield accesses are shift/mask arithmetic). extern fns call
+through CallSym pseudo-FnIds (kExternFnBase..) resolved via Module
+externs; `cc` links with `-lm`. Pass 29 promotes only scalar-sized
+allocations (frame slots are fixed 8-byte cells).

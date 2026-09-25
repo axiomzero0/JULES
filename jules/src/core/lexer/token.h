@@ -16,7 +16,7 @@ enum class Tok : u16 {
     KwDyn, KwDefer, KwExtern,
     // punctuation / operators
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semi, Colon, Arrow, DotDot, Attr, Pound,
+    Comma, Semi, Colon, Arrow, DotDot, Attr, Pound, Dot,
     Plus, Minus, Star, Slash, Percent,
     Assign, Eq, Ne, Lt, Le, Gt, Ge,
     Not, AndAnd, OrOr, Amp, Pipe, Caret, Tilde, Shl, Shr,

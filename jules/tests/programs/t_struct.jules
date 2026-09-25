@@ -1,0 +1,97 @@
+// Frontend round: structs — literals, field access, nested values, copies,
+// shadowing, decomposed (default) and address-taken (contiguous) locals,
+// arrays of structs, linked structures through *mut, params/returns, methods.
+struct Inner { a: i64, b: i64 }
+struct Point { x: f64, y: f64, inner: Inner }
+
+trait Shape { fn area(&self) -> f64; }
+
+impl Shape for Point {
+    fn area(&self) -> f64 { return self.x * self.y; }
+}
+
+impl Point {
+    fn scale(&mut self, k: f64) {
+        self.x = self.x * k;
+        self.y = self.y * k;
+    }
+    fn sum_inner(&self) -> i64 { return self.inner.a + self.inner.b; }
+}
+
+fn mk(a: f64, b: f64) -> Point {
+    return Point { x: a, y: b, inner: Inner { a: 1, b: 2 } };
+}
+
+fn total(p: Point) -> i64 { return p.inner.a * 10 + p.inner.b; }
+
+struct Node { val: i64, next: *mut Node }
+
+fn main() -> i64 {
+    // decomposed local (the SROA-by-construction fast path)
+    var p = Point { x: 2.0, y: 3.0, inner: Inner { a: 4, b: 5 } };
+    print(p.x);
+    print(p.y);
+    print(p.inner.a);
+    print(p.inner.b);
+    print(p.area());
+    p.scale(2.0);
+    print(p.x);
+    print(p.area());
+    print(p.sum_inner());
+
+    // whole-struct copy (decomposed -> decomposed, field-wise)
+    var q = p;
+    q.x = 10.0;
+    print(q.x);
+    print(p.x);
+
+    // address-taken local (contiguous storage): &p flows into a write
+    var r = Point { x: 1.0, y: 1.0, inner: Inner { a: 0, b: 0 } };
+    bump(&r.inner);
+    print(r.inner.a);
+    print(r.inner.b);
+
+    // by-value parameter and struct return
+    let m = mk(1.5, 2.5);
+    print(m.x);
+    print(m.inner.a);
+    print(total(m));
+
+    // array of structs through alloc(Point, n)
+    let arr = alloc(Point, 3);
+    for i in 0..3 {
+        arr[i].x = 1.0 * (i as f64);
+        arr[i].y = 2.0;
+        arr[i].inner.a = i as i64;
+        arr[i].inner.b = i as i64 * 2;
+    }
+    print(arr[2].x);
+    print(arr[2].inner.b);
+
+    // linked structure through *mut Node (recursive type via pointer)
+    let n1 = alloc(Node);
+    let n2 = alloc(Node);
+    n1.val = 7;
+    n1.next = n2;
+    n2.val = 8;
+    n2.next = n1; // cycle
+    print(n1.next.val);
+    print(n2.next.val);
+    print(n1.next.next.val);
+
+    // shadowing: a scalar named p hides the struct slots
+    {
+        var p = 42;
+        print(p);
+    }
+    print(p.x); // struct p is intact after the shadowing scope
+
+    // pointer receiver auto-deref: node.next.val chains fields through ptrs
+    print(n1.next.next.next.val);
+    return 0;
+}
+
+fn bump(inner: *mut Inner) {
+    inner.a = inner.a + 100;
+    inner.b = inner.b + 200;
+}

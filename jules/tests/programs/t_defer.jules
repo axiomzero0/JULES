@@ -1,0 +1,81 @@
+// Frontend round: defer — LIFO execution at every scope exit: fall-through,
+// break, continue, return; nested scopes; per-iteration loop semantics;
+// the value of a 'return e' is evaluated BEFORE defers run (Zig rule).
+fn main() -> i64 {
+    var log: i64 = 0;
+
+    // fall-through at function-block scope: runs at the implicit end
+    defer { log = log + 100000; }
+
+    // plain block scope: defers run at the closing brace
+    {
+        defer { log = log + 1; }
+        log = log + 10;
+    }
+    print(log); // 11
+
+    // nested: inner defers first
+    {
+        defer { log = log * 2; }
+        {
+            defer { log = log + 5; }
+        }
+        log = log + 1;
+    }
+    print(log); // 11 -> +5 -> +1 -> *2 = 34
+
+    // loops: body scope exits each iteration
+    var n: i64 = 0;
+    for i in 0..3 {
+        defer { n = n + 10; }
+        n = n + 1;
+    }
+    print(n); // 33
+
+    // break: defers of inner scopes + the loop body run before the exit
+    var b: i64 = 0;
+    var it: i64 = 0;
+    while true {
+        it = it + 1;
+        defer { b = b + 7; }
+        if it == 2 { break; }
+        b = b + 1;
+    }
+    print(b);   // iter1: b=1 then defer +7 = 8; iter2: break runs defer -> 15
+    print(it);
+
+    // continue: the iteration scope's defers run, then the next iteration
+    var c: i64 = 0;
+    for i in 0..4 {
+        defer { c = c + 100; }
+        if i == 1 { continue; }
+        c = c + 1;
+    }
+    print(c); // 4 iterations x100 + 3 increments = 403
+
+    // single-statement defer form
+    var s: i64 = 0;
+    {
+        defer s = s + 3;
+        s = s + 4;
+    }
+    print(s); // 7
+
+    // defers run before 'return' leaves, but the return VALUE was fixed
+    print(fnval()); // 41 — the value evaluated before the defer mutated t
+    print(fnval2()); // observable side effect of the return-time defer: 42
+    return 0;
+}
+
+fn fnval() -> i64 {
+    var t: i64 = 41;
+    defer { t = t + 1; } // runs, but the return value was already fixed
+    return t;
+}
+
+fn fnval2() -> i64 {
+    var t: i64 = 41;
+    defer { t = t + 1; }
+    t = t + 0; // no-op to keep the shape interesting
+    return t + 0; // still 41
+}

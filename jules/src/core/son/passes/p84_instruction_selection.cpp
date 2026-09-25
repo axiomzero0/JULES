@@ -23,7 +23,7 @@ public:
             LFunction& lf = ctx.lin->fns[i];
             FunctionGraph* fg = ctx.mod.find_fn(lf.fid);
             if (!fg) { ok = false; continue; }
-            ok &= x64_select_instructions(lf, *fg, ctx.syms);
+            ok &= x64_select_instructions(lf, *fg, ctx.syms, ctx.lin->externs);
         }
         return ok;
     }

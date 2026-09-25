@@ -22,7 +22,10 @@ public:
         buf[name.size()] = '\0';
         SymbolId id = static_cast<SymbolId>(names_.size());
         names_.push_back(buf);
-        map_.insert(name, id);
+        // Insert the ARENA-BACKED view, never the caller's: `name` may be a
+        // temporary (e.g. mangled method names), and a dangling view would
+        // corrupt the sorted map (found the hard way in the frontend round).
+        map_.insert(std::string_view(buf, name.size()), id);
         return id;
     }
     SymbolId find(std::string_view name) const {
