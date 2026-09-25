@@ -4,6 +4,7 @@ set(JULES_SOURCES
     src/core/lexer/lexer.cpp
     src/core/parser/parser.cpp
     src/core/sema/sema.cpp
+    src/core/sema/borrow.cpp
     src/core/son/analysis/alias.cpp
     src/core/son/analysis/analysis_manager.cpp
     src/core/son/analysis/dominators.cpp

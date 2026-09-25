@@ -1,0 +1,9 @@
+module rb_defer_move;
+import strict;
+fn main() -> i64 {
+    let p = alloc(i64);
+    defer free(p);
+    *p = 7;
+    let q = p;
+    return *q;
+}

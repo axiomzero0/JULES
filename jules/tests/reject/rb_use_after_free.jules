@@ -1,0 +1,7 @@
+module rb_use_after_free;
+import strict;
+fn main() -> i64 {
+    let p = alloc(i64);
+    free(p);
+    return *p;
+}

@@ -57,6 +57,10 @@ struct Expr {
 
     // cast target type (ExprKind::Cast); sema computes result `ty`
     TypeId cast_target = ty_none();
+    // `p as *const T` vs `p as *mut T`: the TypeId lattice has a single
+    // pointer type per pointee, so the const bit is recorded here for the
+    // strict borrow checker (shared-view creation vs. moving relabel).
+    bool cast_ptr_const = false;
 
     // comptime-folded marker (set by sema when value was compile-time evaluated)
     bool comptime_value = false;
@@ -209,8 +213,18 @@ struct TypeSlot {
     SourcePos pos;
 };
 
+struct ImportDecl {
+    SymbolId name = kNoSymbol;
+    SourcePos pos;
+};
+
 struct ModuleAst {
     std::string module_name = "main";
+    // `import NAME;` — built-in importable units. 'strict' opts the module
+    // into the strict borrow checker (Rust-shaped ownership/borrow rules,
+    // enforced at compile time; never on by default — language features are
+    // not gated behind it).
+    std::vector<ImportDecl> imports;
     std::vector<ConstDecl> consts;
     std::vector<FnDecl> fns;      // includes impl methods (moved + mangled by sema)
     std::vector<StructDecl> structs;

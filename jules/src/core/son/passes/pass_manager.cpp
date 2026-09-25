@@ -118,7 +118,20 @@ bool PassManager::run() {
     // they would run after the module was already linearized.
     std::stable_sort(all.begin(), all.end(), [](const Pass* a, const Pass* b) {
         if (a->stage() != b->stage()) return a->stage() == Stage::Son;
-        return a->order() < b->order();
+        // Within the Linear stage, passes with pre-lowering catalog numbers
+        // (71: GuardInsertion — a Phase-6 slot that became Linear when the
+        // guard-site table moved to the linear module) still need LINEARIZED
+        // blocks, so they sequence after the linearizer (83) despite their
+        // lower catalog identity. The catalog number (order()) is the spec's
+        // namespace and stays untouched; this is execution order only.
+        // GuardInsertion (71) is a Linear-stage pass that needs LINEARIZED
+        // blocks: it sequences between the linearizer (83) and the machine
+        // tier (84+) and BEFORE the manifest emission (89) so its guard-site
+        // table is what pass 89 serializes. Keys are scaled x10 to place 71
+        // at 835 — between 83 (830) and 84 (840).
+        int ka = a->order() == 71 ? 835 : a->order() * 10;
+        int kb = b->order() == 71 ? 835 : b->order() * 10;
+        return ka < kb;
     });
     size_t son_end = 0; // one-past-the-end of the SoN group
     for (size_t i = 0; i < all.size(); ++i)

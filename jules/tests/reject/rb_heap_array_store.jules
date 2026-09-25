@@ -1,0 +1,10 @@
+module rb_heap_array_store;
+import strict;
+struct Box { v: *mut i64, w: i64 }
+fn main() -> i64 {
+    let arr = alloc(Box, 4);
+    let p = alloc(i64);
+    *p = 3;
+    arr[0] = Box { v: p, w: 1 };
+    return 0;
+}

@@ -1,0 +1,5 @@
+jules lto summary v1
+functions: 2
+fn 0 nodes 22 params 2 hint never
+fn 1 nodes 43 params 0 hint cost
+  edge -> 0 sites 6 const yes

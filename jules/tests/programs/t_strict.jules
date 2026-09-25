@@ -1,0 +1,91 @@
+// Strict borrow checker (opt-in `import strict;`): the full ownership story
+// — moves, shared views, call lends, helper-allocated returns, loops, defers,
+// and struct-field ownership. Runs under the whole level matrix: strict mode
+// is a FRONTEND contract and must never change what the optimizer may do.
+module t_strict;
+import strict;
+
+fn fill(p: *mut i64, v: i64) -> i64 {
+    *p = v;
+    return *p;
+}
+
+fn make(v: i64) -> *mut i64 {
+    let p = alloc(i64);
+    *p = v;
+    return p;
+}
+
+fn read_two(a: *const i64, b: *const i64) -> i64 {
+    return *a + *b;
+}
+
+struct Box {
+    v: *mut i64,
+    w: i64,
+}
+
+struct Counter {
+    n: i64,
+}
+
+impl Counter {
+    fn bump(&mut self) -> i64 {
+        self.n = self.n + 1;
+        return self.n;
+    }
+}
+
+fn main() -> i64 {
+    // moves + lends
+    let p = make(10);
+    let a = fill(p, 20);
+    let q = make(30);
+    let b = fill(q, 5);
+
+    // shared views: many live reads, no writes while live
+    var shared_sum = 0 as i64;
+    {
+        let c1 = p as *const i64;
+        let c2 = q as *const i64;
+        shared_sum = read_two(c1, c2);
+    }
+    *p = *p + 1;
+
+    // struct field ownership: q moved into the field, freed through it
+    let bx = Box { v: q, w: 7 };
+    let fld = *bx.v;
+    free(bx.v);
+
+    // methods on a local (receiver = transient borrow)
+    let ctr = Counter { n: 4 };
+    let bumped = ctr.bump();
+
+    // loops: alloc/free per iteration (site-origin reset)
+    var loop_sum = 0 as i64;
+    var i = 0 as i64;
+    while i < 5 {
+        let t = alloc(i64);
+        *t = i * i;
+        loop_sum = loop_sum + *t;
+        free(t);
+        i = i + 1;
+    }
+
+    // defer: the free runs at scope exit, after the last use
+    let d = alloc(i64);
+    defer free(d);
+    *d = 100;
+    let dv = *d;
+
+    // branch join: different origins merged, then freed
+    var m = alloc(i64);
+    if a > 15 { *m = a; } else { *m = b; }
+    let mv = *m;
+    free(m);
+
+    free(p);
+    let total = a + b + shared_sum + fld + bumped + loop_sum + dv + mv;
+    print(total);
+    return 0;
+}

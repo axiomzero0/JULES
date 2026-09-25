@@ -1,0 +1,1 @@
+free of a moved value 'p'

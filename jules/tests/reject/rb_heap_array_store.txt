@@ -1,0 +1,1 @@
+cannot move an owned pointer into a heap-array slot

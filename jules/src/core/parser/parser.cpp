@@ -142,6 +142,7 @@ private:
             accept(Tok::Semi);
             return !check(Tok::Eof);
         }
+        if (check(Tok::KwImport)) return parse_import(mod);
         Attrs attrs = parse_attrs();
         if (check(Tok::KwConst)) return parse_const(mod);
         bool is_comptime = accept(Tok::KwComptime);
@@ -177,6 +178,39 @@ private:
         errored_ = true;
         advance();
         return !check(Tok::Eof);
+    }
+
+    bool parse_import(ModuleAst& mod) {
+        ImportDecl im;
+        im.pos = cur().pos;
+        advance(); // import
+        if (!check(Tok::Ident)) {
+            diag_.error(cur().pos, "expected an importable unit name after 'import' "
+                        "(built-ins: 'strict' — the strict borrow checker)");
+            errored_ = true;
+            while (!check(Tok::Semi) && !check(Tok::Eof)) advance();
+            accept(Tok::Semi);
+            return !check(Tok::Eof);
+        }
+        im.name = intern_name(cur().text);
+        im.pos = cur().pos;
+        advance();
+        // Optional :: path segments (recorded, single-module MVP; rejected
+        // by sema — no importable units exist beyond the built-ins).
+        while (check(Tok::Colon)) {
+            advance(); advance();
+            if (check(Tok::Ident)) {
+                diag_.error(cur().pos, "'import' paths are not part of the MVP subset; "
+                            "import built-in units by bare name ('import strict;')");
+                errored_ = true;
+                while (!check(Tok::Semi) && !check(Tok::Eof)) advance();
+                accept(Tok::Semi);
+                return !check(Tok::Eof);
+            } else break;
+        }
+        expect(Tok::Semi, "';' after import");
+        mod.imports.push_back(im);
+        return true;
     }
 
     bool parse_const(ModuleAst& mod) {
@@ -525,7 +559,7 @@ private:
                 diag_.error(cur().pos, "expected 'const' or 'mut' after '*' in pointer type");
                 errored_ = true;
             }
-            (void)is_const; // mutability is a frontend check only (no alias model yet)
+            last_type_ptr_const_ = is_const; // consumed by the `as`-cast site
             SourcePos ppos = cur().pos;
             // Reject pointer-to-pointer outright (not in the MVP lattice,
             // and no user type is ever a pointer).
@@ -917,11 +951,13 @@ private:
             if (check(Tok::KwAs)) {
                 SourcePos pos = cur().pos;
                 advance();
+                last_type_ptr_const_ = false;
                 TypeId t = parse_type();
                 ExprP c = std::make_unique<Expr>();
                 c->pos = pos;
                 c->kind = ExprKind::Cast;
                 c->cast_target = t;
+                c->cast_ptr_const = last_type_ptr_const_; // *const vs *mut
                 c->lhs = std::move(e);
                 e = std::move(c);
                 continue;
@@ -1097,6 +1133,8 @@ private:
     bool errored_ = false;
     SymbolTable* sym_;
     ModuleAst* mod_ = nullptr; // pending-type slot registry (set by parse_module)
+    bool last_type_ptr_const_ = false; // parse_type_base's '*' const bit,
+                                       // consumed by the `as`-cast site
 };
 
 } // namespace

@@ -11,6 +11,7 @@ enum class Tok : u16 {
     // keywords
     KwFn, KwComptime, KwLet, KwVar, KwConst, KwReturn, KwIf, KwElse, KwWhile,
     KwFor, KwIn, KwBreak, KwContinue, KwTrue, KwFalse, KwAs, KwModule, KwUse,
+    KwImport,
     // reserved for future milestones (clear diagnostics when used)
     KwStruct, KwClass, KwEnum, KwBitfield, KwBitmask, KwAlias, KwTrait, KwImpl,
     KwDyn, KwDefer, KwExtern,

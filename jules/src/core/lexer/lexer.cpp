@@ -13,6 +13,7 @@ constexpr Key kKeywords[] = {
     {"for", Tok::KwFor}, {"in", Tok::KwIn}, {"break", Tok::KwBreak},
     {"continue", Tok::KwContinue}, {"true", Tok::KwTrue}, {"false", Tok::KwFalse},
     {"as", Tok::KwAs}, {"module", Tok::KwModule}, {"use", Tok::KwUse},
+    {"import", Tok::KwImport},
     {"struct", Tok::KwStruct}, {"class", Tok::KwClass}, {"enum", Tok::KwEnum},
     {"bitfield", Tok::KwBitfield}, {"bitmask", Tok::KwBitmask}, {"alias", Tok::KwAlias},
     {"trait", Tok::KwTrait}, {"impl", Tok::KwImpl}, {"dyn", Tok::KwDyn},
@@ -35,6 +36,7 @@ const char* tok_name(Tok t) {
         case Tok::KwContinue: return "'continue'"; case Tok::KwTrue: return "'true'";
         case Tok::KwFalse: return "'false'"; case Tok::KwAs: return "'as'";
         case Tok::KwModule: return "'module'"; case Tok::KwUse: return "'use'";
+        case Tok::KwImport: return "'import'";
         case Tok::KwStruct: return "'struct'"; case Tok::KwClass: return "'class'";
         case Tok::KwEnum: return "'enum'"; case Tok::KwBitfield: return "'bitfield'";
         case Tok::KwBitmask: return "'bitmask'"; case Tok::KwAlias: return "'alias'";

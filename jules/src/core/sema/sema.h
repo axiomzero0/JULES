@@ -52,6 +52,13 @@ struct SemaModule {
     FlatMap<SymbolId, size_t> fn_by_name;
     bool has_main = false;
 
+    // `import strict;` — the strict borrow checker is OPT-IN, exactly like
+    // Rust's borrow discipline but never imposed by default: without the
+    // import, JULES keeps raw-pointer freedom (the dev decides). With it,
+    // ownership/move/borrow rules are enforced at compile time by the
+    // borrow checker (core/sema/borrow.cpp).
+    bool strict_mode = false;
+
     // User-defined types (sema-only TypeIds >= kUserTyBase; the builder
     // degrades them to lattice types — they never reach the IR).
     UserTypeTable user_types;

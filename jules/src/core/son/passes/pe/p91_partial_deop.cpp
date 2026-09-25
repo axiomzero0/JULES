@@ -67,8 +67,16 @@ public:
         return AnalysisKind::Dominators | AnalysisKind::LoopInfo |
                AnalysisKind::AliasInfo | AnalysisKind::MemDep | AnalysisKind::CallGraph;
     }
-    ModeMask modes() const override { return kModeAOT; } // sketches ride the
-    // ELF .init_array / atexit dump, same as pass 43
+    ModeMask modes() const override {
+        // The ladder is profile-driven speculation: AOT (the profile was
+        // dumped via .init_array / atexit, same as pass 43) AND the
+        // optimizing JIT tier (compile-time latency budgeted by
+        // cap_level_for_jit). Baseline JIT stays out: it must not pay for
+        // cloning. This is also what lets the guard family (71/74/89)
+        // actually meet: pass 89's manifest is JIT-emitted, so the
+        // guarded ladder must be able to exist in JIT mode.
+        return kModeAOT | kModeJitOptimizing;
+    }
     bool run(PassContext& ctx) override {
         if (ctx.opts.pgo == PgoMode::Instrument) return instrument(ctx);
         if (ctx.opts.pgo == PgoMode::Use) return use(ctx);

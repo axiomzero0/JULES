@@ -1,0 +1,8 @@
+module rb_view_write;
+import strict;
+fn main() -> i64 {
+    let p = alloc(i64);
+    let c = p as *const i64;
+    *c = 5;
+    return 0;
+}

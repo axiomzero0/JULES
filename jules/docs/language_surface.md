@@ -102,3 +102,57 @@ pre-defer one). Defer bodies must not contain `break`/`continue`/`return`
 4. Pass 29 (heap-to-stack) promoted aggregate allocations (`alloc(T, n)`,
    struct buffers) into fixed 8-byte frame slots — heap corruption. It now
    promotes only scalar-sized allocations; aggregates keep their malloc.
+
+## `import` and strict mode (the opt-in borrow checker)
+
+`import NAME;` names a built-in compiler unit. The single-module MVP has
+exactly one: `strict`.
+
+`import strict;` opts the whole module into the STRICT BORROW CHECKER
+(core/sema/borrow.cpp) — never on by default, and it never gates language
+features: raw-pointer freedom remains the default surface, and the same
+programs compile identically without the import. With it, Rust-shaped
+ownership rules are enforced at compile time, flow-sensitively, per
+function, with interprocedural return-flow summaries:
+
+- **Ownership**: every allocation has exactly one owner. Pointer values
+  MOVE on rebinding (`let` / assignment / return / struct-field store /
+  non-const pointer casts). Use of a moved value is an error.
+- **Shared views**: `p as *const T` creates read-only, copyable views.
+  While any is live the allocation cannot be written or freed (scope-based
+  liveness — Rust-2015 semantics, documented).
+- **Unique borrows**: `&x` takes the single live borrow of a struct local;
+  the target is frozen (no reads/writes/moves/re-borrows) while the view
+  lives. Borrowing a local into a heap field or returning it is rejected.
+- **Calls lend**: pointer (and pointer-bearing struct) arguments are lent
+  for the call and returned to the caller; the callee cannot free or move
+  them. A helper that returns its parameter flows that borrow back to the
+  caller (return-flow summaries), so the result aliases the argument.
+- **free discipline**: `free` consumes its argument. Double free, use after
+  free, free of borrowed/parameter values, and free through heap-array
+  slots are errors; `defer free(p)` schedules the consume at scope exit on
+  every path (moved-after-defer is caught there).
+- **Structs**: pointer-bearing structs are non-Copy (whole-value moves);
+  scalar-only structs copy freely. Local field loads move (partial moves);
+  heap-struct field loads yield shared views — the owning free is
+  `free(x.field)`. Heap ARRAY slots cannot own pointers (no drop runs on
+  them): store a shared view instead. This is the Rust idiom (indices or
+  borrows in collections, never bare owned pointers).
+- **Provenance**: integer-to-pointer casts are rejected.
+
+Leaks are SAFE (as in Rust's mem::forget): an unfreed owner at scope exit
+is never an error. comptime functions and comptime blocks are
+interpreter-managed and skipped by design.
+
+Tests: tests/programs/t_strict.jules (whole level matrix) +
+tests/reject/rb_*.jules (one file per violation class; the runner's
+rejection family asserts compile failure with the expected diagnostic).
+
+## Latent optimizer bug found by this round (fixed)
+
+`MemDep::store_is_overwritten_before_read` did not treat `Return` as a
+memory reader: a trailing store to an allocation that escapes through the
+return (the `make()` helper pattern: `alloc; *p = v; return p;`) was
+dropped as dead, so every caller read garbage at -O1+. The scan now treats
+Return like Call (the caller continues on that memory version). Found by
+t_strict's helper-returns-pointer shapes.

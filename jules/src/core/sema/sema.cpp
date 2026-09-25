@@ -1,5 +1,7 @@
 #include "core/sema/sema.h"
 
+#include "core/sema/borrow.h"
+
 #include <cmath>
 #include <cstdio>
 
@@ -23,6 +25,7 @@ public:
         : mod_(mod), out_(out), diag_(diag), syms_(syms) {}
 
     bool run() {
+        check_imports();
         register_user_types();
         register_traits();
         move_impl_methods();
@@ -35,11 +38,30 @@ public:
         check_trait_impl_signatures();
         for (FnDecl& fn : mod_.fns)
             if (!fn.is_extern) run_escape_analysis(fn);
+        if (out_.strict_mode && !diag_.has_errors())
+            run_borrow_check(mod_, out_, diag_, syms_);
         if (!out_.has_main && !diag_.has_errors()) {
             SourcePos pos = mod_.fns.empty() ? SourcePos{} : mod_.fns[0].pos;
             diag_.error(pos, "no 'fn main' found: an executable entry point is required");
         }
         return !diag_.has_errors();
+    }
+
+    // ---- imports ----------------------------------------------------------
+    // `import NAME;` names a built-in compiler unit. The single-module MVP
+    // has exactly one: 'strict' (the strict borrow checker). Unknown names
+    // are errors — silence would turn a typo into a missing safety net.
+    void check_imports() {
+        for (ImportDecl& im : mod_.imports) {
+            std::string n = std::string(syms_.name(im.name));
+            if (n == "strict") {
+                out_.strict_mode = true;
+            } else {
+                diag_.error(im.pos, "unknown import '" + n + "': the built-in units are "
+                            "'strict' (strict borrow checker). The MVP is single-module; "
+                            "there are no other importable units yet");
+            }
+        }
     }
 
 private:

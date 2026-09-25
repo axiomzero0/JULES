@@ -126,6 +126,43 @@ for t in tests/programs/*.jules; do
     done
 done
 
+# Strict borrow checker (opt-in `import strict;`): rejection tests.
+# tests/reject/<name>.jules must FAIL to compile, and the diagnostics must
+# contain the (single-line, fixed-string) substring in tests/reject/<name>.txt.
+# This is the negative side of the strict-mode contract: without the import
+# these programs compile freely (raw-pointer default); with it they must be
+# rejected before any code is emitted.
+run_reject() {
+    local name=$1
+    local src="tests/reject/${name}.jules"
+    local exp="tests/reject/${name}.txt"
+    local out="$WORK/rej_${name}.log"
+    if timeout 30 $JULESC "$src" -o "$WORK/rej_${name}.bin" > "$out" 2>&1; then
+        echo "FAIL $name (rejection test compiled successfully)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    local pattern
+    pattern=$(cat "$exp" 2>/dev/null)
+    if [ -z "$pattern" ]; then
+        echo "FAIL $name (missing expected-substring file $exp)"
+        fail=$((fail + 1))
+        return 1
+    fi
+    if ! grep -qF "$pattern" "$out"; then
+        echo "FAIL $name (diagnostics missing '$pattern')"
+        sed 's/^/    /' "$out" | tail -4
+        fail=$((fail + 1))
+        return 1
+    fi
+    echo "PASS $name [strict rejection: $pattern]"
+    pass=$((pass + 1))
+}
+for r in tests/reject/*.jules; do
+    [ -e "$r" ] || continue
+    run_reject "$(basename "$r" .jules)"
+done
+
 # Optimizer self-verification: the pass must have actually transformed.
 assert_pass_active t02_gvn GlobalValueNumbering
 assert_pass_active t03_sccp SparseConditionalConstantPropagation

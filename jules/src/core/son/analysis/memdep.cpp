@@ -131,6 +131,11 @@ bool MemDep::store_is_overwritten_before_read(NodeId s) const {
     //   Load  same base  -> read (bad)
     //   Load  other base -> continue
     //   Call             -> may read (bad)
+    //   Return           -> may read (bad): the memory version leaves with
+    //                        the return and the CALLER continues on it — a
+    //                        trailing store to an allocation that escapes
+    //                        (returned, passed out) is live there. Found by
+    //                        the strict-mode test round (make() + free)
     //   Alloc            -> continue
     //   Phi containing s -> conservative (bad)
     std::vector<NodeId> work;
@@ -146,7 +151,7 @@ bool MemDep::store_is_overwritten_before_read(NodeId s) const {
                 continue;
             }
             if ((un.op == Op::Load || un.op == Op::Store || un.op == Op::Call ||
-                 un.op == Op::Alloc) &&
+                 un.op == Op::Alloc || un.op == Op::Return) &&
                 un.n_in > 1 && un.in[1] == ver)
                 work.push_back(u);
         }
@@ -168,6 +173,7 @@ bool MemDep::store_is_overwritten_before_read(NodeId s) const {
                 if (same_base(*aa_, un.in[2], base_addr)) return false;
                 break; // unrelated load: not part of the chain ordering we need
             case Op::Call:
+            case Op::Return:
                 return false;
             case Op::Alloc:
                 push_users_of(u);

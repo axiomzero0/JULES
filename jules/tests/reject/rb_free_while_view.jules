@@ -1,0 +1,9 @@
+module rb_free_while_view;
+import strict;
+fn main() -> i64 {
+    let p = alloc(i64);
+    let c = p as *const i64;
+    let v = *c;
+    free(p);
+    return v;
+}

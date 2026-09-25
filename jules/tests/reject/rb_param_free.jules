@@ -1,0 +1,13 @@
+module rb_param_free;
+import strict;
+fn consume(p: *mut i64) -> i64 {
+    *p = 1;
+    free(p);
+    return *p;
+}
+fn main() -> i64 {
+    let p = alloc(i64);
+    let r = consume(p);
+    free(p);
+    return r;
+}

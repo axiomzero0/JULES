@@ -1,0 +1,9 @@
+module rb_double_free;
+import strict;
+fn main() -> i64 {
+    let p = alloc(i64);
+    *p = 1;
+    free(p);
+    free(p);
+    return 0;
+}
