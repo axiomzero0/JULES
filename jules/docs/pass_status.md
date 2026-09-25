@@ -313,10 +313,37 @@ one line of width-respecting test emission; regression-locked by
 t38 at every level. t38 also locks the honest skip: masked_i64's
 loop never vectorizes and its result stays exact.
 
-Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or MIR.; `SIMPLIFIED` — Real but reduced: core mechanism present, documented reductions.; `VACUOUS` — Complete for the current IR: the constructs it targets do not exist in the MVP subset.; `SCAFFOLD` — Not yet implemented: contract, modes and telemetry in place; honest no-op.; `DETECTION` — Analysis/proof machinery live and reported through --stats; the rewrite is implemented in-file and gated on a named dependency (the arm-split-elimination surgery / the variant cap).; `COMPLETE for the current IR` — The pass's scan and contract are live; the construct it targets does not exist yet, so the candidate set is structurally empty (claims nothing).
+Guard-family rewrite round (2026-09-25, the arm-split-elimination
+surgery): the last three gated rewrites landed, and the "surgery"
+turned out to be mostly REPAIRING the gated code itself. p72's versioner
+had three wiring defects (the clone's PIN slot was never deferred —
+every cloned control node stayed wired into the ORIGINAL loop; the
+after-loop re-pin walk re-pointed the exit merge's OWN pred slots to
+itself; the header phis were excluded from the live-out set, so
+post-loop code read the original loop's phi on the clone path — stale
+stack, wrong output) plus the enabling SCCP fix underneath: the If
+arm-marking now gates on the If's OWN block executability (the resolved-
+false guard's dead true-arm met the OPTIMISTIC loop-entry IV value
+through its range guards, turned them "executable", defeated the
+pred-trim, and the cascade then killed the LIVE generic-arm merge and
+the whole original loop body with it). p74's rewrite is fact injection:
+an arm-dominated same-key guard has its condition replaced by a Const
+and the sweep's SCCP does the split elimination (74 now sits BEFORE the
+folding set so a single-round -O1 sweep prunes in-round). p73's
+gated-off restructure had ROTTED: the rung call's structural slots were
+never initialized (uninitialized stack read — Call pinned on an If with
+a Cmp as its memory version), and the protected-call walk returned a
+FALLBACK rung by stack order — the one-call true-arm count is now the
+soundness gate, with the retired-slot variant cap (pe_make_variant
+extra_slots) for the widened rung. Suite 606 -> 628 (t55/t56 + runner
+asserts: PGO round-trips, resolved counts, kill-switch isolation).
 
-Status roll-up: 68 IMPLEMENTED (1 delegated: 28), 4 SIMPLIFIED, 4 VACUOUS,
-15 SCAFFOLD.
+Legend: `IMPLEMENTED` — Real transform/analysis operating on the SoN graph or MIR.; `SIMPLIFIED` — Real but reduced: core mechanism present, documented reductions.; `VACUOUS` — Complete for the current IR: the constructs it targets do not exist in the MVP subset.; `COMPLETE for the current IR` — The pass's scan and contract are live; the construct it targets does not exist yet, so the candidate set is structurally empty (claims nothing).
+
+Status roll-up: 81 IMPLEMENTED, 3 COMPLETE for the current IR, 4 SIMPLIFIED,
+4 VACUOUS — 92/92. No SCAFFOLD and no DETECTION rows remain: every pass
+now ships a real transform, a real analysis, or an honest complete-for-
+current-IR scan.
 
 | # | Pass | Status | Notes |
 |---|------|--------|-------|
@@ -391,9 +418,9 @@ Status roll-up: 68 IMPLEMENTED (1 delegated: 28), 4 SIMPLIFIED, 4 VACUOUS,
 | 69 | SpeculativeDevirtualization | COMPLETE for the current IR (no eligible sites) | The scan is live: every Call carries a static FnId (trait/method calls lower through the single-module static-dispatch table; the IR has no indirect form), so the speculation candidate set is structurally empty — the pass counts it for telemetry and claims nothing. The guarded-direct-call rewrite stays documented for the day `dyn`/function-pointer dispatch lands. |
 | 70 | InlineCacheInsertion | COMPLETE for the current IR (no eligible sites) | With every call site monomorphic by construction, an IC stub would be a compare against a constant that always succeeds. The candidate-set scan (mirroring 69's) runs and reports zero; the mono/poly/mega shapes are documented for the day dispatch lands (chosen by observed target counts from 69's type profiles). |
 | 71 | GuardInsertion | IMPLEMENTED | Linear stage (exec slot 835, between the linearizer and the machine tier): materializes every kFlagGuardSite If into the linear module's guard-site table that pass 89's deopt manifest serializes; kinds derived from the guard's comparison (Eq -> const, Ge -> range_lo, Le -> range_hi). |
-| 72 | GuardHoisting | DETECTION live; versioner implemented, gated | A guard whose condition cone is pure with leaves pinned OUTSIDE the loop re-checks the same fact every iteration. The full loop versioner is implemented (whole-loop clone with id-keyed remap + deferred backedge patching, preheader guard, exit-merge Region with live-out phis, per-version guard const-resolution) and exercised under JULES_GUARD_HOIST=1; the DEFAULT mode detects and reports the hoistable set. The gate: const-resolved ladders leave dead predecessors in the ladder's merge Regions that the cleanup's SCCP/DNE does not prune in this shape — the same arm-split-elimination surgery pass 74 documents as the deferred rewrite. Tests: t48_guardhoist (PGO flow + detection assert). |
-| 73 | GuardWeakening | DETECTION live; restructure implemented, gated | The negotiation analysis is complete: the (origin-fn, param) sketch is re-derived exactly as pass 91 enumerated it, the guarded assumption is matched (unique Const binding with the guard's constant), the hull must contain V and fit the level's range budget. The Eq->Ge/Le two-hinge rewrite (with the range rung's call re-emission and the false-path join) is implemented and kept in-file. The gate: building the range rung is a THIRD variant for the same origin — pe_make_variant's per-function cap (the PE family's termination guard) rejects it, and the rewrite also shares 72/74's arm-split dependency. Tests: t49_guardweaken (PGO flow + detection assert). |
-| 74 | GuardMerging | DETECTION (rewrite deferred) | Same-value guards within a dominator subtree merge: the dominated re-check is provably redundant. The pass proves the redundancy set and reports it through --stats; the control rewrite is deferred on the arm-split-elimination surgery (see the file header). 2026-09-25: the pass now actually RUNS in the post-inline cleanup sweep (kCleanupOrders), matching its file contract — previously the slot was claimed but not scheduled. |
+| 72 | GuardHoisting | IMPLEMENTED (default-on) | A guard whose condition cone is pure with leaves pinned OUTSIDE the loop re-checks the same fact every iteration; the transform is whole-loop VERSIONING: preheader guard, clone with id-keyed remap + deferred pin/value-slot backedge patching, per-version guard const-resolution, exit-merge Region with live-out phis (INCLUDING the header phis — the loop-carried state post-loop code reads). The const-resolved ladders are pruned by the cleanup sweep's SCCP (arm-split elimination). 2026-09-25 round: three wiring bugs fixed (pin slot never deferred — every cloned control node stayed wired into the ORIGINAL loop; the after-loop re-pin walk re-pointed the exit merge's OWN pred slots to itself; header phis excluded from the live-out set), plus the enabling SCCP fix (the If arm-marking now gates on the If's OWN block executability — the dead true-arm met the optimistic loop-entry IV value through its range guards and turned them "executable"). Tests: t48_guardhoist (PGO round-trip, versioner default-on, kill-switch). |
+| 73 | GuardWeakening | IMPLEMENTED (rewrite gated to the sound shape) | The negotiation analysis is complete: the (origin-fn, param) sketch is re-derived exactly as pass 91 enumerated it, the guarded assumption is matched (unique Const binding with the guard's constant), the hull must contain V and fit the level's range budget. The Eq->Ge/Le two-hinge rewrite (range rung call re-emission with the retired slot's extra variant cap, false-path join, arm re-pointing) is LIVE for the LAST-binding shape: the guard's true side must host exactly ONE rung call (a deeper sub-ladder's fallback rungs still carry the weakened Const binding — the [Const x, Range c] shape restructures around the wrong call otherwise). Non-last sites are detected and counted; the nested restructure is future work. Tests: t49_guardweaken (nested detection), t55_gweak (rewrite + round-trip + kill-switch). |
+| 74 | GuardMerging | IMPLEMENTED (fact-injection rewrite) | Same-value guards within a dominator subtree merge: the dominated re-check is provably redundant. The rewrite is arm-level: a guard whose block is dominated by another same-key guard's IfTrue (or IfFalse) projection has its condition replaced with a Const pinned at its block, and the cleanup sweep's SCCP performs the arm-split elimination (kill the dead projection, trim the ladder merge's dead pred, realign phis, cascade the dead rung) — the same machinery that prunes the versioned loops of pass 72. 74 sits BEFORE the folding set in kCleanupOrders so a single-round sweep (-O1) still prunes in-round. The natural firing shape: pass 72 versions a loop containing two same-key ladders and resolves only the first — the leftover and its clone are arm-dominated by the hoisted guard. Tests: t56_gmerge (PGO round-trip + resolved assert + kill-switch). |
 | 75 | AssumptionTracking | SIMPLIFIED | Assumption registry per compiled version. |
 | 76 | InliningCostModel | IMPLEMENTED | Per-site benefit scores. |
 | 77 | AlwaysInlineEnforcement | IMPLEMENTED | Force-inline annotated/trivial functions. |

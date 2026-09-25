@@ -212,6 +212,24 @@ private:
 
         bool changed = false;
 
+        // TWO-PHASE: collect every eligible site FIRST, then emit. The
+        // single-pass version iterated call nodes while emit_ladder
+        // created NEW eligible calls — the generic floor is a fresh call
+        // to the ORIGINAL with the same dynamic arguments, so the scan
+        // would reach it and ladder the floor of the floor of the floor.
+        // The pe_make_variant dedup rejection used to stop that
+        // recursion BY ACCIDENT (same-key floor sites were rejected as
+        // "!made") — fixing the dedup contract (31-a round) unmasked the
+        // loop: an infinite ladder emission on any hot-call program
+        // (observed: t56's use build never terminating).
+        struct Site {
+            u32 fi;
+            NodeId id;
+            std::vector<PeAssumption> asms;
+            std::vector<FnId> rungs;
+        };
+        std::vector<Site> sites;
+
         for (u32 fi = 0; fi < ctx.mod.fns.size(); ++fi) {
             for (NodeId id = 0; id < ctx.mod.fns[fi].g.size(); ++id) {
                 Node nc = ctx.mod.fns[fi].g.node(id); // snapshot: variant
@@ -245,7 +263,9 @@ private:
 
                 // rung variants: prefix assumption sets V[0..k); the
                 // generic floor (k == 0) is a fresh copy of the original
-                // call, not a variant.
+                // call, not a variant. Same-key prefixes DEDUP to the
+                // existing variant — that is the reuse contract, not a
+                // rejection.
                 std::vector<FnId> rungs(asms.size() + 1, kNoFn);
                 bool ok = true;
                 for (size_t k = 1; k <= asms.size(); ++k) {
@@ -260,13 +280,17 @@ private:
                     }
                 }
                 if (!ok) continue;
-
-                // Re-acquire after pe_make_variant (mod.fns may have moved).
-                Graph& g = ctx.mod.fns[fi].g;
-                if (id >= g.size() || g.node(id).op != Op::Call) continue; // defensive
-                emit_ladder(g, id, asms, rungs);
-                changed = true;
+                sites.push_back(Site{fi, id, asms, rungs});
             }
+        }
+
+        // Emission phase: the caller graphs may have moved (variant
+        // creation above); re-acquire per site and re-validate the call.
+        for (const Site& s : sites) {
+            Graph& g = ctx.mod.fns[s.fi].g;
+            if (s.id >= g.size() || g.node(s.id).op != Op::Call) continue; // defensive
+            emit_ladder(g, s.id, s.asms, s.rungs);
+            changed = true;
         }
         return changed;
     }

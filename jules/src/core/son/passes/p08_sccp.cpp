@@ -256,6 +256,19 @@ private:
             case Op::If: {
                 LatVal c = get(nd.in[1]);
                 if (c.kind == Lat::Top) return; // wait for the condition
+                // Gate on the If's OWN block executability: value users of
+                // a lattice change can sit in NON-executable blocks (the
+                // pre-seeded Consts and optimistic phi values flow there
+                // through set()'s user push), and an If in a dead block
+                // must never mark its projections executable. Observed on
+                // the versioned loop (pass 72 round): the resolved-false
+                // guard's dead true-arm met the OPTIMISTIC loop-entry IV
+                // value (Const 0) through its range guards — their arms
+                // turned "executable", the ladder merge kept its dead
+                // pred, and the phase-5 cascade then killed the LIVE
+                // generic-arm merge, taking the whole original loop body
+                // with it (verifier: header phis use killed nodes).
+                if (!exec_.contains(nd.in[0])) return;
                 // find this If's projections
                 NodeId tproj = kNoNode, fproj = kNoNode;
                 for (NodeId u : g_.uses_of(n)) {

@@ -850,7 +850,7 @@ FunctionGraph clone_bound(const FunctionGraph& src,
 
 FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
                      const std::vector<PeAssumption>& bindings, const PeBudgets& b,
-                     bool* changed) {
+                     bool* changed, u32 extra_slots) {
     if (changed) *changed = false;
     FunctionGraph* src = mod.find_fn(origin);
     if (!src || src->param_types.empty() || bindings.empty()) return kNoFn;
@@ -859,10 +859,20 @@ FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
     for (const PeAssumption& a : bindings)
         if (a.param >= src->param_types.size()) return kNoFn;
 
-    // dedup (exact assumption sets share one variant)
+    // dedup (exact assumption sets share one variant). A dedup hit IS a
+    // produced variant: `changed` reports "a usable variant materialized"
+    // (created OR reused) — the callers' rejection gates read it that
+    // way, and the reuse contract ("identical binding sets across call
+    // sites share ONE variant", pe.h) requires same-key sites after the
+    // first to succeed here, not to be rejected as if nothing was made
+    // (found by the 31-a review round: the second ladder of a two-site
+    // program was never emitted, so its guard never existed).
     u64 key = assumptions_key(origin, bindings);
     for (const VariantEntry& e : variant_table())
-        if (e.key == key) return e.fid;
+        if (e.key == key) {
+            if (changed) *changed = true;
+            return e.fid;
+        }
 
     if (b.max_variants_per_fn == 0) return kNoFn;
     u32 per_fn = 0;
@@ -872,7 +882,11 @@ FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
         const FunctionGraph* v = mod.find_fn(e.fid);
         if (v) total_nodes += v->g.live_count();
     }
-    if (per_fn >= b.max_variants_per_fn) return kNoFn;
+    // The cap counts ladder positions; a caller that retires a rung's calls
+    // in the same action may spend its slot (see pe.h — the weakened rung
+    // replaces the retired one, so per-SITE width is unchanged). The
+    // allowance is additive: up to extra_slots variants beyond the cap.
+    if (per_fn >= b.max_variants_per_fn + extra_slots) return kNoFn;
     if (total_nodes >= b.total_nodes) return kNoFn;
 
     // benefit gate: something must become compile-time

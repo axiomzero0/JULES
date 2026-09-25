@@ -1,0 +1,39 @@
+// Pass 73 (GuardWeakening): warm2(c, x) is called with c = i % 5 (a
+// narrow [0,4] hull -> the Range rung; the range folds the c > 4 branch,
+// so the first prefix is beneficial) and x sticky 3 with misses at 4
+// (191 of 200 >= 95% -> the Const rung; the param-sorted assumption set
+// is [Range c, Const x] — x's binding is LAST, the sound rewrite shape).
+// Pass 91 emits the Eq rung x == 3; pass 73 weakens it to x in [3,4]
+// (the hull around the sticky value), so the 4-invocations stop falling
+// to the [Range c] rung. The output must match the plain build exactly:
+// the widened variant only picks specializations, never semantics.
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    return v * 1;
+}
+
+fn warm2(c: i64, x: i64) -> i64 {
+    var r: i64 = x + c;
+    if c > 4 {
+        r = 0; // never taken inside the [0,4] hull; the Range rung folds it
+    }
+    if x < 3 {
+        return x * c + 2;
+    }
+    return r;
+}
+
+fn main() -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 200 {
+        var x = opaque(3);
+        if i >= 191 {
+            x = opaque(4);
+        }
+        s = s + warm2(i % 5, x);
+        i = i + 1;
+    }
+    print(s); // 1009
+    return 0;
+}

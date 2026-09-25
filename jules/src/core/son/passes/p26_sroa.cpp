@@ -161,7 +161,13 @@ private:
         }
         if (const NodeId* m = memo_.find(mem)) return *m == kNoNode ? kNoNode : *m;
 
-        const Node& mv = g_.node(mem);
+        // VALUE snapshot (not a reference): the Phi case below CREATES
+        // nodes (g_.make), which grows — and may reallocate — the graph's
+        // node storage; reading mv.in[...] after that is a use-after-free
+        // (found by ASAN on the t55 instrument build; the release build
+        // read freed-but-intact memory and happened to be correct — the
+        // same dangling-reference class as the p73 round).
+        const Node mv = g_.node(mem);
         switch (mv.op) {
             case Op::Alloc:
                 if (mem == alloc) {

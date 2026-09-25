@@ -1,0 +1,37 @@
+// Pass 74 (GuardMerging): TWO call sites with the SAME loop-invariant
+// guarded argument (x, sticky 3) inside one loop. Pass 91 gives each call
+// its own x==3 ladder (the dedup fix lets same-key sites share variants);
+// pass 72 versions the loop on the FIRST ladder's guard and const-resolves
+// only that one (plus its clone) — the second ladder's guard and its clone
+// stay dynamic. Pass 74 then arm-resolves them: the original-side guard
+// sits under the hoisted guard's FALSE arm (x != 3 there) and the
+// clone-side guard under its TRUE arm (x == 3), so both re-checks collapse
+// to constants and the cleanup sweep's SCCP prunes their dead rungs.
+// The loop bound is a runtime value (opaque) so the static/PGO unrollers
+// leave the body at one iteration — eight ladders would blow the
+// versioner's 200-node body budget and the t56 shape would never fire.
+#[no_inline]
+fn opaque(v: i64) -> i64 {
+    return v * 1;
+}
+
+fn hot(x: i64, c: i64) -> i64 {
+    if x < 3 {
+        return x * c + 1;
+    }
+    return x - c;
+}
+
+fn main() -> i64 {
+    let x = opaque(3); // runtime value, pinned before the loop
+    let n = opaque(100); // runtime bound: the unrollers keep the body single
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + hot(x, i);      // ladder 1: guard x == 3
+        s = s + hot(x, i + 1);  // ladder 2: SAME key (same SSA value)
+        i = i + 1;
+    }
+    print(s); // -9400
+    return 0;
+}

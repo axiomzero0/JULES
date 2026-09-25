@@ -188,9 +188,13 @@ bool PassManager::run() {
         // same way.
         // 74 runs post-inline per its own file contract: pass 91 creates
         // the guard sites in the LAST SoN slot, and the cleanup sweep at
-        // the SoN/Linear boundary is where the merger's detection sees
-        // them (its rewrite remains deferred — see the pass file).
-        static const int kCleanupOrders[] = {26, 30, 23, 24, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58, 74};
+        // the SoN/Linear boundary is where the merger sees them. It sits
+        // BEFORE the folding set so the SAME round's SCCP performs the
+        // arm-split elimination for the guards 74 const-resolves — the
+        // single-round sweep levels (-Os; the spec family is Off at -O1)
+        // must not carry resolved-but-unpruned guards into the linearizer
+        // (verifier: dead predecessors).
+        static const int kCleanupOrders[] = {26, 30, 23, 24, 74, 1, 2, 3, 7, 8, 9, 44, 42, 54, 58};
         for (u32 r = 0; r < rounds; ++r) {
             std::vector<Pass*> again = PassRegistry::instance().create_all();
             FlatMap<int, Pass*> by_order;

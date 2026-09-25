@@ -12,17 +12,23 @@
 //          L  resolves G to Const(false)                     (generic rung)
 //          both exits merge at a new Region with phis for the live-outs.
 //
-// STATUS: detection live, rewrite gated. The versioner (clone, guard
-// resolution, exit merge) is implemented and exercised under
-// JULES_GUARD_HOIST=1, but the const-resolved ladders leave dead
-// predecessors in the ladder's merge Regions that the cleanup sweep's
-// SCCP/DNE does not prune in this shape — the same arm-split-elimination
-// surgery pass 74's header documents as the deferred rewrite (found by
-// the t41 JIT round; the resolution-side rewrite lands with it). The
-// default mode DETECTS the hoistable guard set (pure condition cone with
-// leaves pinned outside the loop, ladder contained in the loop) and
-// reports the count through --stats — the same proof-count contract
-// pass 74 ships under.
+// The const-resolved ladders are then pruned by the cleanup sweep's SCCP
+// (kill the dead projection, trim the merge preds, realign the phis,
+// cascade the dead rung) — the arm-split elimination. The versioner's
+// wiring contract: the clone's pin slots deferral-remap exactly like
+// value slots (a forward-referencing block clone must not stay wired
+// into the original loop), and the exit merge keeps its OWN pred slots
+// (the after-loop re-pin walk must skip it — re-pointing them created a
+// self-loop). The live-out set includes the HEADER PHIS: they are the
+// loop-carried state post-loop code reads (dominance forbids body defs
+// from escaping), and every merge phi pairs the original's def with the
+// clone's on the two exit edges.
+//
+// Both fixed-shape hazards found by the t48 round: the resolved-false
+// guard's dead true-arm met the OPTIMISTIC loop-entry IV value through
+// its range guards and turned them "executable" (SCCP now gates the If
+// arm marking on the If's OWN block executability — the classic rule
+// that instructions only evaluate in executable blocks).
 #include "core/son/passes/pass_utils.h"
 
 #include <algorithm>
@@ -141,6 +147,17 @@ struct LoopVersioner {
         NodeId ins[kMaxInputs];
         ins[0] = pin;
         size_t mark = deferred.size(); // records pushed by THIS clone
+        // The pin slot follows the SAME deferral protocol as the value
+        // slots (the pre-pass comment's contract, now actually true): the
+        // pre-pass pins If clones at their ORIGINAL block, and a forward
+        // block reference (a Jump/Region clone whose pred sweep has not
+        // run yet) remaps to itself — both must patch onto the clone in
+        // the post-sweep pass. Without this, every cloned control node
+        // stays wired into the ORIGINAL loop (observed on t48: verifier
+        // "dead predecessor" cascade + wrong-code at the default -O2).
+        if (un.in[0] != kNoNode && ins[0] == un.in[0] &&
+            in_body->contains(un.in[0]))
+            deferred.push_back(Deferred{0, 0, un.in[0]});
         for (u8 i = 1; i < un.n_in; ++i) {
             NodeId o = un.in[i];
             ins[i] = remap(o);
@@ -167,9 +184,16 @@ struct LoopVersioner {
             Node un = g.node(u); // copy: make_arr reallocs
             if (un.in[0] != old_blk) continue;
             // heads (Jump/projections) are cloned via blkmap in the sweep;
-            // Ifs ARE block contents (their projections are the blocks)
+            // Ifs ARE block contents — but the PRE-PASS already cloned
+            // every If pinned at a loop block (they sit in vmap as KEYS,
+            // so originals are skipped above). The only Ifs reaching this
+            // point are the PRE-PASS CLONES THEMSELVES, still pinned at
+            // their original block until the deferred patch — cloning them
+            // again produced kFlagGuardSite-carrying orphans that p74
+            // would resolve pointlessly (31-a review finding F2).
             if (un.op == Op::Jump || un.op == Op::IfTrue ||
-                un.op == Op::IfFalse || un.op == Op::Region)
+                un.op == Op::IfFalse || un.op == Op::Region ||
+                un.op == Op::If)
                 continue;
             // Phis included: a join phi inside the body remaps uniformly
             // (region input = the cloned block; value inputs remap with
@@ -197,23 +221,19 @@ public:
                AnalysisKind::AliasInfo | AnalysisKind::MemDep |
                AnalysisKind::CallGraph;
     }
+    ModeMask modes() const override {
+        // The versioner duplicates the whole loop — the same cloning cost
+        // class as the ladder creator (91) whose guards it hoists. The
+        // baseline JIT tier must not pay for speculation machinery.
+        return kModeAOT | kModeJitOptimizing;
+    }
     bool run(PassContext& ctx) override {
         bool changed = false;
-        bool execute = std::getenv("JULES_GUARD_HOIST") != nullptr;
         for (FunctionGraph& fg : ctx.mod.fns) {
             for (int round = 0; round < 4; ++round) {
                 auto li = LoopInfo::compute(fg.g, ctx.analysis.doms(fg));
                 bool this_round = false;
                 for (const Loop& l : li->loops()) {
-                    if (!execute) {
-                        // detection: count the hoistable guards (reported
-                        // through --stats like pass 74's proof counts)
-                        if (detect_one(fg, *li, l)) {
-                            changed = true;
-                            detected_ += 1;
-                        }
-                        continue;
-                    }
                     if (hoist_one(fg, *li, l)) {
                         this_round = true;
                         break; // CFG changed: recompute
@@ -227,46 +247,6 @@ public:
     }
 
 private:
-    u32 detected_ = 0; // telemetry: hoistable guard sites (detection mode)
-
-    // Detection: does this loop contain a hoistable guard (pure cone,
-    // leaves pinned outside, ladder contained)? Mirrors hoist_one's gate
-    // set without any rewrite.
-    static bool detect_one(FunctionGraph& fg, LoopInfo& /*li*/, const Loop& l) {
-        Graph& g = fg.g;
-        FlatMap<NodeId, bool> in_loop;
-        for (NodeId blk : l.blocks) in_loop.insert(blk, true);
-        for (NodeId blk : l.blocks) {
-            for (NodeId u : g.uses_of(blk)) {
-                Node un = g.node(u);
-                if (un.op == Op::Dead) continue;
-                if (un.op != Op::If || (un.flags & kFlagGuardSite) == 0 ||
-                    un.in[0] != blk)
-                    continue;
-                if (un.n_in < 2 || g.node(un.in[1]).op != Op::Cmp) continue;
-                bool inv = true;
-                std::vector<NodeId> probe;
-                std::vector<NodeId> work{un.in[1]};
-                while (!work.empty()) {
-                    NodeId n = work.back();
-                    work.pop_back();
-                    const Node& nn = g.node(n);
-                    NodeId pin = nn.n_in > 0 ? nn.in[0] : kNoNode;
-                    if (pin == kNoNode || !in_loop.contains(pin)) continue;
-                    if (!cone_pure_op(nn.op)) {
-                        inv = false;
-                        break;
-                    }
-                    probe.push_back(n);
-                    for (u8 k = 1; k < nn.n_in; ++k)
-                        if (nn.in[k] != kNoNode) work.push_back(nn.in[k]);
-                }
-                if (inv && !probe.empty()) return true;
-            }
-        }
-        return false;
-    }
-
     static bool hoist_one(FunctionGraph& fg, LoopInfo& li, const Loop& l) {
         Graph& g = fg.g;
         (void)fg;
@@ -425,7 +405,13 @@ private:
             for (NodeId u : g.uses_of(blk)) {
                 Node un = g.node(u);
                 if (un.in[0] != blk) continue;
-                if (is_control_op(un.op) || un.op == Op::Phi) continue;
+                if (is_control_op(un.op)) continue;
+                // Phis ARE live-out candidates — the HEADER phis are the
+                // loop-carried state, and they are exactly what post-loop
+                // code reads (dominance forbids reading body defs after
+                // the loop: the exit path skips the body). Excluding them
+                // left `print(s)` reading the ORIGINAL loop's phi on the
+                // clone path — stale stack state, wrong output (t48).
                 for (NodeId w : g.uses_of(u)) {
                     Node wn = g.node(w);
                     if (wn.op == Op::Dead) continue;
@@ -472,6 +458,11 @@ private:
                 v.vmap.insert(u, c);
             }
         }
+        // Invariant proven by the pre-pass above: loop_if is an If pinned
+        // at a loop block (checked at discovery), so its clone exists NOW —
+        // no structural edit has happened yet. The exit merge below depends
+        // on it; bailing after the sweep would strand a half-versioned graph.
+        if (!v.vmap.contains(loop_if)) return false;
 
         // header clone: Region entered from T2; latch pred patched after
         u8 latch_slot = entry_slot == 0 ? 1 : 0;
@@ -544,7 +535,8 @@ private:
         // ---- exit merge: Region + live-out phis + after-loop re-pins ----
         const NodeId* lif_c = v.vmap.find(loop_if);
         if (!lif_c) {
- return false; }
+            return false; // unreachable: the invariant check above
+        }
         NodeId exit2 = g.make(g.node(exit_proj).op, ty_ctrl(), {*lif_c});
         NodeId r;
         {
@@ -572,10 +564,14 @@ private:
             }
         }
         // after-loop code pinned at exit_proj moves to R (control first:
-        // data re-pins must not orphan the use list being walked)
+        // data re-pins must not orphan the use list being walked). R ITSELF
+        // is a Region user of exit_proj — skipping it keeps its own pred
+        // slots intact (re-pointing them to R created a self-loop,
+        // observed as n201: Region in=[n201, n200]).
         {
             const SmallVec<NodeId, 4> users = g.uses_of(exit_proj);
             for (NodeId u : users) {
+                if (u == r) continue; // R's own pred slots are structural
                 Node un = g.node(u);
                 if (un.op == Op::Dead) continue;
                 if (un.op == Op::Jump || un.op == Op::If || un.op == Op::Return) {

@@ -540,6 +540,83 @@ else
     pass=$((pass + 1))
 fi
 
+# ---- guard-family rewrite round (2026-09-25): the arm-split surgery ----
+# p72's versioner is DEFAULT-ON now, so t48/t49's PGO round-trips above
+# already exercise it end-to-end (outputs asserted there). t55/t56 below
+# lock the two newly-ungated rewrites:
+#   * t55 (p73 rewrite): the [Range c, Const x] shape — x's binding LAST,
+#     the sound single-rung arm. The use build must REPORT the weakening
+#     (changes = the restructure, not just detection) and survive the
+#     round-trip.
+run_pgo_test t55_gweak GuardWeakening
+#   * t56 (p74 rewrite): two same-key ladders in one loop — pass 72
+#     version-resolves only the first; the use build's GuardMerging must
+#     resolve the leftover + its clone (changes > 0). The versioner is
+#     part of the chain (it creates the arm domination), so its activity
+#     is asserted on the SAME use build.
+run_pgo_test t56_gmerge PartialDeoptimization
+p72t56=$(timeout 30 $JULESC --pgo=use="$WORK/t56_gmerge_pgo/jules.prof" --stats tests/programs/t56_gmerge.jules -o "$WORK/p72t56.bin" 2>/dev/null |
+          awk -v p="GuardHoisting" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$p72t56" ] || [ "$p72t56" = "0" ]; then
+    echo "FAIL t56_gmerge (GuardHoisting never versioned — the merge shape needs it)"
+    fail=$((fail + 1))
+else
+    echo "PASS t56_gmerge [GuardHoisting changes=$p72t56 in the merge flow]"
+    pass=$((pass + 1))
+fi
+p74stats=$(timeout 30 $JULESC --pgo=use="$WORK/t56_gmerge_pgo/jules.prof" --stats tests/programs/t56_gmerge.jules -o "$WORK/p74.bin" 2>/dev/null |
+           awk -v p="GuardMerging" '$2 == p {v += $4} END {print v + 0}')
+if [ -z "$p74stats" ] || [ "$p74stats" = "0" ]; then
+    echo "FAIL t56_gmerge (GuardMerging resolved nothing)"
+    fail=$((fail + 1))
+else
+    echo "PASS t56_gmerge [GuardMerging resolved=$p74stats]"
+    pass=$((pass + 1))
+fi
+#   * kill-switch isolation for the rewrites. GuardHoisting is exercised
+#     by the plain t48 build (no PGO needed — the versioner fires without
+#     a profile); GuardWeakening/GuardMerging only run under --pgo=use,
+#     so their disabled-config checks consume the PGO flow's profile or
+#     they would be vacuous (the pass is inert in plain builds — 31-c
+#     finding).
+ks_plain() {
+    local tname=$1 pname=$2
+    if ! timeout 30 $JULESC --disable "$pname" "tests/programs/${tname}.jules" -o "$WORK/ks_${tname}.bin" > /dev/null 2>&1; then
+        echo "FAIL $tname (--disable $pname compile)"
+        fail=$((fail + 1))
+        return
+    fi
+    timeout 30 "$WORK/ks_${tname}.bin" > "$WORK/ks_${tname}.out" 2>&1
+    if ! diff -q "tests/expected/${tname}.txt" "$WORK/ks_${tname}.out" > /dev/null 2>&1; then
+        echo "FAIL $tname (--disable $pname output)"
+        fail=$((fail + 1))
+    else
+        echo "PASS $tname [$pname disabled, output intact]"
+        pass=$((pass + 1))
+    fi
+}
+ks_pgo() {
+    local tname=$1 pname=$2
+    local prof="$WORK/${tname}_pgo/jules.prof"
+    if ! timeout 30 $JULESC --pgo=use="$prof" --disable "$pname" "tests/programs/${tname}.jules" -o "$WORK/ks_${tname}.bin" > /dev/null 2>&1; then
+        echo "FAIL $tname (--disable $pname pgo compile)"
+        fail=$((fail + 1))
+        return
+    fi
+    timeout 30 "$WORK/ks_${tname}.bin" > "$WORK/ks_${tname}.out" 2>&1
+    if ! diff -q "tests/expected/${tname}.txt" "$WORK/ks_${tname}.out" > /dev/null 2>&1; then
+        echo "FAIL $tname (--disable $pname pgo output)"
+        fail=$((fail + 1))
+    else
+        echo "PASS $tname [$pname disabled under --pgo=use, output intact]"
+        pass=$((pass + 1))
+    fi
+}
+ks_plain t48_guardhoist GuardHoisting
+ks_pgo t55_gweak GuardWeakening
+ks_pgo t56_gmerge GuardMerging
+ks_pgo t56_gmerge GuardHoisting
+
 # p35 (MaterializationPointInsertion): the JIT-mode deopt manifest carries
 # the sunk allocation's materialization recipe.
 if [ -d "$WORK/p35run" ]; then rm -rf "$WORK/p35run"; fi

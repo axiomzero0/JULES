@@ -87,10 +87,22 @@ bool pe_fold(Graph& g, u32 round_limit,
 // budgets (level-tied), dedups against previously created variants, and
 // appends the accepted variant to the module. Returns the variant's FnId,
 // or kNoFn when rejected (no benefit / budget / duplicate of the origin).
-// `changed` (optional) reports whether the fold rewrote anything.
+// `changed` (optional) reports whether a usable VARIANT materialized —
+// created fresh OR reused via the exact-assumption-set dedup (identical
+// binding sets across call sites share one variant; the fold telemetry
+// of a reused variant belongs to its creation, not the reuse).
+//
+// `extra_slots` (default 0): additional ladder-width slots the caller has
+// ALREADY retired in the same action — the per-fn cap becomes
+// (existing + extra) < max_variants_per_fn. Contract: only a caller that
+// kills an existing rung's calls for this origin in the same rewrite may
+// spend its slot (the weakened rung REPLACES the retired one's ladder
+// position, so the ladder width per call site is unchanged). Termination
+// holds: pass 73 weakens each site at most once per run and the global
+// node budget still bounds the total.
 FnId pe_make_variant(Module& mod, SymbolTable& syms, FnId origin,
                      const std::vector<PeAssumption>& bindings, const PeBudgets& b,
-                     bool* changed = nullptr);
+                     bool* changed = nullptr, u32 extra_slots = 0);
 
 // Re-derive the variant's assumptions (empty = not a PE variant).
 const std::vector<PeAssumption>* pe_variant_assumptions(FnId fid);
