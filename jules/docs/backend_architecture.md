@@ -368,8 +368,15 @@ proves it), once-per-window seeds with replay only on non-stale pops, flat
 open-addressing dedup, fingerprints carried by queue entries. Measured on
 the throughput kernel with identical exploration (same pop/construction
 counts, same results): pops 0.23M -> 1.09M/sec, constructions 0.64M ->
-3.07M/sec, wall 5.16s -> 1.09s (4.75x). The remaining levers, in order:
-SIMD lane simulation (12 lanes fit 2 zmm vectors per location),
+3.07M/sec, wall 5.16s -> 1.09s (4.75x). SIMD lane simulation LANDED (2026-09-26): the sims and the fold
+exist in scalar/avx2/avx512 encodings (JULES_SUPEROPT_SIM selects;
+auto-detects), verified byte-identical by the runner's lane-mode
+differential lock and a TU-level differential fuzzer against the
+pre-SIMD closures. Default-budget rates: pops 0.96M -> 1.25M/sec,
+constructions 3.64M -> 4.75M/sec (+30%, mostly the location-major state
+layout; the vector encodings add ~7% because the core is
+journal/dedup-table-bound, not sim-bound). The remaining levers, in
+order: journal/table traffic (the now-dominant cost),
 lane-count-adaptive verification for the JIT path, and window-level
 parallelism for AOT.
 

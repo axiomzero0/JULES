@@ -24,11 +24,9 @@ public:
         // verdicts over every loop with packed bodies
         for (const Loop& l : li_.loops()) {
             bool has_packed = false;
-            NodeId iv = kNoNode;
             for (NodeId u : g_.uses_of(l.header)) {
                 if (g_.is_dead(u)) continue;
                 if (ty_is_vector(g_.node(u).ty)) { has_packed = true; }
-                if (g_.node(u).op == Op::Phi && g_.node(u).ty == ty_i64()) iv = u;
             }
             if (!has_packed) continue;
             ++vector_loops_;

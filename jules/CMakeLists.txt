@@ -17,8 +17,10 @@ else ()
     message(WARNING "C++26 unavailable; falling back to C++23")
 endif ()
 
-# Project laws: no exceptions, no RTTI in the compiler itself.
-add_compile_options(-fno-exceptions -fno-rtti -Wall -Wextra)
+# Project laws: no exceptions, no RTTI in the compiler itself;
+# warnings are ERRORS — a warning is a defect, never noise to be
+# filtered or suppressed (engineering standard).
+add_compile_options(-fno-exceptions -fno-rtti -Wall -Wextra -Werror)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
 

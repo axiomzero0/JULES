@@ -312,6 +312,42 @@ else
     echo "SKIP t_superopt [tier-4: no z3 binary on PATH]"
 fi
 
+# SIMD lane-mode DIFFERENTIAL LOCK (the round's core invariant): the
+# simulation closures exist in a scalar reference encoding plus SIMD
+# encodings (avx2/avx512), selected by JULES_SUPEROPT_SIM. Every
+# supported mode must compile t_super_tput to a BYTE-IDENTICAL binary —
+# the fingerprints, dedup, goal tests and winners are mode-independent
+# by construction; any divergence is a soundness bug in an encoding.
+# Modes the CPU cannot execute are skipped (the override would SIGILL).
+sim_modes="scalar"
+if grep -q ' avx2 ' /proc/cpuinfo 2>/dev/null; then sim_modes="$sim_modes avx2"; fi
+# avx512 needs f+dq+bw — the fold's vpmullq is DQ; the gate mirrors
+# lane_mode()'s own requirement (avx512f alone would SIGILL)
+if grep -q ' avx512f ' /proc/cpuinfo 2>/dev/null && \
+   grep -q ' avx512dq ' /proc/cpuinfo 2>/dev/null && \
+   grep -q ' avx512bw ' /proc/cpuinfo 2>/dev/null; then sim_modes="$sim_modes avx512"; fi
+sim_ok=1
+sim_ref=""
+for m in $sim_modes; do
+    JULES_SUPEROPT_SIM=$m timeout 60 $JULESC -O3 "tests/programs/t_super_tput.jules" \
+        -o "$WORK/sim_$m.bin" 2>"$WORK/sim_$m.log" || sim_ok=0
+    if [ ! -s "$WORK/sim_$m.bin" ]; then sim_ok=0; fi
+done
+if [ "$sim_ok" = "1" ]; then
+    sim_ref=$(md5sum "$WORK/sim_scalar.bin" | cut -d' ' -f1)
+    for m in $sim_modes; do
+        h=$(md5sum "$WORK/sim_$m.bin" | cut -d' ' -f1)
+        [ "$h" = "$sim_ref" ] || sim_ok=0
+    done
+fi
+if [ "$sim_ok" = "1" ]; then
+    echo "PASS t_super_tput [lane-mode differential lock: $sim_modes byte-identical]"
+    pass=$((pass + 1))
+else
+    echo "FAIL t_super_tput [lane modes diverged: $sim_modes]"
+    fail=$((fail + 1))
+fi
+
 # PGO round-trip (pass 43): instrument -> run (writes jules.prof) -> use.
 # Asserts: the instrumented binary's output is UNCHANGED (instrumentation
 # must not alter semantics), the profile exists and is non-trivial, the

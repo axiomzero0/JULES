@@ -18,7 +18,7 @@ if [ -z "$STD" ]; then
 fi
 echo "building julesc with $CXX $STD"
 
-FLAGS="$STD -fno-exceptions -fno-rtti -O2 -Wall -Wextra -Isrc"
+FLAGS="$STD -fno-exceptions -fno-rtti -O2 -Wall -Wextra -Werror -Isrc"
 mkdir -p build/obj
 
 mapfile -t SOURCES < <(grep -o 'src/[^ ]*\.cpp' sources.cmake | sort)

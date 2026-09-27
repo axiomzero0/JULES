@@ -3,8 +3,8 @@
 // Top-down vectorization of counted loops with contiguous unit-stride array
 // accesses (SSE2 128-bit baseline: 2 lanes x 8B, 4 lanes x 4B):
 //
-//   [preheader] --guard(bound >= VF)--> [vector loop] --exit--\
-//        \----- guard false --------------------------------> [merge]
+//   [preheader] --guard(bound >= VF)--> [vector loop] --exit--> [merge]
+//        \----- guard false -------------------------------> [merge]
 //   vector loop: k = 0..nv (nv = bound / VF), one packed iteration
 //   computes VF scalar iterations of the ORIGINAL body.
 //   [merge] feeds the ORIGINAL loop, which stays intact as the scalar

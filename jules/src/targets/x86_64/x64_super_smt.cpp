@@ -778,14 +778,14 @@ bool x64_super_smt_selftest(const superopt::Tier4Query& q) {
     for (u32 g = 0; g < kMaxGpr; ++g)
         if ((q.livein_gpr >> g) & 1)
             binds += " (= X_R" + std::to_string(g) + " " +
-                     hex64(static_cast<u64>(q.seed->r[0][g])) + ")";
+                     hex64(static_cast<u64>(q.seed->r[g][0])) + ")";
     for (u32 k = 0; k < q.nslots; ++k)
         if ((q.livein_slots >> k) & 1)
             binds += " (= X_S" + std::to_string(k) + " " +
-                     hex64(static_cast<u64>(q.seed->s[0][k])) + ")";
+                     hex64(static_cast<u64>(q.seed->s[k][0])) + ")";
     for (u32 fi = 0; fi < kNF; ++fi)
         binds += " (= X_F" + std::to_string(fi) + " " +
-                 hex64(static_cast<u64>(q.seed->f[0][fi])) + ")";
+                 hex64(static_cast<u64>(q.seed->f[fi][0])) + ")";
     for (const auto& pr : O.poisons)
         binds += " (= " + pr.first + " " +
                  hex64(sm_poison_lane(0, pr.second)) + ")";
@@ -796,17 +796,17 @@ bool x64_super_smt_selftest(const superopt::Tier4Query& q) {
     for (u32 g = 0; g < kMaxGpr; ++g)
         if ((q.contract_gpr >> g) & 1) {
             names.push_back(O.r[g]);
-            expect.push_back(static_cast<u64>(q.orig_final->r[0][g]));
+            expect.push_back(static_cast<u64>(q.orig_final->r[g][0]));
         }
     for (u32 k = 0; k < q.nslots; ++k)
         if ((q.contract_slots >> k) & 1) {
             names.push_back(O.s[k]);
-            expect.push_back(static_cast<u64>(q.orig_final->s[0][k]));
+            expect.push_back(static_cast<u64>(q.orig_final->s[k][0]));
         }
     if (q.contract_flags)
         for (u32 fi = 0; fi < kNF; ++fi) {
             names.push_back(O.f[fi]);
-            expect.push_back(static_cast<u64>(q.orig_final->f[0][fi]));
+            expect.push_back(static_cast<u64>(q.orig_final->f[fi][0]));
         }
 
     std::string smt = "(set-logic QF_BV)\n";

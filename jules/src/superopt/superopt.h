@@ -60,6 +60,7 @@
 #include "core/codegen/linear.h"
 
 #include <array>
+#include <cstddef>
 #include <vector>
 
 namespace jules::superopt {
@@ -68,17 +69,55 @@ namespace jules::superopt {
 constexpr u32 kMaxGpr = 15;     // rax..r15 (rbp/rsp are never window operands)
 constexpr u32 kMaxSlot = 6;     // slots a window may touch
 constexpr u32 kNF = 5;         // ZF SF OF CF PF
-constexpr u32 kVecSearch = 12;  // test vectors per batch (search + verify
+constexpr u32 kVecSearch = 12;  // REAL test lanes per batch (search + verify
                                  // lanes; see the honesty note in .h §4)
+constexpr u32 kVecPad = 16;    // storage STRIDE: lanes [kVecSearch, kVecPad)
+                                 // are SIMD padding. They are never read
+                                 // semantically (every consumer loops
+                                 // v < kVecSearch) and never folded (the
+                                 // Zobrist pad lanes are zero and the vector
+                                 // fold masks them PER BLOCK, so 16-lane
+                                 // vector folds equal the 12-lane scalar
+                                 // folds exactly). PAD UNIFORMITY: every
+                                 // lane-writer in the ISA closures is
+                                 // lane-uniform and the pad lanes seed as
+                                 // zero, so pads hold ONE value per location;
+                                 // the fold masking is what keeps pads OUT
+                                 // of the fingerprint — they are NOT free
+                                 // scratch.
+static_assert(kVecPad >= kVecSearch, "padding must cover the real lanes");
+static_assert(kVecPad % 8 == 0, "padding must hold whole zmm blocks");
 
-// One concrete machine state: per-vector values for every modeled location.
+// One concrete machine state: per-vector values for every modeled location,
+// LOCATION-MAJOR (all lanes of one location contiguous — the layout SIMD
+// needs; the lane-major predecessor made every per-lane step a 120-byte
+// stride and defeated the vector fold).
 // Flag lanes may hold POISON values (undefined-flag writes) which simply
 // never compare equal to anything sane.
-struct VState {
-    i64 r[kVecSearch][kMaxGpr];
-    i64 s[kVecSearch][kMaxSlot];
-    i64 f[kVecSearch][kNF];
+struct alignas(64) VState {
+    i64 r[kMaxGpr][kVecPad];
+    i64 s[kMaxSlot][kVecPad];
+    i64 f[kNF][kVecPad];
 };
+// ALIGNMENT CONTRACT: the simulation closures and the fold vector-load
+// whole rows of r/s/f (the C++ vector types claim natural alignment, so
+// GCC emits aligned zmm/ymm moves). Every row must therefore start at a
+// multiple of the widest vector width: rows are 128B strided from a
+// 64B-aligned base — r at 0, s at 15*128, f at 21*128. These asserts make
+// any future layout change that breaks the invariant unbuildable.
+static_assert(offsetof(VState, r) % 64 == 0 &&
+              offsetof(VState, s) % 64 == 0 &&
+              offsetof(VState, f) % 64 == 0,
+              "VState vector rows must be 64B-aligned");
+
+// ---- lane execution mode --------------------------------------------------
+// The simulation closures and the fingerprint fold exist in one SCALAR
+// encoding (the reference) plus SIMD encodings over the padded lanes,
+// selected once per process: auto = best the CPU offers, overridable for
+// the differential lock (JULES_SUPEROPT_SIM=scalar|avx2|avx512) that
+// proves the encodings byte-identical on real programs.
+enum class LaneMode { Scalar, Avx2, Avx512 };
+LaneMode lane_mode();
 
 // Liveness/read-write effects of one concrete Inst. Produced by the ISA
 // table; consumed by the liveness dataflow and the definedness rule.

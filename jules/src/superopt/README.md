@@ -150,11 +150,73 @@ every in-place simulation and after every restore, and against the
 replayed state at every pop — proving the journal covers exactly what the
 sims write. The full suite passes in audit mode too.
 
-Remaining levers toward the throughput targets (documented, in order):
-SIMD lanes for the sims and the fold terms (12 lanes = 2 zmm vectors per
-location — the closures are ready to vectorize), lane-count-adaptive
-verification strength for the JIT path, and window-level parallelism for
-AOT (windows are already independent search problems).
+### SIMD lane execution (the 2026-09-26 round)
+
+The simulation closures and the fingerprint fold now exist in multiple
+LANE ENCODINGS selected once per process (`JULES_SUPEROPT_SIM=scalar |
+avx2 | avx512`, auto = best the CPU offers): one generic closure body
+per opcode compiles three ways — the scalar reference is a ONE-ELEMENT
+vector (`vector_size(8)`, ABI-stable, which makes the comparison
+operators uniform: `a == b` yields ALL-ONES/0 masks at every width),
+plus target-attributed AVX2/AVX-512 forwarders (real ymm/zmm codegen).
+The 12 real lanes ride 16 padded lanes (2 zmm/location); pad lanes are
+masked at the fold and never read semantically and masked per block at the fold, so the search —
+fingerprints, dedup, goal tests, winners — is BIT-IDENTICAL across
+modes: the runner's lane-mode differential lock compiles the throughput
+kernel in every supported mode and asserts byte-identical binaries
+(`t_super_tput`, suite 631).
+
+Two disciplines make the layer sound and warning-free (`-Werror`
+everywhere now — build.sh, CMakeLists, all local build scripts):
+
+- **SIGNATURE DISCIPLINE**: a vector value never crosses a function
+  signature by value — not as a parameter, not as a return, not even in
+  a lambda. By-value vectors are an ABI construct (their register
+  convention depends on the target ISA; GCC's `-Wpsabi` is fatal), and
+  internal helpers have no ABI. Every helper exchanges vectors by
+  reference; `always_inline` SROA-erases the indirection.
+- **ALIGNMENT CONTRACT**: GCC emits ALIGNED vector moves for
+  reinterpret_cast loads (the vector types claim natural alignment), so
+  every vector-loaded row must be genuinely aligned: `VState` rows at
+  offsets 0/1920/2688 of the `alignas(64)` struct; the `Journal`
+  re-ordered rows-first (the first layout put control words first and
+  every avx512 fold faulted on the offset-24 rows); `Zobrist` and the
+  poison table `alignas(64)`. `static_assert`s on the offsets make a
+  violating layout unbuildable.
+
+The rewrite was verified by a TU-level DIFFERENTIAL FUZZER (old scalar
+closures vs new closures over ~24k random instruction/state pairs,
+comparing every location, fault results, and effects): it caught SIX
+latent divergences the binary-level lock had missed (a misplaced `~` in
+the add-overflow flag that made OF always 1; 32-bit SAR filling from bit
+63 instead of the sign-extended low half; an absent-slot compare reading
+the register; movzx byte-merging instead of replacing the register; the
+arithmetic condition masks yielding 0/1 instead of all-ones; and
+32-bit cmov truncating false lanes — hardware does not write at all when
+the condition fails). All six are fixed; the fuzzer now reports zero
+divergences, and exploration counts match the pre-SIMD engine exactly
+(611,589 pops / 1,481,393 constructions / 1,013,723 simulations on the
+elevated-budget kernel, byte-identical output).
+
+Honest throughput accounting (default budgets — the real -O3 pipeline
+config; elevated budgets are memory-bound in the dedup tables and
+flatten compute gains):
+
+| metric (default budgets) | old engine | scalar ref (new) | avx512 (new) |
+|--------------------------|-----------|-----------------|--------------|
+| pops/sec | 0.96M | 1.17M | 1.25M |
+| constructions/sec | 3.64M | 4.44M | 4.75M |
+| simulations/sec | 2.15M | 2.62M | 2.81M |
+
+The +30% is real but mostly comes from the location-major state layout
+and the uniform closure bodies (+22% on the scalar reference alone); the
+vector encodings add ~7% because the core is NOT sim-bound anymore: the
+construction loop's dominant costs are the write-set journal's memcpy
+traffic (~1.5KB per flag-writing candidate) and the flat dedup tables.
+The next documented lever is therefore journal/table traffic (narrower
+flag rows, cache-local tables), not more SIMD. Lane-count-adaptive
+verification for the JIT path and window-level parallelism for AOT follow
+after that.
 
 ## Honest limits
 

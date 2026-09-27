@@ -3,6 +3,7 @@
 #include "superopt.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <queue>
@@ -67,23 +68,31 @@ void seed_state(VState& st, u32 batch, u32 nslots, const i64* imms, u32 nims) {
         if (v >= kSweepLanes && nims) {
             // constant-sweep lane: one window constant everywhere
             i64 c = imms[(v - kSweepLanes) % nims];
-            for (u32 g = 0; g < kMaxGpr; ++g) st.r[v][g] = c;
-            for (u32 k = 0; k < kMaxSlot; ++k) st.s[v][k] = c;
-            for (u32 f = 0; f < kNF; ++f) st.f[v][f] = c & 1;
+            for (u32 g = 0; g < kMaxGpr; ++g) st.r[g][v] = c;
+            for (u32 k = 0; k < kMaxSlot; ++k) st.s[k][v] = c;
+            for (u32 f = 0; f < kNF; ++f) st.f[f][v] = c & 1;
             continue;
         }
         for (u32 g = 0; g < kMaxGpr; ++g)
-            st.r[v][g] = static_cast<i64>(splitmix64(
+            st.r[g][v] = static_cast<i64>(splitmix64(
                 splitmix64(static_cast<u64>(lane_base[v % kSweepLanes])) ^
                 (0x9E3779B9ull * (g + 1))));
         for (u32 k = 0; k < kMaxSlot; ++k)
-            st.s[v][k] = k < nslots ? static_cast<i64>(splitmix64(
+            st.s[k][v] = k < nslots ? static_cast<i64>(splitmix64(
                                           splitmix64(static_cast<u64>(lane_base[v % kSweepLanes])) ^
                                           (0x9E3779B9ull * (kMaxGpr + k + 1))))
                                     : 0;
         for (u32 f = 0; f < kNF; ++f)
-            st.f[v][f] = splitmix64(splitmix64(static_cast<u64>(lane_base[v % kSweepLanes])) ^
+            st.f[f][v] = splitmix64(splitmix64(static_cast<u64>(lane_base[v % kSweepLanes])) ^
                                    (0x9E3779B9ull * (kMaxGpr + kMaxSlot + f + 1))) & 1;
+    }
+    // SIMD pad lanes: a deterministic zero base. Nothing semantic reads
+    // them (consumers loop v < kVecSearch) and the vector fold masks them,
+    // but zeroing keeps the pad content mode-independent too.
+    for (u32 v = kVecSearch; v < kVecPad; ++v) {
+        for (u32 g = 0; g < kMaxGpr; ++g) st.r[g][v] = 0;
+        for (u32 k = 0; k < kMaxSlot; ++k) st.s[k][v] = 0;
+        for (u32 f = 0; f < kNF; ++f) st.f[f][v] = 0;
     }
 }
 
@@ -137,13 +146,27 @@ inline u64 term64(u64 z, u64 x) {
     return t ^ (t >> 31);
 }
 
-struct Zobrist {
-    // [position][lane]; positions: kMaxGpr GPRs, kMaxSlot slots, kNF flags
-    u64 z[kMaxGpr + kMaxSlot + kNF][kVecSearch];
+struct alignas(64) Zobrist {
+    // [position][lane]; positions: kMaxGpr GPRs, kMaxSlot slots, kNF flags.
+    // ALIGNMENT CONTRACT: the rows are vector-loaded (zmm claims natural
+    // 64-byte alignment) — the struct must be 64-byte aligned or every
+    // aligned row load faults (#GP). The pad lanes are ZERO by
+    // construction: with the state's pad lanes masked at the fold (per
+    // block), a 16-lane vector fold equals the 12-lane scalar fold
+    // exactly (term64(0, 0) == 0), so the fingerprint — and with it the
+    // whole search — is mode-independent. The splitmix chain over the
+    // REAL lanes is byte-identical to the pre-SIMID chain (12 values per
+    // row, row-major): fingerprints are unchanged from the previous build.
+    u64 z[kMaxGpr + kMaxSlot + kNF][kVecPad];
+    static_assert(sizeof(z[0]) % 64 == 0,
+                  "zobrist rows are vector-loaded: stride must be 64B-aligned");
     Zobrist() {
         u64 s = 0x5DEECE66Dull;
-        for (auto& row : z)
-            for (u64& x : row) x = splitmix64(s = splitmix64(s));
+        for (auto& row : z) {
+            for (u32 v = 0; v < kVecSearch; ++v)
+                row[v] = splitmix64(s = splitmix64(s));
+            for (u32 v = kVecSearch; v < kVecPad; ++v) row[v] = 0;
+        }
     }
 };
 const Zobrist& ztable() {
@@ -156,12 +179,12 @@ u64 fp_full(const VState& st, u32 nslots) {
     u64 h = 0;
     for (u32 v = 0; v < kVecSearch; ++v) {
         for (u32 g = 0; g < kMaxGpr; ++g)
-            h ^= term64(Z.z[g][v], static_cast<u64>(st.r[v][g]));
+            h ^= term64(Z.z[g][v], static_cast<u64>(st.r[g][v]));
         for (u32 k = 0; k < nslots; ++k)
-            h ^= term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[v][k]));
+            h ^= term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[k][v]));
         for (u32 f = 0; f < kNF; ++f)
             h ^= term64(Z.z[kMaxGpr + kMaxSlot + f][v],
-                        static_cast<u64>(st.f[v][f]));
+                        static_cast<u64>(st.f[f][v]));
     }
     return h;
 }
@@ -173,16 +196,29 @@ u64 fp_full(const VState& st, u32 nslots) {
 // write set BEFORE the sim (the set comes from the ISA row's Effects — the
 // same single source the liveness dataflow trusts) and restores it after,
 // keeping the parent pristine for the next construction.
-struct Journal {
+// LAYOUT CONTRACT: the vector rows r/s/f are FIRST — every row's offset
+// must be a multiple of the widest vector width (64B), because the fold
+// loads them with aligned zmm moves (the C++ vector types claim natural
+// alignment; a scalar-fields-first layout put rows at offsets 24/544/680
+// and every avx512 fold faulted — the static_asserts below make that
+// layout unbuildable instead of merely broken).
+struct alignas(64) Journal {
+    i64 r[4][kVecPad];      // full padded rows (the pad lanes round-trip
+                            // too: what save captured is exactly what
+                            // restore writes back)
+    i64 s[kVecPad];
+    i64 f[kNF][kVecPad];
     u32 gr[4];               // written GPR indices (e.g. IDiv/MulHi write 2)
     u32 ngr = 0;
-    i64 r[kVecSearch][4];
     bool slot = false;      // window-local index of a written slot
     u32 slot_idx = 0;
-    i64 s[kVecSearch];
     bool flags = false;     // ANY flag write (defined or undefined-poison)
-    i64 f[kVecSearch][kNF];
 };
+static_assert(sizeof(Journal) % 64 == 0, "journal rows must start 64B-aligned");
+static_assert(offsetof(Journal, r) % 64 == 0 &&
+              offsetof(Journal, s) % 64 == 0 &&
+              offsetof(Journal, f) % 64 == 0,
+              "journal vector rows must be 64B-aligned (fold loads them)");
 
 void journal_save(Journal& j, const VState& st, const Effects& e,
                   const i32* wslots, u32 nslots) {
@@ -201,8 +237,8 @@ void journal_save(Journal& j, const VState& st, const Effects& e,
             }
             j.gr[j.ngr++] = g;
         }
-    for (u32 v = 0; v < kVecSearch; ++v)
-        for (u32 i = 0; i < j.ngr; ++i) j.r[v][i] = st.r[v][j.gr[i]];
+    for (u32 i = 0; i < j.ngr; ++i)
+        std::memcpy(j.r[i], st.r[j.gr[i]], sizeof j.r[i]);
     j.slot = false;
     if (e.slot_write >= 0) {
         for (u32 s = 0; s < nslots; ++s) {
@@ -213,46 +249,164 @@ void journal_save(Journal& j, const VState& st, const Effects& e,
             }
         }
         if (j.slot)
-            for (u32 v = 0; v < kVecSearch; ++v) j.s[v] = st.s[v][j.slot_idx];
+            std::memcpy(j.s, st.s[j.slot_idx], sizeof j.s);
     }
     j.flags = e.writes_flags || e.undef_flags;
-    if (j.flags)
-        for (u32 v = 0; v < kVecSearch; ++v)
-            for (u32 f = 0; f < kNF; ++f) j.f[v][f] = st.f[v][f];
+    if (j.flags) std::memcpy(j.f, st.f, sizeof j.f);
 }
 
 void journal_restore(VState& st, const Journal& j) {
-    for (u32 v = 0; v < kVecSearch; ++v) {
-        for (u32 i = 0; i < j.ngr; ++i) st.r[v][j.gr[i]] = j.r[v][i];
-        if (j.slot) st.s[v][j.slot_idx] = j.s[v];
-        if (j.flags)
-            for (u32 f = 0; f < kNF; ++f) st.f[v][f] = j.f[v][f];
-    }
+    for (u32 i = 0; i < j.ngr; ++i)
+        std::memcpy(st.r[j.gr[i]], j.r[i], sizeof j.r[i]);
+    if (j.slot) std::memcpy(st.s[j.slot_idx], j.s, sizeof j.s);
+    if (j.flags) std::memcpy(st.f, j.f, sizeof st.f);
 }
 
 // XOR-fold delta over the journaled positions: old terms out, new in.
-u64 journal_fp_delta(const VState& st, const Journal& j, u32 nslots) {
+// SCALAR encoding (the reference). The vector kernel below must produce
+// the identical u64 (proven by construction: same term set, XOR is
+// order-free, pad terms are zero).
+u64 journal_fp_delta_scalar(const VState& st, const Journal& j, u32 nslots) {
+    (void)nslots; // signature symmetry with fp_full
     const Zobrist& Z = ztable();
     u64 d = 0;
-    for (u32 v = 0; v < kVecSearch; ++v) {
-        for (u32 i = 0; i < j.ngr; ++i) {
-            const u32 g = j.gr[i];
-            d ^= term64(Z.z[g][v], static_cast<u64>(j.r[v][i])) ^
-                 term64(Z.z[g][v], static_cast<u64>(st.r[v][g]));
-        }
-        if (j.slot) {
-            const u32 k = j.slot_idx;
+    for (u32 i = 0; i < j.ngr; ++i) {
+        const u32 g = j.gr[i];
+        for (u32 v = 0; v < kVecSearch; ++v)
+            d ^= term64(Z.z[g][v], static_cast<u64>(j.r[i][v])) ^
+                 term64(Z.z[g][v], static_cast<u64>(st.r[g][v]));
+    }
+    if (j.slot) {
+        const u32 k = j.slot_idx;
+        for (u32 v = 0; v < kVecSearch; ++v)
             d ^= term64(Z.z[kMaxGpr + k][v], static_cast<u64>(j.s[v])) ^
-                 term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[v][k]));
+                 term64(Z.z[kMaxGpr + k][v], static_cast<u64>(st.s[k][v]));
+    }
+    if (j.flags) {
+        for (u32 f = 0; f < kNF; ++f) {
+            const u32 p = kMaxGpr + kMaxSlot + f;
+            for (u32 v = 0; v < kVecSearch; ++v)
+                d ^= term64(Z.z[p][v], static_cast<u64>(j.f[f][v])) ^
+                     term64(Z.z[p][v], static_cast<u64>(st.f[f][v]));
         }
-        if (j.flags)
-            for (u32 f = 0; f < kNF; ++f)
-                d ^= term64(Z.z[kMaxGpr + kMaxSlot + f][v],
-                            static_cast<u64>(j.f[v][f])) ^
-                     term64(Z.z[kMaxGpr + kMaxSlot + f][v],
-                            static_cast<u64>(st.f[v][f]));
     }
     return d;
+}
+
+// ---- SIMD fold kernels ----------------------------------------------------
+// The delta over whole 16-lane rows: term64 per lane, XOR-folded. The
+// pad lanes contribute exactly zero (Zobrist pads are zero and BOTH the
+// saved and the new row are masked to the real lanes first), so the vector
+// result equals the scalar one bit for bit — the search cannot tell which
+// kernel ran. The multiply is vpmullq at AVX-512DQ (a single op per 8
+// lanes); AVX2 has no 64x64 lane multiply (GCC would emulate it at a
+// loss), so only the AVX-512 kernel exists — avx2 and scalar dispatch to
+// the reference above.
+namespace {
+
+alignas(64) const u64 kRealLaneMask[kVecPad] = {
+    ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull,
+    ~0ull, ~0ull, ~0ull, ~0ull, 0, 0, 0, 0,
+};
+
+// Fold-lane policy with the SIGNATURE DISCIPLINE of the ISA layer: vector
+// values cross function boundaries by reference only (by-value vectors
+// are an ABI construct — -Wpsabi is fatal here); with always_inline the
+// indirection is SROA-erased and the machine code is unchanged.
+template <typename VT, u32 W>
+struct FoldLane {
+    using T = VT;
+    static constexpr u32 LW = W;
+    static inline __attribute__((always_inline)) void splat(u64 v, T& out) {
+        for (u32 i = 0; i < W; ++i) out[i] = v;
+    }
+    static inline __attribute__((always_inline)) void ld(const i64* p, T& out) {
+        out = *reinterpret_cast<const T*>(p);
+    }
+    static inline __attribute__((always_inline)) void ld(const u64* p, T& out) {
+        ld(reinterpret_cast<const i64*>(p), out);
+    }
+};
+
+template <typename L>
+static inline __attribute__((always_inline)) void
+termv(const typename L::T& z, const typename L::T& x, typename L::T& out) {
+    typename L::T phi, t, sh31;
+    L::splat(0x9E3779B97F4A7C15ull, phi);
+    L::splat(31, sh31);
+    t = (z ^ x) * phi;
+    out = t ^ (t >> sh31);
+}
+
+// One (zobrist-row, old-row, new-row) fold over whole padded lanes; the
+// real-lane mask zeroes the pad terms so the result equals the scalar
+// reference bit for bit. Signature is pointer-only (no vector ABI).
+template <typename L>
+static inline __attribute__((always_inline)) void
+fold_row(const u64* zrow, const u64* oldrow, const u64* newrow,
+         typename L::T& d) {
+    typename L::T real;
+    L::ld(kRealLaneMask, real);
+    for (u32 b = 0; b < kVecPad; b += L::LW) {
+        typename L::T z, o, n;
+        L::ld(zrow + b, z);
+        L::ld(oldrow + b, o);
+        L::ld(newrow + b, n);
+        o = o & real;
+        n = n & real;
+        typename L::T t1, t2;
+        termv<L>(z, o, t1);
+        termv<L>(z, n, t2);
+        d ^= t1 ^ t2;
+    }
+}
+
+template <typename L>
+inline __attribute__((always_inline)) u64 fp_delta_vec(const VState& st,
+                                                       const Journal& j,
+                                                       u32 nslots) {
+    (void)nslots;
+    const Zobrist& Z = ztable();
+    typename L::T d;
+    L::splat(0, d);
+    for (u32 i = 0; i < j.ngr; ++i) {
+        const u32 g = j.gr[i];
+        fold_row<L>(Z.z[g], reinterpret_cast<const u64*>(j.r[i]),
+                    reinterpret_cast<const u64*>(st.r[g]), d);
+    }
+    if (j.slot) {
+        const u32 k = j.slot_idx;
+        fold_row<L>(Z.z[kMaxGpr + k], reinterpret_cast<const u64*>(j.s),
+                    reinterpret_cast<const u64*>(st.s[k]), d);
+    }
+    if (j.flags) {
+        for (u32 f = 0; f < kNF; ++f) {
+            const u32 p = kMaxGpr + kMaxSlot + f;
+            fold_row<L>(Z.z[p], reinterpret_cast<const u64*>(j.f[f]),
+                        reinterpret_cast<const u64*>(st.f[f]), d);
+        }
+    }
+    u64 h = 0;
+    for (u32 i = 0; i < L::LW; ++i) h ^= d[i];
+    return h;
+}
+
+} // namespace
+
+__attribute__((target("avx512f,avx512dq,avx512bw,avx512vl")))
+u64 journal_fp_delta_avx512(const VState& st, const Journal& j, u32 nslots) {
+    return fp_delta_vec<FoldLane<u64 __attribute__((vector_size(64))), 8>>(
+        st, j, nslots);
+}
+
+// Dispatcher: the vector kernel at AVX-512, the reference everywhere
+// else (AVX2 lacks a 64x64 lane multiply — GCC's emulation loses to the
+// scalar loop). lane_mode() is cached; the search cannot tell which
+// kernel ran — both produce the identical fingerprint.
+inline u64 journal_fp_delta(const VState& st, const Journal& j, u32 nslots) {
+    if (lane_mode() == LaneMode::Avx512)
+        return journal_fp_delta_avx512(st, j, nslots);
+    return journal_fp_delta_scalar(st, j, nslots);
 }
 
 // ---- flat open-addressing maps (dedup + expanded-set) --------------------
@@ -539,17 +693,17 @@ bool contract_ok(const VState& a, const VState& b, const WindowCtx& c) {
     for (u32 g = 0; g < kMaxGpr; ++g) {
         if (!(c.contract_gpr & (1u << g))) continue;
         for (u32 v = 0; v < kVecSearch; ++v)
-            if (a.r[v][g] != b.r[v][g]) return false;
+            if (a.r[g][v] != b.r[g][v]) return false;
     }
     for (u32 k = 0; k < c.nslots; ++k) {
         if (!(c.contract_slots & (1u << k))) continue;
         for (u32 v = 0; v < kVecSearch; ++v)
-            if (a.s[v][k] != b.s[v][k]) return false;
+            if (a.s[k][v] != b.s[k][v]) return false;
     }
     if (c.contract_flags) {
         for (u32 v = 0; v < kVecSearch; ++v)
             for (u32 f = 0; f < kNF; ++f)
-                if (a.f[v][f] != b.f[v][f]) return false;
+                if (a.f[f][v] != b.f[f][v]) return false;
     }
     return true;
 }
@@ -563,19 +717,19 @@ u32 contract_matches(const VState& a, const VState& b, const WindowCtx& c) {
     for (u32 g = 0; g < kMaxGpr; ++g) {
         if (!(c.contract_gpr & (1u << g))) continue;
         bool eq = true;
-        for (u32 v = 0; v < kVecSearch && eq; ++v) eq = a.r[v][g] == b.r[v][g];
+        for (u32 v = 0; v < kVecSearch && eq; ++v) eq = a.r[g][v] == b.r[g][v];
         if (eq) ++m;
     }
     for (u32 k = 0; k < c.nslots; ++k) {
         if (!(c.contract_slots & (1u << k))) continue;
         bool eq = true;
-        for (u32 v = 0; v < kVecSearch && eq; ++v) eq = a.s[v][k] == b.s[v][k];
+        for (u32 v = 0; v < kVecSearch && eq; ++v) eq = a.s[k][v] == b.s[k][v];
         if (eq) ++m;
     }
     if (c.contract_flags) {
         bool eq = true;
         for (u32 v = 0; v < kVecSearch && eq; ++v)
-            for (u32 f = 0; f < kNF && eq; ++f) eq = a.f[v][f] == b.f[v][f];
+            for (u32 f = 0; f < kNF && eq; ++f) eq = a.f[f][v] == b.f[f][v];
         if (eq) ++m;
     }
     return m;
@@ -597,6 +751,34 @@ bool simulate(VState& st, const WindowCtx& c, const TableIndex& idx,
 }
 
 } // namespace
+
+// ---- lane execution mode --------------------------------------------------
+// One cached decision per process: the environment override first (the
+// differential lock forces each encoding), then the best the CPU offers.
+// The engine's fold kernel and the ISA table's simulation closures both
+// consult this single source, so a mode is a whole-process property.
+LaneMode lane_mode() {
+    static const LaneMode m = [] {
+        const char* v = std::getenv("JULES_SUPEROPT_SIM");
+        if (v && *v) {
+            if (std::strcmp(v, "scalar") == 0) return LaneMode::Scalar;
+            if (std::strcmp(v, "avx2") == 0) return LaneMode::Avx2;
+            if (std::strcmp(v, "avx512") == 0) return LaneMode::Avx512;
+            // unknown value: fall through to auto (not silent — the mode is
+            // observable via --stats and the TPUT line)
+        }
+#if defined(__x86_64__)
+        __builtin_cpu_init();
+        if (__builtin_cpu_supports("avx512f") &&
+            __builtin_cpu_supports("avx512dq") &&
+            __builtin_cpu_supports("avx512bw"))
+            return LaneMode::Avx512;
+        if (__builtin_cpu_supports("avx2")) return LaneMode::Avx2;
+#endif
+        return LaneMode::Scalar;
+    }();
+    return m;
+}
 
 Report run(LFunction& lf, const IsaTable& isa, const Opts& o) {
     Report rep;

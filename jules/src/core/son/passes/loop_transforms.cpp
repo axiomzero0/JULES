@@ -471,7 +471,7 @@ u32 clone_body_chain(Graph& g, const CountedLoop& cl, u32 extra, bool at_entry) 
     NodeId prev_latch = at_entry ? g.node(cl.header).in[cl.entry_slot] : header_latch;
 
     for (u32 copy = 1; copy <= extra; ++copy) {
-        Cloner c{g, cl, {}, {}, kNoNode};
+        Cloner c{g, cl, {}, {}, kNoNode, nullptr, {}};
         c.in_body = &in_body;
         // seeds: header phis -> previous copy's values
         for (size_t i = 0; i < live.size(); ++i) c.vmap.insert(live[i], live_vals[i]);

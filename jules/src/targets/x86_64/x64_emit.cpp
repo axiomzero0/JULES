@@ -529,7 +529,8 @@ struct Emitter {
             i64 sv = static_cast<i64>(c.iv);
             i32 low = static_cast<i32>(static_cast<u32>(c.iv));
             bool fits32 = (sv >= -2147483648LL && sv <= 2147483647LL) ||
-                          (static_cast<u64>(static_cast<i64>(low)) == c.iv);
+                          (static_cast<u64>(static_cast<i64>(low)) ==
+                           static_cast<u64>(c.iv)); // bit-identical compare
             if (fits32) {
                 Inst& i = emit(IOp::ArithRImm);
                 i.bin = op;
