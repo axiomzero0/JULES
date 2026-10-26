@@ -2673,11 +2673,10 @@ bool x64_branch_fusion(LFunction& lf) {
             if (q.b.k == Operand::K::Reg && q.b.reg == a) return true;
             switch (q.op) {
                 // destructive: a is read AND written
-                case IOp::ArithRR: case IOp::FpBin: case IOp::Cmov:
-                case IOp::ShiftImm: case IOp::ShiftCl: case IOp::Neg:
-                case IOp::Not: case IOp::FpNeg:
-                case IOp::CmpRR: case IOp::FpCmp: case IOp::Test:
-                case IOp::MovZX: // writes AL but that IS part of rax
+                case IOp::ArithRR: case IOp::ArithRImm: case IOp::FpBin:
+                case IOp::Cmov: case IOp::ShiftImm: case IOp::ShiftCl:
+                case IOp::Neg: case IOp::Not: case IOp::FpNeg:
+                case IOp::CmpRR: case IOp::CmpRImm: case IOp::Test:
                     return q.a.k == Operand::K::Reg && q.a.reg == a;
                 // fixed-register implicit operands
                 case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
@@ -2685,6 +2684,15 @@ bool x64_branch_fusion(LFunction& lf) {
                            (q.a.k == Operand::K::Reg && q.a.reg == a);
                 case IOp::Cqo: return a == R::Rax; // reads rax, writes rdx
                 case IOp::SExt32: return a == R::Rax; // movslq reads eax
+                // store family: a pure register read (stored value / store
+                // base / pushed callee reg) — no register is written
+                case IOp::MovRS: case IOp::MovFpS: case IOp::StoreMem:
+                case IOp::PushCal:
+                    return q.a.k == Operand::K::Reg && q.a.reg == a;
+                // movzbq reads the fixed %al (rax's low byte); the dst is
+                // a pure write. cvtsi2sd likewise reads rax.
+                case IOp::MovZX: case IOp::CvtToFp:
+                    return a == R::Rax;
                 case IOp::MovFpFp: case IOp::MovRR:
                     // a mov DEFINES its dst — the old value is dead
                     return false;
@@ -2801,13 +2809,53 @@ bool x64_machine_peephole(LFunction& lf) {
     }
 
     // Register-reference predicates for the scan-based patterns below.
+    //
+    // reads_reg must cover EVERY form that reads x, because the walks
+    // below decide deadness from it. Four classes:
+    //   * DESTRUCTIVE a-operand ops (sar/neg/not/imul-imm/cmov/ucomis...)
+    //     read their a operand before overwriting it — a walk that sees
+    //     only the write treats the instruction as a redefinition and
+    //     misses the read. The commutative phi-backedge fusion walked
+    //     exactly this way and swapped an add whose OLD destination a
+    //     later in-place sar still read (t_stoch divpow @ -Oz: floor(q)
+    //     met a truncating remainder).
+    //   * the store family reads a register and writes NO register (the
+    //     MovRS/MovFpS phantom writes made walks treat spills as kills).
+    //   * the div/mul family and the conversion forms read FIXED
+    //     registers (rax/rdx/al) regardless of their operand fields.
+    //   * Lea2 carries its SIB index register in b.slot, not b.reg.
+    // Reads must ALSO be checked before writes at every walk step: a
+    // destructive op both reads and writes its operand, and the read is
+    // the one that matters for liveness.
     auto reads_reg = [](const Inst& q, R x) {
         if (q.b.k == Operand::K::Reg && q.b.reg == x) return true;
         switch (q.op) {
-            case IOp::ArithRR: case IOp::CmpRR: case IOp::FpBin:
-            case IOp::FpCmp: case IOp::Cmov: case IOp::Test:
-            case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
+            // destructive a-operand forms: a is read, then overwritten
+            case IOp::ArithRR: case IOp::ArithRImm: case IOp::CmpRR:
+            case IOp::CmpRImm: case IOp::FpBin: case IOp::FpCmp:
+            case IOp::FpNeg: case IOp::Cmov: case IOp::Test:
+            case IOp::ShiftImm: case IOp::ShiftCl:
+            case IOp::Neg: case IOp::Not:
+            // pure a reads: stored value / store base / pushed callee reg
+            case IOp::MovRS: case IOp::MovFpS: case IOp::StoreMem:
+            case IOp::PushCal:
                 return q.a.k == Operand::K::Reg && q.a.reg == x;
+            // div/mul family: implicit fixed inputs rax (+rdx as the high
+            // dividend), plus the a operand (divisor/multiplier)
+            case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
+                return (x == R::Rax || x == R::Rdx) ||
+                       (q.a.k == Operand::K::Reg && q.a.reg == x);
+            // fixed-rax reads: cqo/movslq read rax; movzbq reads the fixed
+            // %al (rax's low byte — the dst is a pure write); cvtsi2sd
+            // reads rax
+            case IOp::Cqo: case IOp::SExt32: case IOp::MovZX:
+            case IOp::CvtToFp:
+                return x == R::Rax;
+            // lea2: the SIB index register rides in b.slot (b.reg is the
+            // base, already covered by the generic b.reg check above; the
+            // constructor sets b.k = Reg, so no kind test here)
+            case IOp::Lea2:
+                return static_cast<R>(q.b.slot) == x;
             default: return false;
         }
     };
@@ -2816,12 +2864,23 @@ bool x64_machine_peephole(LFunction& lf) {
             case IOp::MovRR: case IOp::MovFpFp: case IOp::ArithRR:
             case IOp::ArithRImm: case IOp::FpBin: case IOp::FpNeg:
             case IOp::MovRImm: case IOp::ShiftImm: case IOp::ShiftCl:
-            case IOp::Neg: case IOp::Not: case IOp::SExt32:
+            case IOp::Neg: case IOp::Not:
             case IOp::MovFpR: case IOp::MovFpFromGpr: case IOp::MovSR:
-            case IOp::MovFpS: case IOp::MovRS: case IOp::MovZX:
-            case IOp::CvtToFp: case IOp::CvtToInt: case IOp::Cmov:
-            case IOp::Setcc:
+            case IOp::MovZX: case IOp::Cmov:
                 return q.a.k == Operand::K::Reg && q.a.reg == x;
+            // setcc rewrites its byte target (al when unset): a full-rax
+            // value is partially destroyed either way
+            case IOp::Setcc:
+                return (q.a.k == Operand::K::Reg && q.a.reg == x) ||
+                       x == R::Rax;
+            // fixed-register writes (the serializer ignores operands)
+            case IOp::CvtToInt: case IOp::XorEax:
+                return x == R::Rax;
+            case IOp::CvtToFp:
+                return x == R::Xmm0;
+            // div/mul family: rax and rdx are both rewritten
+            case IOp::IDiv: case IOp::UDiv: case IOp::MulHi: case IOp::Cqo:
+                return x == R::Rax || x == R::Rdx;
             default: return false;
         }
     };
@@ -3008,8 +3067,11 @@ bool x64_machine_peephole(LFunction& lf) {
             const Inst& q = code[j];
             if (is_boundary(q)) { abort = true; break; }
             if (q.op == IOp::Nop) continue;
-            if (writes_reg(q, R::Rax)) { ok = true; break; }
+            // reads first: a destructive op (add $k, rax) both reads and
+            // rewrites rax — the read of the pre-extension value forbids
+            // the retarget even though a write follows
             if (reads_reg(q, R::Rax)) { abort = true; break; }
+            if (writes_reg(q, R::Rax)) { ok = true; break; }
         }
         if (!ok || abort) continue;
         zx.a.reg = mv.a.reg;
@@ -3055,6 +3117,9 @@ bool x64_machine_peephole(LFunction& lf) {
             if (op.b.k != Operand::K::Reg || op.b.reg != d) continue;
             if (op.a.k != Operand::K::Reg) continue;
             if (op.a.reg == s) continue;         // would read S twice
+            // the fold kills the copy that DEFINES the op's destructive
+            // a operand: with a == d the op would read D's pre-copy value
+            if (op.a.reg == d) continue;
             bool fp_op = op.op == IOp::VecBinF64 || op.op == IOp::VecBinI64 ||
                          op.op == IOp::VecBinI32 || op.op == IOp::VecBinF32 ||
                          op.op == IOp::FpBin || op.op == IOp::FpCmp;
@@ -3086,8 +3151,11 @@ bool x64_machine_peephole(LFunction& lf) {
                     return false;                  // survives or garbage: stop
                 }
                 if (is_boundary(q)) return false;
-                if (writes_reg(q, x)) return true;
+                // reads first: a destructive op (sar $k, S / add $k, S)
+                // reads S before rewriting it — the read forbids the
+                // retarget even though a write follows
                 if (reads_reg(q, x)) return false;
+                if (writes_reg(q, x)) return true;
             }
             return false;
         };
@@ -3165,8 +3233,11 @@ bool x64_machine_peephole(LFunction& lf) {
                     if (t == LS::Dead && f == LS::Dead) return LS::Dead;
                     return LS::Unknown;
                 }
-                if (writes_reg(q, x)) return LS::Dead;
+                // reads FIRST: a destructive op that both reads and writes
+                // x keeps x live (its old value feeds the result); only a
+                // pure write is a redefinition.
                 if (reads_reg(q, x)) return LS::Live;
+                if (writes_reg(q, x)) return LS::Dead;
                 ++j;
             }
             return LS::Unknown;
@@ -3228,8 +3299,10 @@ bool x64_machine_peephole(LFunction& lf) {
             const Inst& q = code[j];
             if (is_boundary(q)) { abort = true; break; }
             if (q.op == IOp::Nop) continue;
-            if (writes_reg(q, B)) { ok = true; break; }
+            // reads first: a destructive op reading B forbids the fold
+            // even though a write follows
             if (reads_reg(q, B)) { abort = true; break; }
+            if (writes_reg(q, B)) { ok = true; break; }
         }
         if (!ok || abort) continue;
         op.a.reg = B;

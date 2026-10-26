@@ -1,0 +1,46 @@
+// Signed div/mod-by-pow2 composed patterns: behavior-only oracle test.
+//
+// The patterns are chosen so the deterministic pipeline must KEEP the
+// p12 signed forms intact end-to-end (the divisor only becomes constant
+// after inlining; the quotient feeds both a direct use and the remainder
+// identity, producing the duplicated q computation the backend must
+// lower consistently):
+//   * decomp:      a*6 -> (a<<2)+(a<<1) needs table decomposition + rewrites
+//   * factored:    (a*5)+(a*5) -> a*10 -> shift chains (factor + decomp)
+//   * cancelled:   b-b and *1 / +0 chains after the above re-expose
+//                  identity positions the cleanup already consumed
+//   * divpow:      x/8 and x%8 composed as q*3 + r with negative numerators
+//                  — q and r must come from the SAME (truncating)
+//                  division; caught the -Oz commutative-add swap that
+//                  let a floor-quotient meet a truncating remainder
+//                  (x64_emit phi-backedge walk saw the in-place sar as a
+//                  pure write and missed the read).
+// Outputs are oracle-checked at every level of the matrix.
+fn decomp(a: i64, b: i64) -> i64 {
+    var t: i64 = a * 6;
+    var u: i64 = (a * 5) + (a * 5);
+    var v: i64 = t + u;
+    var w: i64 = v + (b - b);
+    var z: i64 = w * 1;
+    return z + 0;
+}
+
+// pow2 division/modulo chains: the search's tg_div_pow2 rows meet the
+// signed-adjustment identity; -O3's deterministic tier leaves the idiv
+// because the divisor only becomes constant after inlining.
+fn divpow(x: i64) -> i64 {
+    var q: i64 = x / 8;
+    var r: i64 = x % 8;
+    return q * 3 + r;
+}
+
+fn main() -> i64 {
+    print(decomp(3, 4));
+    print(decomp(0, 9));
+    print(decomp(-7, 5));
+    print(divpow(100));
+    print(divpow(-100));
+    print(divpow(7));
+    print(divpow(-1));
+    return 0;
+}

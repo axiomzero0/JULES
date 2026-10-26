@@ -1295,9 +1295,12 @@ struct Allocator {
                 bool rd = q.b.k == Operand::K::Reg && q.b.reg == reg;
                 if (!rd) {
                     switch (q.op) {
-                        case IOp::ArithRR: case IOp::CmpRR: case IOp::Cmov:
+                        // destructive a-operand forms read their a operand
+                        case IOp::ArithRR: case IOp::ArithRImm:
+                        case IOp::CmpRR: case IOp::CmpRImm:
+                        case IOp::Cmov:
                         case IOp::ShiftImm: case IOp::ShiftCl: case IOp::Neg:
-                        case IOp::Not: case IOp::Test: case IOp::MovZX:
+                        case IOp::Not: case IOp::Test:
                             rd = q.a.k == Operand::K::Reg && q.a.reg == reg;
                             break;
                         case IOp::IDiv: case IOp::UDiv: case IOp::MulHi:
@@ -1306,6 +1309,10 @@ struct Allocator {
                             break;
                         case IOp::Cqo:
                         case IOp::SExt32:
+                        case IOp::MovZX:
+                        case IOp::CvtToFp:
+                            // fixed-rax reads (movzx reads the fixed %al —
+                            // rax's low byte — its dst is a pure write)
                             rd = reg == R::Rax;
                             break;
                         default:
@@ -1411,6 +1418,10 @@ struct Allocator {
             auto reg_ref = [](const Inst& q, R x) {
                 if (q.a.k == Operand::K::Reg && q.a.reg == x) return true;
                 if (q.b.k == Operand::K::Reg && q.b.reg == x) return true;
+                // lea2's SIB index register rides in b.slot (b.reg is the
+                // base; the constructor sets b.k = Reg — no kind test)
+                if (q.op == IOp::Lea2 && static_cast<R>(q.b.slot) == x)
+                    return true;
                 return false;
             };
             for (const auto& e : home_store_.entries()) {
